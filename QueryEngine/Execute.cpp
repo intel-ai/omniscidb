@@ -51,6 +51,7 @@
 #include "Shared/measure.h"
 #include "Shared/scope.h"
 #include "Shared/shard_key.h"
+#include "Utils/Async.h"
 
 #include "AggregatedColRange.h"
 #include "StringDictionaryGenerations.h"
@@ -1747,7 +1748,7 @@ void Executor::dispatchFragments(
             const int device_id,
             const FragmentsList& frag_list,
             const int64_t rowid_lookup_key) {
-          query_threads.push_back(std::async(std::launch::async,
+          query_threads.push_back(utils::async(std::launch::async,
                                              dispatch,
                                              ExecutorDeviceType::GPU,
                                              device_id,
@@ -1789,7 +1790,7 @@ void Executor::dispatchFragments(
       }
       CHECK_GE(device_id, 0);
 
-      query_threads.push_back(std::async(std::launch::async,
+      query_threads.push_back(utils::async(std::launch::async,
                                          dispatch,
                                          device_type,
                                          device_id,
