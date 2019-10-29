@@ -51,7 +51,7 @@
 #include "Shared/measure.h"
 #include "Shared/scope.h"
 #include "Shared/shard_key.h"
-#include "Utils/Async.h"
+#include "Utils/Threading.h"
 
 #include "AggregatedColRange.h"
 #include "StringDictionaryGenerations.h"
