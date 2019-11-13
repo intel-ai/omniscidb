@@ -185,7 +185,7 @@ void FileMgr::init(const size_t num_reader_threads) {
                   << " Num pages: " << numPages;
 
           file_futures.emplace_back(
-              utils::async([filePath, fileId, pageSize, numPages, this] {
+              std::async(std::launch::async, [filePath, fileId, pageSize, numPages, this] {
                 std::vector<HeaderInfo> tempHeaderVec;
                 openExistingFile(filePath, fileId, pageSize, numPages, tempHeaderVec);
                 return tempHeaderVec;
@@ -348,7 +348,7 @@ void FileMgr::init(const std::string dataPathToConvertFrom) {
           size_t numPages = fileSize / pageSize;
 
           file_futures.emplace_back(
-              utils::async([filePath, fileId, pageSize, numPages, this] {
+              std::async(std::launch::async, [filePath, fileId, pageSize, numPages, this] {
                 std::vector<HeaderInfo> tempHeaderVec;
                 openExistingFile(filePath, fileId, pageSize, numPages, tempHeaderVec);
                 return tempHeaderVec;
