@@ -2541,10 +2541,17 @@ std::vector<int64_t> Executor::getJoinHashTablePtrs(const ExecutorDeviceType dev
       return {};
     }
     bool isPart = hash_table->isPartitioned();
-    table_ptrs.push_back(hash_table->getJoinHashBuffer(
-        device_type,
-        device_type == ExecutorDeviceType::GPU ? device_id : 0,
-        isPart ? frag_id : -1));
+    if (hash_table->useDescriptors()) {
+      table_ptrs.push_back(hash_table->getJoinHashDescriptorPtr(
+          device_type,
+          device_type == ExecutorDeviceType::GPU ? device_id : 0,
+          isPart ? frag_id : -1));
+    } else {
+      table_ptrs.push_back(hash_table->getJoinHashBuffer(
+          device_type,
+          device_type == ExecutorDeviceType::GPU ? device_id : 0,
+          isPart ? frag_id : -1));
+    }
   }
   return table_ptrs;
 }

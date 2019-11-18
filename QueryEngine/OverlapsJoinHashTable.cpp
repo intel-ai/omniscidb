@@ -143,9 +143,9 @@ std::shared_ptr<OverlapsJoinHashTable> OverlapsJoinHashTable::getSyntheticInstan
       op, query_infos, memory_level, device_count, column_cache, executor);
 }
 
-void OverlapsJoinHashTable::reifyWithLayout(const int device_count,
-                                            const JoinHashTableInterface::HashType layout,
-                                            size_t forced_size) {
+void OverlapsJoinHashTable::reifyWithLayout(
+    const int device_count,
+    const JoinHashTableInterface::HashType layout) {
   CHECK(layout == JoinHashTableInterface::HashType::OneToMany);
   layout_ = layout;
   const auto& query_info = get_inner_query_info(getInnerTableId(), query_infos_).info;
@@ -212,10 +212,6 @@ void OverlapsJoinHashTable::reifyWithLayout(const int device_count,
   // from entries_per_device.
   std::tie(entry_count_, emitted_keys_count_) =
       calculateCounts(shard_count, query_info, device_count, columns_per_device);
-  if (forced_size) {
-    CHECK(forced_size >= entry_count_);
-    entry_count_ = forced_size;
-  }
   size_t hash_table_size = calculateHashTableSize(
       bucket_sizes_for_dimension_.size(), emitted_keys_count_, entry_count_);
   VLOG(1) << "Finalized overlaps hashjoin bucket threshold of " << std::fixed

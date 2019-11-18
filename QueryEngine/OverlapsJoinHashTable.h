@@ -35,7 +35,8 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
                               entry_count,
                               column_cache,
                               executor,
-                              inner_outer_pairs) {}
+                              inner_outer_pairs,
+                              false) {}
 
   ~OverlapsJoinHashTable() override {}
 
@@ -68,8 +69,7 @@ class OverlapsJoinHashTable : public BaselineJoinHashTable {
 
  protected:
   void reifyWithLayout(const int device_count,
-                       const JoinHashTableInterface::HashType layout,
-                       size_t forced_size = 0) override;
+                       const JoinHashTableInterface::HashType layout) override;
 
   std::pair<size_t, size_t> calculateCounts(
       size_t shard_count,

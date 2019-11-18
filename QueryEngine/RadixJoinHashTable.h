@@ -69,7 +69,13 @@ class RadixJoinHashTable : public JoinHashTableInterface {
                                const int device_id,
                                const int partition_id) const noexcept override;
 
+  int64_t getJoinHashDescriptorPtr(const ExecutorDeviceType device_type,
+                                   const int device_id,
+                                   const int partition_id = -1) const noexcept override;
+
   bool isPartitioned() const noexcept override { return true; }
+
+  bool useDescriptors() const noexcept override { return true; }
 
   std::string toString(const ExecutorDeviceType device_type,
                        const int device_id,
@@ -79,7 +85,8 @@ class RadixJoinHashTable : public JoinHashTableInterface {
       const ExecutorDeviceType device_type,
       const int device_id) const noexcept override;
 
-  llvm::Value* codegenSlot(const CompilationOptions&, const size_t) override;
+  llvm::Value* codegenSlot(const CompilationOptions&,
+                           const size_t) override;
 
   HashJoinMatchingSet codegenMatchingSet(const CompilationOptions&,
                                          const size_t) override;
@@ -120,8 +127,7 @@ class RadixJoinHashTable : public JoinHashTableInterface {
   Executor* executor_;
   std::vector<InnerOuter> inner_outer_pairs_;
   std::unordered_map<int, std::shared_ptr<JoinHashTableInterface>> part_tables_;
-  std::unordered_map<int, std::vector<InputTableInfo>> new_query_info_;
-  size_t unified_size_ = 0;
+  std::deque<std::vector<InputTableInfo>> part_query_infos_;
 };
 
 #endif  // QUERYENGINE_RADIXJOINHASHTABLE_H

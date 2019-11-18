@@ -75,7 +75,16 @@ using InnerOuter = std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>;
 
 class JoinHashTableInterface {
  public:
+  struct Descriptor {
+    int8_t* buffer;
+    int64_t entry_count;
+  };
+
   virtual bool isPartitioned() const noexcept { return false; }
+
+  // Return true if dynamic code is generated to used hash
+  // table descriptors rather than plain buffer pointers.
+  virtual bool useDescriptors() const noexcept { return false; }
 
   virtual int64_t getJoinHashBuffer(const ExecutorDeviceType device_type,
                                     const int device_id,
@@ -85,6 +94,11 @@ class JoinHashTableInterface {
                                        const int device_id,
                                        const int partition_id = -1) const
       noexcept = 0;  // bytes
+
+  virtual int64_t getJoinHashDescriptorPtr(const ExecutorDeviceType device_type,
+                                           const int device_id,
+                                           const int partition_id = -1) const
+      noexcept = 0;
 
   virtual std::string toString(const ExecutorDeviceType device_type,
                                const int device_id,

@@ -36,6 +36,7 @@
 #include "InputMetadata.h"
 #include "JoinHashTableInterface.h"
 
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Value.h>
 
 #ifdef HAVE_CUDA
@@ -81,6 +82,10 @@ class JoinHashTable : public JoinHashTableInterface {
                                const int device_id,
                                const int partition_id = -1) const noexcept override;
 
+  int64_t getJoinHashDescriptorPtr(const ExecutorDeviceType device_type,
+                                   const int device_id,
+                                   const int partition_id = -1) const noexcept override;
+
   std::string toString(const ExecutorDeviceType device_type,
                        const int device_id,
                        bool raw = false) const noexcept override;
@@ -115,11 +120,16 @@ class JoinHashTable : public JoinHashTableInterface {
       const bool is_sharded,
       const bool col_is_nullable,
       const bool is_bw_eq,
-      const int64_t sub_buff_size,
+      llvm::Value* sub_buff_size,
       Executor* executor,
       const bool is_bucketized = false);
 
-  static llvm::Value* codegenHashTableLoad(const size_t table_idx, Executor* executor);
+  static llvm::Value* codegenHashTableLoad(const size_t table_idx,
+                                           Executor* executor,
+                                           bool use_descriptors);
+
+  static llvm::StructType* getDescriptorType(Executor* executor);
+  static llvm::Type* getDescriptorPtrType(Executor* executor);
 
   static auto yieldCacheInvalidator() -> std::function<void()> {
     return []() -> void {

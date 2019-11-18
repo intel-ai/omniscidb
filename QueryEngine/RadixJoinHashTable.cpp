@@ -67,49 +67,30 @@ RadixJoinHashTable::RadixJoinHashTable(
       qual_bin_oper.get(), *(executor->getCatalog()), executor->getTemporaryTables());
   CHECK(!inner_outer_pairs_.empty());
   const auto& query_info = get_inner_query_info(getInnerTableId(), query_infos).info;
-  // create "partitions" for performing hash building
+
   for (auto frag : query_info.fragments) {
-    std::vector<InputTableInfo> q;
-    Fragmenter_Namespace::TableInfo ti;
-    ti.chunkKeyPrefix = query_info.chunkKeyPrefix;
-    ti.fragments.emplace_back(frag);
-    InputTableInfo iti;
-    iti.table_id = getInnerTableId();
-    iti.info = ti;
-    q.emplace_back(iti);
-    new_query_info_.emplace(std::make_pair(frag.fragmentId, q));
-  }
-  // construct hash tables for those "partitions"
-  for (auto frag : query_info.fragments) {
-    const auto total_entries = 2 * frag.getNumTuples();
-    const auto shard_count = memory_level == Data_Namespace::GPU_LEVEL
-                                 ? BaselineJoinHashTable::getShardCountForCondition(
-                                       qual_bin_oper.get(), executor, inner_outer_pairs_)
-                                 : 0;
-    const auto entries_per_device =
-        get_entries_per_device(total_entries, shard_count, device_count, memory_level);
+    Fragmenter_Namespace::TableInfo part_info;
+    part_info.chunkKeyPrefix = query_info.chunkKeyPrefix;
+    part_info.fragments.emplace_back(frag);
+
+    // Baseline hash doesn't copy input table infos and holds
+    // a reference instead. So keep them in part_query_infos_.
+    part_query_infos_.emplace_back();
+    auto& part_infos = part_query_infos_.back();
+    part_infos.emplace_back(InputTableInfo{getInnerTableId(), part_info});
+
     part_tables_.emplace(
         std::make_pair(frag.fragmentId,
-                       std::shared_ptr<BaselineJoinHashTable>(new BaselineJoinHashTable(
+                       BaselineJoinHashTable::getInstance(
                            qual_bin_oper,
-                           new_query_info_.at(frag.fragmentId),
+                           part_infos,
                            memory_level,
                            // Currently all base hash tables share the same layout
                            HashType::OneToMany /*preferred_hash_type*/,
-                           entries_per_device,
+                           device_count,
                            column_cache,
                            executor,
-                           inner_outer_pairs_))));
-    // At the moment we need to unify hash tables sizes
-    // to get single one codegen for them
-    auto table = part_tables_[frag.fragmentId].get();
-    if (const auto base_line = dynamic_cast<BaselineJoinHashTable*>(table)) {
-      std::vector<BaselineJoinHashTable::ColumnsForDevice> columns_per_device;
-      auto shard_count = base_line->getColumns(device_count, columns_per_device);
-      unified_size_ = std::max(
-          base_line->getOneToManyElements(device_count, shard_count, columns_per_device),
-          unified_size_);
-    }
+                           true)));
   }
 }
 
@@ -124,19 +105,27 @@ size_t RadixJoinHashTable::shardCount() const {
 int64_t RadixJoinHashTable::getJoinHashBuffer(const ExecutorDeviceType device_type,
                                               const int device_id,
                                               const int partition_id) const noexcept {
-  auto it = part_tables_.find(partition_id);
-  if (it != part_tables_.end())
-    return it->second->getJoinHashBuffer(device_type, device_id);
+  CHECK(false)
+      << "RadixJoinHashTable doesn't support plain buffers. Use descriptors instead.";
   return 0;
 }
 
 size_t RadixJoinHashTable::getJoinHashBufferSize(const ExecutorDeviceType device_type,
                                                  const int device_id,
                                                  const int partition_id) const noexcept {
-  auto it = part_tables_.find(partition_id);
-  if (it != part_tables_.end())
-    return it->second->getJoinHashBuffer(device_type, device_id);
+  CHECK(false)
+      << "RadixJoinHashTable doesn't support plain buffers. Use descriptors instead.";
   return 0;
+}
+
+int64_t RadixJoinHashTable::getJoinHashDescriptorPtr(const ExecutorDeviceType device_type,
+                                                     const int device_id,
+                                                     const int partition_id) const
+    noexcept {
+  auto it = part_tables_.find(partition_id);
+  CHECK(it != part_tables_.end())
+      << "An attempt to get hash table descriptor for missing part";
+  return it->second->getJoinHashDescriptorPtr(device_type, device_id);
 }
 
 std::string RadixJoinHashTable::toString(const ExecutorDeviceType device_type,
@@ -163,14 +152,14 @@ std::set<DecodedJoinHashBufferEntry> RadixJoinHashTable::decodeJoinHashBuffer(
 
 llvm::Value* RadixJoinHashTable::codegenSlot(const CompilationOptions& co,
                                              const size_t index) {
-  // All tables are the same for now, so pick any and use it to generate code.
-  CHECK(!part_tables_.empty());
-  return part_tables_.begin()->second->codegenSlot(co, index);
+  CHECK(false) << "RadixJoinHashTable doesn't support OneToOne layout";
+  return nullptr;
 }
 
 HashJoinMatchingSet RadixJoinHashTable::codegenMatchingSet(const CompilationOptions& co,
                                                            const size_t index) {
-  // All tables are the same for now, so pick any and use it to generate code.
+  // All tables are of the same type and use size agnostic codegen, so pick any and use it
+  // to generate code.
   CHECK(!part_tables_.empty());
   return part_tables_.begin()->second->codegenMatchingSet(co, index);
 }
@@ -213,15 +202,8 @@ size_t RadixJoinHashTable::payloadBufferOff(const int partition_id) const noexce
 }
 
 void RadixJoinHashTable::reify(const int device_count) {
-  // TODO: check for paritions cache
-  // TODO: check for hash table cache
-
-  for (auto pr : part_tables_) {
-    auto table = pr.second.get();
-    if (auto base_line = dynamic_cast<BaselineJoinHashTable*>(table)) {
-      base_line->reify(device_count, unified_size_);
-    }
-  }
+  for (auto pr : part_tables_)
+    dynamic_cast<BaselineJoinHashTable*>(pr.second.get())->reify(device_count);
 }
 
 size_t RadixJoinHashTable::dump(size_t entry_limit) const {

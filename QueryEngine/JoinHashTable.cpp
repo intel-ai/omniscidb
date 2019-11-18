@@ -1277,7 +1277,7 @@ void JoinHashTable::putHashTableOnCpuToCache(
 }
 
 llvm::Value* JoinHashTable::codegenHashTableLoad(const size_t table_idx) {
-  const auto hash_ptr = codegenHashTableLoad(table_idx, executor_);
+  const auto hash_ptr = codegenHashTableLoad(table_idx, executor_, useDescriptors());
   if (hash_ptr->getType()->isIntegerTy(64)) {
     return hash_ptr;
   }
@@ -1288,7 +1288,8 @@ llvm::Value* JoinHashTable::codegenHashTableLoad(const size_t table_idx) {
 }
 
 llvm::Value* JoinHashTable::codegenHashTableLoad(const size_t table_idx,
-                                                 Executor* executor) {
+                                                 Executor* executor,
+                                                 bool use_descriptors) {
   llvm::Value* hash_ptr = nullptr;
   const auto total_table_count =
       executor->plan_state_->join_info_.join_hash_tables_.size();
@@ -1306,7 +1307,21 @@ llvm::Value* JoinHashTable::codegenHashTableLoad(const size_t table_idx,
     hash_ptr = get_arg_by_name(executor->cgen_state_->row_func_, "join_hash_tables");
   }
   CHECK(hash_ptr);
+  if (use_descriptors) {
+    hash_ptr = executor->cgen_state_->ir_builder_.CreatePointerCast(
+        hash_ptr, getDescriptorPtrType(executor));
+  }
   return hash_ptr;
+}
+
+llvm::StructType* JoinHashTable::getDescriptorType(Executor* executor) {
+  return llvm::StructType::get(executor->cgen_state_->ir_builder_.getInt64Ty(),
+                               executor->cgen_state_->ir_builder_.getInt64Ty());
+}
+
+llvm::Type* JoinHashTable::getDescriptorPtrType(Executor* executor) {
+  auto* desc_type = getDescriptorType(executor);
+  return llvm::PointerType::getUnqual(desc_type);
 }
 
 std::vector<llvm::Value*> JoinHashTable::getHashJoinArgs(llvm::Value* hash_ptr,
@@ -1379,7 +1394,7 @@ HashJoinMatchingSet JoinHashTable::codegenMatchingSet(const CompilationOptions& 
                             shard_count,
                             !key_col_ti.get_notnull(),
                             isBitwiseEq(),
-                            sub_buff_size,
+                            executor_->cgen_state_->llInt(sub_buff_size),
                             executor_,
                             bucketize);
 }
@@ -1389,7 +1404,7 @@ HashJoinMatchingSet JoinHashTable::codegenMatchingSet(
     const bool is_sharded,
     const bool col_is_nullable,
     const bool is_bw_eq,
-    const int64_t sub_buff_size,
+    llvm::Value* sub_buff_size,
     Executor* executor,
     bool is_bucketized) {
   using namespace std::string_literals;
@@ -1413,8 +1428,7 @@ HashJoinMatchingSet JoinHashTable::codegenMatchingSet(
   auto pos_ptr = hash_join_idx_args_in[0];
   CHECK(pos_ptr);
 
-  auto count_ptr = executor->cgen_state_->ir_builder_.CreateAdd(
-      pos_ptr, executor->cgen_state_->llInt(sub_buff_size));
+  auto count_ptr = executor->cgen_state_->ir_builder_.CreateAdd(pos_ptr, sub_buff_size);
   auto hash_join_idx_args = hash_join_idx_args_in;
   hash_join_idx_args[0] = executor->cgen_state_->ir_builder_.CreatePtrToInt(
       count_ptr, llvm::Type::getInt64Ty(executor->cgen_state_->context_));
@@ -1423,9 +1437,10 @@ HashJoinMatchingSet JoinHashTable::codegenMatchingSet(
       slot_valid_lv,
       executor->cgen_state_->emitCall(fname, hash_join_idx_args),
       executor->cgen_state_->llInt(int64_t(0)));
+  auto double_sub_buff_size =
+      executor->cgen_state_->ir_builder_.CreateAdd(sub_buff_size, sub_buff_size);
   auto rowid_base_i32 = executor->cgen_state_->ir_builder_.CreateIntToPtr(
-      executor->cgen_state_->ir_builder_.CreateAdd(
-          pos_ptr, executor->cgen_state_->llInt(2 * sub_buff_size)),
+      executor->cgen_state_->ir_builder_.CreateAdd(pos_ptr, double_sub_buff_size),
       llvm::Type::getInt32PtrTy(executor->cgen_state_->context_));
   auto rowid_ptr_i32 =
       executor->cgen_state_->ir_builder_.CreateGEP(rowid_base_i32, slot_lv);
@@ -1499,6 +1514,13 @@ size_t JoinHashTable::getJoinHashBufferSize(const ExecutorDeviceType device_type
   return cpu_hash_table_buff_->size() *
          sizeof(decltype(cpu_hash_table_buff_)::element_type::value_type);
 #endif
+}
+
+int64_t JoinHashTable::getJoinHashDescriptorPtr(const ExecutorDeviceType device_type,
+                                                const int device_id,
+                                                const int partition_id) const noexcept {
+  CHECK(false) << "JoinHashTable doesn't support size agnostic code generation";
+  return 0;
 }
 
 std::string JoinHashTable::toString(const ExecutorDeviceType device_type,
