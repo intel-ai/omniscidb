@@ -333,14 +333,22 @@ void TablePartitioner::initSWCBuffers(int frag_idx,
   for (uint32_t i = 0; i < fanOut; ++i) {
     // swcb_sizes[i] = partition_offsets[frag_idx][i];
     for (uint32_t j = 0; j < key_sizes_.size(); j++) {
-      if (histograms_[frag_idx][i] > 0)
-        swcb_bufs[i].push_back((int8_t*)aligned_alloc(
-            CACHE_LINE_SIZE, key_sizes_[j] * (CACHE_LINE_SIZE / key_sizes_[j])));
+      if (histograms_[frag_idx][i] > 0) {
+        auto alloc_buf = (int8_t*)aligned_alloc(
+            CACHE_LINE_SIZE, key_sizes_[j] * (CACHE_LINE_SIZE / key_sizes_[j]));
+        if (!alloc_buf)
+            throw std::runtime_error("Not enough memory for software-combined buffer");;
+        swcb_bufs[i].push_back(alloc_buf);
+      }
     }
     for (uint32_t j = 0; j < payload_sizes_.size(); ++j) {
-      if (histograms_[frag_idx][i] > 0)
-        swcb_bufs[i].push_back((int8_t*)aligned_alloc(
-            CACHE_LINE_SIZE, payload_sizes_[j] * (CACHE_LINE_SIZE / payload_sizes_[j])));
+      if (histograms_[frag_idx][i] > 0) {
+        auto alloc_buf = (int8_t*)aligned_alloc(
+            CACHE_LINE_SIZE, payload_sizes_[j] * (CACHE_LINE_SIZE / payload_sizes_[j]));
+        if (!alloc_buf)
+            throw std::runtime_error("Not enough memory for software-combined buffer");
+        swcb_bufs[i].push_back(alloc_buf);
+      }
     }
   }
 }
