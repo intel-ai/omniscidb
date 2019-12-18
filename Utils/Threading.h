@@ -22,11 +22,7 @@ std::future<Result> async(Fn&& fn, Args&&... args) {
 
   auto st = pool->Spawn(
       arrow::internal::detail::packaged_task_wrapper<Result>(std::move(task)));
-  if (!st.ok()) {
-    // This happens when Submit() is called after Shutdown()
-    std::cerr << st.ToString() << std::endl;
-    std::abort();
-  }
+  CHECK(st.ok()) << st.ToString();
   return fut;
 }
 }  // namespace utils
