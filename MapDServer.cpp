@@ -365,7 +365,7 @@ void heartbeat() {
   }
 }
 
-int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server = true) {
+int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server = true) {
 
   // try to enforce an orderly shutdown even after a signal
   register_signal_handlers();
