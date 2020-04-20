@@ -598,24 +598,26 @@ void ArrowCsvForeignStorage::registerTable(Catalog_Namespace::Catalog* catalog,
       createDictionaryEncodedColumn(
           dict, c, col, arr_col_chunked_array, tg, fragments, key, mgr);
     } else if (ctype == kDECIMAL || ctype == kNUMERIC) {
-      switch (c.columnType.get_size()) {
-        case 2:
-          createDecimalColumn<int16_t, arrow::Int16Array>(
-              c, col, arr_col_chunked_array, tg, fragments, key, mgr);
-          break;
-        case 4:
-          createDecimalColumn<int32_t, arrow::Int32Array>(
-              c, col, arr_col_chunked_array, tg, fragments, key, mgr);
-          break;
-        case 8:
-          createDecimalColumn<int64_t, arrow::Int64Array>(
-              c, col, arr_col_chunked_array, tg, fragments, key, mgr);
-          break;
-        default:
-          // TODO: throw unsupported decimal type exception
-          CHECK(false);
-          break;
-      }
+      tg.run([this, &c, &col, arr_col_chunked_array, &tg, &fragments, key, mgr]() {
+        switch (c.columnType.get_size()) {
+          case 2:
+            createDecimalColumn<int16_t, arrow::Int16Array>(
+                c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+            break;
+          case 4:
+            createDecimalColumn<int32_t, arrow::Int32Array>(
+                c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+            break;
+          case 8:
+            createDecimalColumn<int64_t, arrow::Int64Array>(
+                c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+            break;
+          default:
+            // TODO: throw unsupported decimal type exception
+            CHECK(false);
+            break;
+        }
+      });
     } else {
       auto empty = arr_col_chunked_array->null_count() == arr_col_chunked_array->length();
       for (size_t f = 0; f < fragments.size(); f++) {
