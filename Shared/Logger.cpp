@@ -21,6 +21,10 @@ bool g_enable_debug_timer{false};
 #include "Logger.h"
 #include "StringTransform.h"
 
+#include <rapidjson/document.h>
+#include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
+
 #include <boost/algorithm/string.hpp>
 #include <boost/log/expressions.hpp>
 #include <boost/log/sinks.hpp>
@@ -59,12 +63,40 @@ std::string filename(char const* path) {
   return boost::filesystem::path(path).filename().string();
 }
 
-LogOptions::LogOptions(char const* argv0) : options_("Logging") {
+LogOptions::LogOptions(char const* argv0) {
   // Log file base_name matches name of program.
   std::string const base_name =
       argv0 == nullptr ? std::string("omnisci_server") : filename(argv0);
   file_name_pattern_ = base_name + file_name_pattern_;
   symlink_ = base_name + symlink_;
+  set_options();
+}
+
+boost::filesystem::path LogOptions::full_log_dir() const {
+  return log_dir_.has_root_directory() ? log_dir_ : base_path_ / log_dir_;
+}
+
+po::options_description const& LogOptions::get_options() const {
+  return *options_;
+}
+
+// Typical usage calls either get_options() or parse_command_line() but not both.
+void LogOptions::parse_command_line(int argc, char const* const* argv) {
+  po::variables_map vm;
+  po::store(
+      po::command_line_parser(argc, argv).options(*options_).allow_unregistered().run(),
+      vm);
+  po::notify(vm);  // Sets LogOptions member variables.
+}
+
+// Must be called before init() to take effect.
+void LogOptions::set_base_path(std::string const& base_path) {
+  base_path_ = base_path;
+}
+
+// May be called to update default values based on updated member variables.
+void LogOptions::set_options() {
+  options_ = std::make_unique<boost::program_options::options_description>("Logging");
   std::string const channels = join(ChannelNames, " ");
   // Filter out DEBUG[1-4] severities from --help options
   std::string severities;
@@ -73,65 +105,44 @@ LogOptions::LogOptions(char const* argv0) : options_("Logging") {
       (severities += (severities.empty() ? "" : " ")) += name;
     }
   }
-  options_.add_options()(
+  options_->add_options()(
       "log-directory",
       po::value<boost::filesystem::path>(&log_dir_)->default_value(log_dir_),
       "Logging directory. May be relative to data directory, or absolute.");
-  options_.add_options()(
+  options_->add_options()(
       "log-file-name",
       po::value<std::string>(&file_name_pattern_)->default_value(file_name_pattern_),
       "Log file name relative to log-directory.");
-  options_.add_options()("log-symlink",
-                         po::value<std::string>(&symlink_)->default_value(symlink_),
-                         "Symlink to active log.");
-  options_.add_options()("log-severity",
-                         po::value<Severity>(&severity_)->default_value(severity_),
-                         ("Log to file severity level: " + severities).c_str());
-  options_.add_options()(
+  options_->add_options()("log-symlink",
+                          po::value<std::string>(&symlink_)->default_value(symlink_),
+                          "Symlink to active log.");
+  options_->add_options()("log-severity",
+                          po::value<Severity>(&severity_)->default_value(severity_),
+                          ("Log to file severity level: " + severities).c_str());
+  options_->add_options()(
       "log-severity-clog",
       po::value<Severity>(&severity_clog_)->default_value(severity_clog_),
       ("Log to console severity level: " + severities).c_str());
-  options_.add_options()("log-channels",
-                         po::value<Channels>(&channels_)->default_value(channels_),
-                         ("Log channel debug info: " + channels).c_str());
-  options_.add_options()("log-auto-flush",
-                         po::value<bool>(&auto_flush_)->default_value(auto_flush_),
-                         "Flush logging buffer to file after each message.");
-  options_.add_options()("log-max-files",
-                         po::value<size_t>(&max_files_)->default_value(max_files_),
-                         "Maximum number of log files to keep.");
-  options_.add_options()(
+  options_->add_options()("log-channels",
+                          po::value<Channels>(&channels_)->default_value(channels_),
+                          ("Log channel debug info: " + channels).c_str());
+  options_->add_options()("log-auto-flush",
+                          po::value<bool>(&auto_flush_)->default_value(auto_flush_),
+                          "Flush logging buffer to file after each message.");
+  options_->add_options()("log-max-files",
+                          po::value<size_t>(&max_files_)->default_value(max_files_),
+                          "Maximum number of log files to keep.");
+  options_->add_options()(
       "log-min-free-space",
-      po::value<size_t>(&min_free_space_)->default_value(20 << 20),
+      po::value<size_t>(&min_free_space_)->default_value(min_free_space_),
       "Minimum number of bytes left on device before oldest log files are deleted.");
-  options_.add_options()("log-rotate-daily",
-                         po::value<bool>(&rotate_daily_)->default_value(true),
-                         "Start new log files at midnight.");
-  options_.add_options()("log-rotation-size",
-                         po::value<size_t>(&rotation_size_)->default_value(10 << 20),
-                         "Maximum file size in bytes before new log files are started.");
-}
-
-boost::filesystem::path LogOptions::full_log_dir() const {
-  return log_dir_.has_root_directory() ? log_dir_ : base_path_ / log_dir_;
-}
-
-po::options_description const& LogOptions::get_options() const {
-  return options_;
-}
-
-// Typical usage calls either get_options() or parse_command_line() but not both.
-void LogOptions::parse_command_line(int argc, char const* const* argv) {
-  po::variables_map vm;
-  po::store(
-      po::command_line_parser(argc, argv).options(options_).allow_unregistered().run(),
-      vm);
-  po::notify(vm);  // Sets LogOptions member variables.
-}
-
-// Must be called before init() to take effect.
-void LogOptions::set_base_path(std::string const& base_path) {
-  base_path_ = base_path;
+  options_->add_options()("log-rotate-daily",
+                          po::value<bool>(&rotate_daily_)->default_value(rotate_daily_),
+                          "Start new log files at midnight.");
+  options_->add_options()(
+      "log-rotation-size",
+      po::value<size_t>(&rotation_size_)->default_value(rotation_size_),
+      "Maximum file size in bytes before new log files are started.");
 }
 
 template <typename TAG>
@@ -304,6 +315,7 @@ void shutdown() {
 std::istream& operator>>(std::istream& in, Channels& channels) {
   std::string line;
   std::getline(in, line);
+  unquote(line);
   std::regex const rex(R"(\w+)");
   using TokenItr = std::regex_token_iterator<std::string::iterator>;
   TokenItr const end;
@@ -332,6 +344,7 @@ std::ostream& operator<<(std::ostream& out, Channels const& channels) {
 std::istream& operator>>(std::istream& in, Severity& sev) {
   std::string token;
   in >> token;
+  unquote(token);
   auto itr = std::find(SeverityNames.cbegin(), SeverityNames.cend(), token);
   if (itr == SeverityNames.cend()) {
     in.setstate(std::ios_base::failbit);
@@ -393,7 +406,6 @@ boost::log::record_ostream& Logger::stream(char const* file, int line) {
 }
 
 // DebugTimer-related classes and functions.
-
 using Clock = std::chrono::steady_clock;
 
 class DurationTree;
@@ -424,36 +436,41 @@ class Duration {
       , line_(line)
       , name_(name) {}
   bool stop();
+  // Start time relative to parent DurationTree::start_.
   template <typename Units = std::chrono::milliseconds>
-  typename Units::rep value() const {
-    return std::chrono::duration_cast<Units>(stop_ - start_).count();
-  }
+  typename Units::rep relative_start_time() const;
+  // Duration value = stop_ - start_.
+  template <typename Units = std::chrono::milliseconds>
+  typename Units::rep value() const;
 };
 
 using DurationTreeNode = boost::variant<Duration, DurationTree&>;
+using DurationTreeNodes = std::deque<DurationTreeNode>;
 
 class DurationTree {
-  std::deque<DurationTreeNode> durations_;
+  DurationTreeNodes durations_;
   int current_depth_;  //< Depth of next DurationTreeNode.
 
  public:
-  int const depth_;  //< Depth of tree within parent tree, 0 for base tree.
-  std::thread::id const thread_id_;
-  DurationTree(std::thread::id thread_id, int start_depth)
-      // Add +1 to current_depth_ for non-base DurationTrees for extra indentation.
-      : current_depth_(start_depth + (start_depth == 0 ? 0 : 1))
+  int const depth_;  //< Depth of tree within parent tree, 0 for root tree.
+  Clock::time_point const start_;
+  ThreadId const thread_id_;
+  DurationTree(ThreadId thread_id, int start_depth)
+      // Add +1 to current_depth_ for non-root DurationTrees for extra indentation.
+      : current_depth_(start_depth + bool(start_depth))
       , depth_(start_depth)
+      , start_(Clock::now())
       , thread_id_(thread_id) {}
   void pushDurationTree(DurationTree& duration_tree) {
     durations_.emplace_back(duration_tree);
   }
-  const Duration& baseDuration() const {
+  const Duration& rootDuration() const {
     CHECK(!durations_.empty());
     return boost::get<Duration>(durations_.front());
   }
   int currentDepth() const { return current_depth_; }
   void decrementDepth() { --current_depth_; }
-  std::deque<DurationTreeNode> const& durations() const { return durations_; }
+  DurationTreeNodes const& durations() const { return durations_; }
   template <typename... Ts>
   Duration* newDuration(Ts&&... args) {
     durations_.emplace_back(Duration(this, current_depth_++, std::forward<Ts>(args)...));
@@ -462,27 +479,42 @@ class DurationTree {
 };
 
 /// Set stop_, decrement DurationTree::current_depth_.
-/// Return true iff this Duration represents the base timer (see docs).
+/// Return true iff this Duration represents the root timer (see docs).
 bool Duration::stop() {
   stop_ = Clock::now();
   duration_tree_->decrementDepth();
   return depth_ == 0;
 }
 
-using DurationTreeMap =
-    std::unordered_map<std::thread::id, std::unique_ptr<DurationTree>>;
+template <typename Units>
+typename Units::rep Duration::relative_start_time() const {
+  return std::chrono::duration_cast<Units>(start_ - duration_tree_->start_).count();
+}
 
-std::mutex gDurationTreeMapMutex;
-DurationTreeMap gDurationTreeMap;
+template <typename Units>
+typename Units::rep Duration::value() const {
+  return std::chrono::duration_cast<Units>(stop_ - start_).count();
+}
+
+struct GetDepth : boost::static_visitor<int> {
+  int operator()(Duration const& duration) const { return duration.depth_; }
+  int operator()(DurationTree const& duration_tree) const { return duration_tree.depth_; }
+};
+
+using DurationTreeMap = std::unordered_map<ThreadId, std::unique_ptr<DurationTree>>;
+
+std::mutex g_duration_tree_map_mutex;
+DurationTreeMap g_duration_tree_map;
+std::atomic<ThreadId> g_next_thread_id{0};
+ThreadId thread_local const g_thread_id = g_next_thread_id++;
 
 template <typename... Ts>
 Duration* newDuration(Severity severity, Ts&&... args) {
   if (g_enable_debug_timer) {
-    auto const thread_id = std::this_thread::get_id();
-    std::lock_guard<std::mutex> lock_guard(gDurationTreeMapMutex);
-    auto& duration_tree_ptr = gDurationTreeMap[thread_id];
+    std::lock_guard<std::mutex> lock_guard(g_duration_tree_map_mutex);
+    auto& duration_tree_ptr = g_duration_tree_map[g_thread_id];
     if (!duration_tree_ptr) {
-      duration_tree_ptr = std::make_unique<DurationTree>(thread_id, 0);
+      duration_tree_ptr = std::make_unique<DurationTree>(g_thread_id, 0);
     }
     return duration_tree_ptr->newDuration(severity, std::forward<Ts>(args)...);
   }
@@ -490,8 +522,9 @@ Duration* newDuration(Severity severity, Ts&&... args) {
 }
 
 std::ostream& operator<<(std::ostream& os, Duration const& duration) {
-  return os << std::setw(2 * duration.depth_) << ' ' << duration.value() << "ms "
-            << duration.name_ << ' ' << filename(duration.file_) << ':' << duration.line_;
+  return os << std::setw(2 * duration.depth_) << ' ' << duration.value() << "ms start("
+            << duration.relative_start_time() << "ms) " << duration.name_ << ' '
+            << filename(duration.file_) << ':' << duration.line_;
 }
 
 std::ostream& operator<<(std::ostream& os, DurationTree const& duration_tree) {
@@ -505,47 +538,136 @@ std::ostream& operator<<(std::ostream& os, DurationTree const& duration_tree) {
             << duration_tree.thread_id_ << ')';
 }
 
-// Only called by logAndEraseDurationTree() on base tree
+// Only called by logAndEraseDurationTree() on root tree
 boost::log::record_ostream& operator<<(boost::log::record_ostream& os,
                                        DurationTreeMap::const_reference kv_pair) {
   auto itr = kv_pair.second->durations().cbegin();
   auto const end = kv_pair.second->durations().cend();
-  auto const& base_duration = boost::get<Duration>(*itr);
+  auto const& root_duration = boost::get<Duration>(*itr);
   os << "DEBUG_TIMER thread_id(" << kv_pair.first << ")\n"
-     << base_duration.value() << "ms total duration for " << base_duration.name_;
+     << root_duration.value() << "ms total duration for " << root_duration.name_;
   for (++itr; itr != end; ++itr) {
     os << '\n' << *itr;
   }
   return os;
 }
 
-// Depth-first search and erase all DurationTrees. Not thread-safe.
+// Encode DurationTree into json.
+// DurationTrees encode parent/child relationships using a combination
+// of ordered descendents, and an int depth member value for each node.
+// Direct-child nodes are those which:
+//  * do not come after a node of depth <= parent_depth
+//  * have depth == parent_depth + 1
+class JsonEncoder : boost::static_visitor<rapidjson::Value> {
+  std::shared_ptr<rapidjson::Document> doc_;
+  rapidjson::Document::AllocatorType& alloc_;
+  // Iterators are used to determine children when visiting a Duration node.
+  DurationTreeNodes::const_iterator begin_;
+  DurationTreeNodes::const_iterator end_;
+
+  JsonEncoder(JsonEncoder& json_encoder,
+              DurationTreeNodes::const_iterator begin,
+              DurationTreeNodes::const_iterator end)
+      : doc_(json_encoder.doc_), alloc_(doc_->GetAllocator()), begin_(begin), end_(end) {}
+
+ public:
+  JsonEncoder()
+      : doc_(std::make_shared<rapidjson::Document>(rapidjson::kObjectType))
+      , alloc_(doc_->GetAllocator()) {}
+  rapidjson::Value operator()(Duration const& duration) {
+    rapidjson::Value retval(rapidjson::kObjectType);
+    retval.AddMember("type", "duration", alloc_);
+    retval.AddMember("duration_ms", rapidjson::Value(duration.value()), alloc_);
+    retval.AddMember(
+        "start_ms", rapidjson::Value(duration.relative_start_time()), alloc_);
+    retval.AddMember("name", rapidjson::StringRef(duration.name_), alloc_);
+    retval.AddMember("file", filename(duration.file_), alloc_);
+    retval.AddMember("line", rapidjson::Value(duration.line_), alloc_);
+    retval.AddMember("children", childNodes(duration.depth_), alloc_);
+    return retval;
+  }
+  rapidjson::Value operator()(DurationTree const& duration_tree) {
+    begin_ = duration_tree.durations().cbegin();
+    end_ = duration_tree.durations().cend();
+    rapidjson::Value retval(rapidjson::kObjectType);
+    retval.AddMember("type", "duration_tree", alloc_);
+    retval.AddMember("thread_id", to_string(duration_tree.thread_id_), alloc_);
+    retval.AddMember("children", childNodes(duration_tree.depth_), alloc_);
+    return retval;
+  }
+  rapidjson::Value childNodes(int const parent_depth) {
+    GetDepth const get_depth;
+    rapidjson::Value children(rapidjson::kArrayType);
+    for (auto itr = begin_; itr != end_; ++itr) {
+      int const depth = apply_visitor(get_depth, *itr);
+      if (depth <= parent_depth) {
+        break;
+      }
+      if (depth == parent_depth + 1) {
+        JsonEncoder json_encoder(*this, std::next(itr), end_);
+        children.PushBack(apply_visitor(json_encoder, *itr), alloc_);
+      }
+    }
+    return children;
+  }
+  // The root Duration is the "timer" node in the top level debug json object.
+  // Only root Duration has overall total_duration_ms.
+  rapidjson::Value timer(DurationTreeMap::const_reference kv_pair) {
+    begin_ = kv_pair.second->durations().cbegin();
+    end_ = kv_pair.second->durations().cend();
+    rapidjson::Value retval(rapidjson::kObjectType);
+    if (begin_ != end_) {
+      auto const& root_duration = boost::get<Duration>(*(begin_++));
+      retval.AddMember("type", "root", alloc_);
+      retval.AddMember("thread_id", to_string(kv_pair.first), alloc_);
+      retval.AddMember(
+          "total_duration_ms", rapidjson::Value(root_duration.value()), alloc_);
+      retval.AddMember("name", rapidjson::StringRef(root_duration.name_), alloc_);
+      retval.AddMember("children", childNodes(0), alloc_);
+    }
+    return retval;
+  }
+  // Assumes *doc_ is empty.
+  std::string str(DurationTreeMap::const_reference kv_pair) {
+    doc_->AddMember("timer", timer(kv_pair), alloc_);
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc_->Accept(writer);
+    return {buffer.GetString(), buffer.GetSize()};
+  }
+};
+
+/// Depth-first search and erase all DurationTrees. Not thread-safe.
 struct EraseDurationTrees : boost::static_visitor<> {
   void operator()(DurationTreeMap::const_iterator const& itr) const {
     for (auto const& duration_tree_node : itr->second->durations()) {
       apply_visitor(*this, duration_tree_node);
     }
-    gDurationTreeMap.erase(itr);
+    g_duration_tree_map.erase(itr);
   }
   void operator()(Duration const&) const {}
   void operator()(DurationTree const& duration_tree) const {
     for (auto const& duration_tree_node : duration_tree.durations()) {
       apply_visitor(*this, duration_tree_node);
     }
-    gDurationTreeMap.erase(duration_tree.thread_id_);
+    g_duration_tree_map.erase(duration_tree.thread_id_);
   }
 };
 
-void logAndEraseDurationTree(std::thread::id const thread_id) {
-  std::lock_guard<std::mutex> lock_guard(gDurationTreeMapMutex);
-  DurationTreeMap::const_iterator const itr = gDurationTreeMap.find(thread_id);
-  CHECK(itr != gDurationTreeMap.cend());
-  auto const& base_duration = itr->second->baseDuration();
-  if (auto log = Logger(base_duration.severity_)) {
-    log.stream(base_duration.file_, base_duration.line_) << *itr;
+void logAndEraseDurationTree(std::string* json_str) {
+  std::lock_guard<std::mutex> lock_guard(g_duration_tree_map_mutex);
+  DurationTreeMap::const_iterator const itr = g_duration_tree_map.find(g_thread_id);
+  CHECK(itr != g_duration_tree_map.cend());
+  auto const& root_duration = itr->second->rootDuration();
+  if (auto log = Logger(root_duration.severity_)) {
+    log.stream(root_duration.file_, root_duration.line_) << *itr;
   }
-  EraseDurationTrees const tree_trimmer;
-  tree_trimmer(itr);
+  if (json_str) {
+    JsonEncoder json_encoder;
+    *json_str = json_encoder.str(*itr);
+  }
+  EraseDurationTrees erase_duration_trees;
+  erase_duration_trees(itr);
 }
 
 DebugTimer::DebugTimer(Severity severity, char const* file, int line, char const* name)
@@ -558,31 +680,40 @@ DebugTimer::~DebugTimer() {
 void DebugTimer::stop() {
   if (duration_) {
     if (duration_->stop()) {
-      logAndEraseDurationTree(std::this_thread::get_id());
+      logAndEraseDurationTree(nullptr);
     }
     duration_ = nullptr;
   }
 }
 
+std::string DebugTimer::stopAndGetJson() {
+  std::string json_str;
+  if (duration_) {
+    if (duration_->stop()) {
+      logAndEraseDurationTree(&json_str);
+    }
+    duration_ = nullptr;
+  }
+  return json_str;
+}
+
 /// Call this when a new thread is spawned that will have timers that need to be
 /// associated with timers on the parent thread.
-void debugTimerNewThread(std::thread::id parent_thread_id) {
+void debug_timer_new_thread(ThreadId parent_thread_id) {
   if (g_enable_debug_timer) {
-    auto const thread_id = std::this_thread::get_id();
-    if (thread_id != parent_thread_id) {
-      std::lock_guard<std::mutex> lock_guard(gDurationTreeMapMutex);
-      auto parent_itr = gDurationTreeMap.find(parent_thread_id);
-      if (parent_itr != gDurationTreeMap.end()) {
-        auto& duration_tree_ptr = gDurationTreeMap[thread_id];
-        if (!duration_tree_ptr) {
-          auto const current_depth = parent_itr->second->currentDepth();
-          duration_tree_ptr =
-              std::make_unique<DurationTree>(thread_id, current_depth + 1);
-          parent_itr->second->pushDurationTree(*duration_tree_ptr);
-        }
-      }
-    }
+    std::lock_guard<std::mutex> lock_guard(g_duration_tree_map_mutex);
+    auto parent_itr = g_duration_tree_map.find(parent_thread_id);
+    CHECK(parent_itr != g_duration_tree_map.end());
+    auto const current_depth = parent_itr->second->currentDepth();
+    auto& duration_tree_ptr = g_duration_tree_map[g_thread_id];
+    CHECK(!duration_tree_ptr);
+    duration_tree_ptr = std::make_unique<DurationTree>(g_thread_id, current_depth + 1);
+    parent_itr->second->pushDurationTree(*duration_tree_ptr);
   }
+}
+
+ThreadId thread_id() {
+  return g_thread_id;
 }
 
 }  // namespace logger

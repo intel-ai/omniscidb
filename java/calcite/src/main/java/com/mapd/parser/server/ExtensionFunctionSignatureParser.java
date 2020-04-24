@@ -24,6 +24,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.StringReader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,15 +43,38 @@ class ExtensionFunctionSignatureParser {
     FileReader fileReader = new FileReader(file);
     BufferedReader bufferedReader = new BufferedReader(fileReader);
     String line;
-    Pattern r = Pattern.compile("([\\w]+) '([\\w]+) \\((.*)\\)'");
+    Pattern s = Pattern.compile("\\| ([\\` ]|used)+ ([\\w]+) '([\\w<>]+) \\((.*)\\)'");
     Map<String, ExtensionFunction> sigs = new HashMap<String, ExtensionFunction>();
     while ((line = bufferedReader.readLine()) != null) {
-      Matcher m = r.matcher(line);
+      Matcher m = s.matcher(line);
       if (m.find()) {
-        final String name = m.group(1);
-        final String ret = m.group(2);
+        final String name = m.group(2);
+        final String ret = m.group(3);
+        final String cs_param_list = m.group(4);
+        sigs.put(name, toSignature(ret, cs_param_list, false));
+      }
+    }
+    return sigs;
+  }
+
+  static Map<String, ExtensionFunction> parseUdfAst(final String file_path)
+          throws IOException {
+    File file = new File(file_path);
+    FileReader fileReader = new FileReader(file);
+    BufferedReader bufferedReader = new BufferedReader(fileReader);
+    String line;
+    Pattern s = Pattern.compile("([<>:\\w]+) ([:\\w]+)(?:\\(\\))?\\((.*)\\)");
+    Map<String, ExtensionFunction> sigs = new HashMap<String, ExtensionFunction>();
+    while ((line = bufferedReader.readLine()) != null) {
+      Matcher m = s.matcher(line);
+      if (m.find()) {
+        final String name = m.group(2);
+        final String ret = m.group(1);
         final String cs_param_list = m.group(3);
-        sigs.put(name, toSignature(ret, cs_param_list));
+        if (cs_param_list.isEmpty()) {
+          continue;
+        }
+        sigs.put(name, toSignature(ret, cs_param_list, true));
       }
     }
     return sigs;
@@ -90,17 +114,34 @@ class ExtensionFunctionSignatureParser {
   }
 
   private static ExtensionFunction toSignature(
-          final String ret, final String cs_param_list) {
-    return toSignature(ret, cs_param_list, true);
+          final String ret, final String cs_param_list, final boolean has_variable_name) {
+    return toSignature(ret, cs_param_list, has_variable_name, true);
   }
 
-  private static ExtensionFunction toSignature(
-          final String ret, final String cs_param_list, final boolean is_row_func) {
+  private static ExtensionFunction toSignature(final String ret,
+          final String cs_param_list,
+          final boolean has_variable_name,
+          final boolean is_row_func) {
     String[] params = cs_param_list.split(",");
     List<ExtensionFunction.ExtArgumentType> args =
             new ArrayList<ExtensionFunction.ExtArgumentType>();
     for (final String param : params) {
-      final ExtensionFunction.ExtArgumentType arg_type = deserializeType(param.trim());
+      ExtensionFunction.ExtArgumentType arg_type;
+      if (has_variable_name) {
+        String[] full_param = param.trim().split("\\s+");
+        if (full_param.length > 0) {
+          if (full_param[0].trim().compareTo("const") == 0) {
+            assert full_param.length > 1;
+            arg_type = deserializeType((full_param[1]).trim());
+          } else {
+            arg_type = deserializeType((full_param[0]).trim());
+          }
+        } else {
+          arg_type = deserializeType(full_param[0]);
+        }
+      } else {
+        arg_type = deserializeType(param.trim());
+      }
       if (arg_type != ExtensionFunction.ExtArgumentType.Void) {
         args.add(arg_type);
       }
@@ -120,7 +161,7 @@ class ExtensionFunctionSignatureParser {
     }
 
     if (type_name.equals("bool") || type_name.equals("_Bool")) {
-      return ExtensionFunction.ExtArgumentType.Int8; // bool is mapped to int8
+      return ExtensionFunction.ExtArgumentType.Bool;
     }
     if (type_name.equals("int8_t") || type_name.equals("char")
             || type_name.equals("int8")) {
@@ -150,13 +191,11 @@ class ExtensionFunctionSignatureParser {
     if (type_name.endsWith(" *")) {
       return pointerType(deserializeType(type_name.substring(0, type_name.length() - 2)));
     }
-
     if (type_name.endsWith("*")) {
       return pointerType(deserializeType(type_name.substring(0, type_name.length() - 1)));
     }
-
     if (type_name.equals("Array<bool>")) {
-      return ExtensionFunction.ExtArgumentType.ArrayInt8;
+      return ExtensionFunction.ExtArgumentType.ArrayBool;
     }
     if (type_name.equals("Array<int8_t>") || type_name.equals("Array<char>")) {
       return ExtensionFunction.ExtArgumentType.ArrayInt8;
@@ -189,18 +228,23 @@ class ExtensionFunctionSignatureParser {
     if (type_name.equals("GeoPolygon")) {
       return ExtensionFunction.ExtArgumentType.GeoPolygon;
     }
+    if (type_name.equals("GeoMultiPolygon")) {
+      return ExtensionFunction.ExtArgumentType.GeoMultiPolygon;
+    }
 
     MAPDLOGGER.info(
             "ExtensionfunctionSignatureParser::deserializeType: unknown type_name=`"
             + type_name + "`");
-    assert false;
-    return null;
+    // TODO: Return void for convenience. Consider sanitizing functions for supported
+    // types before they reach Calcite
+    return ExtensionFunction.ExtArgumentType.Void;
   }
 
   private static ExtensionFunction.ExtArgumentType pointerType(
           final ExtensionFunction.ExtArgumentType targetType) {
     switch (targetType) {
       case Bool:
+        return ExtensionFunction.ExtArgumentType.PBool;
       case Int8:
         return ExtensionFunction.ExtArgumentType.PInt8;
       case Int16:

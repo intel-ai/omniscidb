@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <llvm/Support/Program.h>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <csignal>
@@ -31,7 +32,6 @@
 #include "QueryEngine/UDFCompiler.h"
 #include "QueryRunner/QueryRunner.h"
 #include "Shared/Logger.h"
-#include "Shared/MapDParameters.h"
 #include "TestHelpers.h"
 
 #ifndef BASE_PATH
@@ -111,7 +111,8 @@ class SQLTestEnv : public ::testing::Environment {
       throw std::runtime_error("udf file: " + udf_file.string() + " does not exist");
     }
 
-    UdfCompiler compiler(udf_file.string());
+    std::vector<std::string> udf_compiler_options{std::string("-D UDF_COMPILER_OPTION")};
+    UdfCompiler compiler(udf_file.string(), std::string(""), udf_compiler_options);
     auto compile_result = compiler.compileUdf();
     EXPECT_EQ(compile_result, 0);
 
@@ -176,6 +177,28 @@ TEST_F(UDFCompilerTest, CompileTest) {
   // LOG(FATAL) which stops the process and does not return
 }
 
+TEST_F(UDFCompilerTest, CompilerOptionTest) {
+  UdfCompiler compiler(getUdfFileName());
+  auto compile_result = compiler.compileUdf();
+
+  EXPECT_EQ(compile_result, 0);
+
+  // This function signature is only visible via the -DUDF_COMPILER_OPTION
+  // definition. This definition was passed to the UdfCompiler is Setup.
+  // We had to do it there because Calcite only reads the ast definitions once
+  // at startup
+
+  auto signature = ExtensionFunctionsWhitelist::get_udf("udf_range_int2");
+  ASSERT_NE(signature, nullptr);
+}
+
+TEST_F(UDFCompilerTest, CompilerPathTest) {
+  UdfCompiler compiler(getUdfFileName(), llvm::sys::findProgramByName("clang++").get());
+  auto compile_result = compiler.compileUdf();
+
+  EXPECT_EQ(compile_result, 0);
+}
+
 TEST_F(UDFCompilerTest, CalciteRegistration) {
   UdfCompiler compiler(getUdfFileName());
   auto compile_result = compiler.compileUdf();
@@ -214,6 +237,7 @@ TEST_F(UDFCompilerTest, UdfQuery) {
   run_ddl_statement("DROP TABLE IF EXISTS geospatial_test;");
   run_ddl_statement("DROP TABLE IF EXISTS geospatial_linestring;");
   run_ddl_statement("DROP TABLE IF EXISTS geo_poly;");
+  run_ddl_statement("DROP TABLE IF EXISTS geo_mpoly;");
 
   run_ddl_statement(
       "CREATE TABLE stocks(symbol text, open_p int, high_p int, "
@@ -227,6 +251,7 @@ TEST_F(UDFCompilerTest, UdfQuery) {
 
   run_ddl_statement("CREATE TABLE geospatial_linestring (id INT, l LINESTRING)");
   run_ddl_statement("CREATE TABLE geo_poly (id INT, p POLYGON);");
+  run_ddl_statement("CREATE TABLE geo_mpoly (id INT, p MULTIPOLYGON);");
 
   std::string insert1(
       "INSERT into stocks VALUES ('NVDA', '178', '178', '171', '173', '2019-05-07');");
@@ -276,6 +301,12 @@ TEST_F(UDFCompilerTest, UdfQuery) {
       "INSERT into geo_poly VALUES(0, 'POLYGON((1 0, "
       "0 1, -1 0, 0 -1, 1 0), (0.1 0, 0 0.1, -0.1 0, 0 -0.1, 0.1 0))');");
   EXPECT_NO_THROW(run_multiple_agg(polygon_insert1, ExecutorDeviceType::CPU));
+
+  std::string multipolygon_insert1(
+      "INSERT into geo_mpoly VALUES(0, 'MULTIPOLYGON(((1 0, 0 1, -1 0, 0 -1, 1 0), "
+      "(0.1 0, 0 0.1, -0.1 0, 0 -0.1, 0.1 0)), ((2 0, 0 2, -2 0, 0 -2, 2 0), "
+      "(0.2 0, 0 0.2, -0.2 0, 0 -0.2, 0.2 0)))');");
+  EXPECT_NO_THROW(run_multiple_agg(multipolygon_insert1, ExecutorDeviceType::CPU));
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -422,6 +453,50 @@ TEST_F(UDFCompilerTest, UdfQuery) {
     ASSERT_EQ(0,
               v<int64_t>(run_simple_agg(
                   "select polygon_output_srid(p) from geo_poly WHERE id = 0;", dt)));
+
+    ASSERT_NEAR(static_cast<double>(2.0 - 0.02 + 8.0 - 0.08),
+                v<double>(run_simple_agg(
+                    "select multipolygon_area(p) from geo_mpoly WHERE id = 0;", dt)),
+                static_cast<double>(0.0001));
+
+    ASSERT_NEAR(static_cast<double>(4 * 1.41421 + 4 * 2.82842),
+                v<double>(run_simple_agg(
+                    "select multipolygon_perimeter(p) from geo_mpoly WHERE id = 0;", dt)),
+                static_cast<double>(0.0001));
+
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select multipolygon_compression(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "select multipolygon_input_srid(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select multipolygon_output_srid(p) from geo_mpoly WHERE id = 0;", dt)));
+
+    {
+      auto check_row_result = [](const auto& crt_row, const auto& expected) {
+        compare_array(crt_row[0], expected);
+      };
+
+      const auto rows = run_multiple_agg(
+          "SELECT array_ret_udf(pay_by_quarter, CAST(1.2 AS DOUBLE)) FROM sal_emp;", dt);
+      ASSERT_EQ(rows->rowCount(), size_t(4));
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{6000, 7200, 8400, 9600});
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{3600, 4200, 4800, 5160});
+      check_row_result(rows->getNextRow(false, false), std::vector<double>{});
+      check_row_result(rows->getNextRow(false, false),
+                       std::vector<double>{8400,
+                                           inline_fp_null_value<double>(),
+                                           inline_fp_null_value<double>(),
+                                           10800});
+    }
   }
 
   EXPECT_THROW(run_simple_agg("SELECT udf_range_integer(high_p, low_p) from stocks where "
@@ -434,6 +509,7 @@ TEST_F(UDFCompilerTest, UdfQuery) {
   run_ddl_statement("DROP TABLE geospatial_test;");
   run_ddl_statement("DROP TABLE geospatial_linestring;");
   run_ddl_statement("DROP TABLE geo_poly;");
+  run_ddl_statement("DROP TABLE geo_mpoly;");
 }
 
 int main(int argc, char** argv) {

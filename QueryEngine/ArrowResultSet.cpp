@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include "ArrowResultSet.h"
-#include "ArrowUtil.h"
-#include "Descriptors/RelAlgExecutionDescriptor.h"
+#include "QueryEngine/ArrowResultSet.h"
 
 #include <arrow/api.h>
 #include <arrow/io/memory.h>
 #include <arrow/ipc/api.h>
+
+#include "QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
+#include "Shared/ArrowUtil.h"
 
 namespace {
 
@@ -217,17 +218,29 @@ void ArrowResultSet::resultSetArrowLoopback() {
     }
   }
   const auto converter = ArrowResultSetConverter(rows_, col_names, -1);
-  const auto serialized_arrow_output = converter.getSerializedArrowOutput();
+
+  arrow::ipc::DictionaryMemo schema_memo;
+  const auto serialized_arrow_output = converter.getSerializedArrowOutput(&schema_memo);
 
   arrow::io::BufferReader schema_reader(serialized_arrow_output.schema);
 
   std::shared_ptr<arrow::Schema> schema;
-  arrow::ipc::DictionaryMemo dictionary_memo;
-  ARROW_THROW_NOT_OK(arrow::ipc::ReadSchema(&schema_reader, &dictionary_memo, &schema));
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadSchema(&schema_reader, &dictionary_memo_, &schema));
+  CHECK_EQ(schema_memo.num_fields(), dictionary_memo_.num_fields());
+
+  // add the dictionaries from the serialized output to the newly created memo
+  const auto& serialized_id_to_dict = schema_memo.id_to_dictionary();
+  for (const auto itr : serialized_id_to_dict) {
+    const auto& id = itr.first;
+    const auto& dict = itr.second;
+    CHECK(!dictionary_memo_.HasDictionary(id));
+    ARROW_THROW_NOT_OK(dictionary_memo_.AddDictionary(id, dict));
+  }
 
   arrow::io::BufferReader records_reader(serialized_arrow_output.records);
-  ARROW_THROW_NOT_OK(
-      arrow::ipc::ReadRecordBatch(schema, &dictionary_memo, &records_reader, &record_batch_));
+
+  ARROW_THROW_NOT_OK(arrow::ipc::ReadRecordBatch(
+      schema, &dictionary_memo_, &records_reader, &record_batch_));
 
   CHECK_EQ(schema->num_fields(), record_batch_->num_columns());
 }

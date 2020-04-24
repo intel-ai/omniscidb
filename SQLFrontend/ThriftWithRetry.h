@@ -3,13 +3,14 @@
 
 #include <cmath>
 #include <iostream>
-#include "gen-cpp/mapd_types.h"
+#include "gen-cpp/omnisci_types.h"
 
 template <typename SERVICE_ENUM, typename CLIENT_CONTEXT>
 bool thrift_with_retry(SERVICE_ENUM which_service,
                        CLIENT_CONTEXT& context,
                        char const* arg,
-                       const int try_count = 1) {
+                       const int try_count = 1,
+                       const TSessionId query_session = "") {
   using TException = ::apache::thrift::TException;
 
   int max_reconnect = 4;
@@ -40,7 +41,7 @@ bool thrift_with_retry(SERVICE_ENUM which_service,
         context.client.disconnect(context.session);
         break;
       case kINTERRUPT:
-        context.client.interrupt(context.session);
+        context.client.interrupt(query_session, context.session);
         break;
       case kSQL:
         context.client.sql_execute(
@@ -151,7 +152,7 @@ bool thrift_with_retry(SERVICE_ENUM which_service,
             context.dash_return, context.session, context.dash_id);
         break;
     }
-  } catch (TMapDException& e) {
+  } catch (TOmniSciException& e) {
     std::cerr << e.error_msg << std::endl;
     return false;
   } catch (TException& te) {

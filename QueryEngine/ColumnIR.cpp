@@ -104,7 +104,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenColVar(const Analyzer::ColumnVar
                                                        const bool fetch_column,
                                                        const bool update_query_plan,
                                                        const CompilationOptions& co) {
-  const bool hoist_literals = co.hoist_literals_;
+  const bool hoist_literals = co.hoist_literals;
   auto col_id = col_var->get_column_id();
   const int rte_idx = adjusted_range_table_index(col_var);
   CHECK_LT(static_cast<size_t>(rte_idx), cgen_state_->frag_offsets_.size());
@@ -164,6 +164,10 @@ std::vector<llvm::Value*> CodeGenerator::codegenColVar(const Analyzer::ColumnVar
     }
   }
   const auto hash_join_lhs = hashJoinLhs(col_var);
+  // Note(jclay): This has been prone to cause failures in some overlaps joins.
+  // I believe most of the issues are worked out now, but a good place to check if
+  // failures are happening.
+
   // Use the already fetched left-hand side of an equi-join if the types are identical.
   // Currently, types can only be different because of different underlying dictionaries.
   if (hash_join_lhs && hash_join_lhs->get_type_info() == col_var->get_type_info()) {
@@ -574,6 +578,13 @@ std::shared_ptr<const Analyzer::Expr> CodeGenerator::hashJoinLhs(
         }
         if (rhs->get_type_info().is_string()) {
           return eq_left_op->deep_copy();
+        }
+        if (rhs->get_type_info().is_array()) {
+          // Note(jclay): Can this be restored from copy as above?
+          // If we fall through to the below return statement,
+          // a superfulous cast from DOUBLE[] to DOUBLE[] is made and
+          // this fails at a later stage in codegen.
+          return nullptr;
         }
         return makeExpr<Analyzer::UOper>(
             rhs->get_type_info(), false, kCAST, eq_left_op->deep_copy());

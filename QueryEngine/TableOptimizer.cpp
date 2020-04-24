@@ -107,7 +107,7 @@ inline CompilationOptions get_compilation_options(const ExecutorDeviceType& devi
 
 inline ExecutionOptions get_execution_options() {
   return ExecutionOptions{
-      false, false, false, false, false, false, false, false, 0, false, false, 0};
+      false, false, false, false, false, false, false, false, 0, false, false, 0, false};
 }
 
 }  // namespace
@@ -235,7 +235,7 @@ void TableOptimizer::recomputeMetadata() const {
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_deleted_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
       fragmenter->setNumRows(total_num_tuples);
@@ -327,7 +327,7 @@ void TableOptimizer::recomputeMetadata() const {
       executor_->executeWorkUnitPerFragment(
           ra_exe_unit, table_infos[0], co, eo, cat_, compute_metadata_callback);
 
-      auto* fragmenter = td->fragmenter;
+      auto* fragmenter = td->fragmenter.get();
       CHECK(fragmenter);
       fragmenter->updateChunkStats(cd, stats_map);
     }

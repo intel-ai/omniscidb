@@ -19,6 +19,7 @@
 #include "Calcite/Calcite.h"
 #include "Catalog/Catalog.h"
 #include "DistributedLoader.h"
+#include "Import/CopyParams.h"
 #include "Parser/ParserWrapper.h"
 #include "Parser/parser.h"
 #include "QueryEngine/CalciteAdapter.h"
@@ -27,8 +28,10 @@
 #include "QueryEngine/TableFunctions/TableFunctionsFactory.h"
 #include "Shared/ConfigResolve.h"
 #include "Shared/Logger.h"
-#include "Shared/MapDParameters.h"
 #include "Shared/StringTransform.h"
+#include "Shared/SystemParameters.h"
+#include "Shared/geosupport.h"
+#include "Shared/import_helpers.h"
 #include "bcrypt.h"
 #include "gen-cpp/CalciteServer.h"
 
@@ -42,6 +45,8 @@ extern size_t g_leaf_count;
 extern bool g_enable_filter_push_down;
 
 double g_gpu_mem_limit_percent{0.9};
+
+extern bool g_serialize_temp_tables;
 
 using namespace Catalog_Namespace;
 namespace {
@@ -123,6 +128,8 @@ QueryRunner::QueryRunner(const char* db_path,
                          const int reserved_gpu_mem,
                          const bool create_user,
                          const bool create_db) {
+  g_serialize_temp_tables = true;
+
   boost::filesystem::path base_path{db_path};
   CHECK(boost::filesystem::exists(base_path));
   auto system_db_file = base_path / "mapd_catalogs" / OMNISCI_DEFAULT_DB;
@@ -133,7 +140,8 @@ QueryRunner::QueryRunner(const char* db_path,
 
   register_signal_handler();
   logger::set_once_fatal_func(&calcite_shutdown_handler);
-  g_calcite = std::make_shared<Calcite>(-1, CALCITEPORT, db_path, 1024, udf_filename);
+  g_calcite =
+      std::make_shared<Calcite>(-1, CALCITEPORT, db_path, 1024, 5000, udf_filename);
   ExtensionFunctionsWhitelist::add(g_calcite->getExtensionFunctionWhitelist());
   if (!udf_filename.empty()) {
     ExtensionFunctionsWhitelist::addUdfs(g_calcite->getUserDefinedFunctionWhitelist());
@@ -144,7 +152,7 @@ QueryRunner::QueryRunner(const char* db_path,
   if (std::is_same<CudaBuildSelector, PreprocessorFalse>::value) {
     uses_gpus = false;
   }
-  MapDParameters mapd_params;
+  SystemParameters mapd_params;
   mapd_params.gpu_buffer_mem_bytes = max_gpu_mem;
   mapd_params.aggregator = !leaf_servers.empty();
 
@@ -211,15 +219,33 @@ void QueryRunner::clearCpuMemory() const {
   Executor::clearMemory(Data_Namespace::MemoryLevel::CPU_LEVEL);
 }
 
+std::string apply_copy_to_shim(const std::string& query_str) {
+  auto result = query_str;
+  {
+    boost::regex copy_to{R"(COPY\s*\(([^#])(.+)\)\s+TO\s)",
+                         boost::regex::extended | boost::regex::icase};
+    apply_shim(result, copy_to, [](std::string& result, const boost::smatch& what) {
+      result.replace(
+          what.position(), what.length(), "COPY (#~#" + what[1] + what[2] + "#~#) TO  ");
+    });
+  }
+  return result;
+}
+
 void QueryRunner::runDDLStatement(const std::string& stmt_str_in) {
   CHECK(session_info_);
   CHECK(!Catalog_Namespace::SysCatalog::instance().isAggregator());
 
-  auto stmt_str = stmt_str_in;
+  std::string stmt_str = stmt_str_in;
   // First remove special chars
   boost::algorithm::trim_left_if(stmt_str, boost::algorithm::is_any_of("\n"));
   // Then remove spaces
   boost::algorithm::trim_left(stmt_str);
+
+  ParserWrapper pw{stmt_str};
+  if (pw.is_copy_to) {
+    stmt_str = apply_copy_to_shim(stmt_str_in);
+  }
 
   auto query_state = create_query_state(session_info_, stmt_str);
   auto stdlog = STDLOG(query_state);
@@ -244,24 +270,6 @@ std::shared_ptr<ResultSet> QueryRunner::runSQL(const std::string& query_str,
 
   ParserWrapper pw{query_str};
   if (pw.isCalcitePathPermissable()) {
-    if (ir_file_writer_ && (pw.getDMLType() == ParserWrapper::DMLType::NotDML)) {
-      try {
-        const auto result = runSelectQuery(
-            query_str, device_type, hoist_literals, allow_loop_joins, true);
-        const auto crt_row = result.getRows()->getNextRow(true, true);
-        CHECK_EQ(size_t(1), crt_row.size());
-        const auto scalar_ir = boost::get<ScalarTargetValue>(&crt_row[0]);
-        CHECK(scalar_ir);
-        const auto ir_ns = boost::get<NullableString>(scalar_ir);
-        CHECK(ir_ns);
-        const auto ir_str = boost::get<std::string>(ir_ns);
-        CHECK(ir_str);
-        (*ir_file_writer_)(query_str, *ir_str);
-      } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to run EXPLAIN on SELECT query: " << query_str << " ("
-                     << e.what() << "). Proceeding with query execution.";
-      }
-    }
     const auto execution_result =
         runSelectQuery(query_str, device_type, hoist_literals, allow_loop_joins);
 
@@ -271,29 +279,16 @@ std::shared_ptr<ResultSet> QueryRunner::runSQL(const std::string& query_str,
   auto query_state = create_query_state(session_info_, query_str);
   auto stdlog = STDLOG(query_state);
 
-  const auto& cat = session_info_->getCatalog();
-  auto executor = Executor::getExecutor(cat.getCurrentDB().dbId);
-
-  auto plan =
-      std::unique_ptr<Planner::RootPlan>(parsePlan(query_state->createQueryStateProxy()));
-
-#ifdef HAVE_CUDA
-  return executor->execute(plan.get(),
-                           *session_info_,
-                           hoist_literals,
-                           device_type,
-                           ExecutorOptLevel::LoopStrengthReduction,
-                           true,
-                           allow_loop_joins);
-#else
-  return executor->execute(plan.get(),
-                           *session_info_,
-                           hoist_literals,
-                           device_type,
-                           ExecutorOptLevel::LoopStrengthReduction,
-                           false,
-                           allow_loop_joins);
-#endif
+  SQLParser parser;
+  std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
+  std::string last_parsed;
+  CHECK_EQ(parser.parse(query_str, parse_trees, last_parsed), 0) << query_str;
+  CHECK_EQ(parse_trees.size(), size_t(1));
+  auto stmt = parse_trees.front().get();
+  auto insert_values_stmt = dynamic_cast<InsertValuesStmt*>(stmt);
+  CHECK(insert_values_stmt);
+  insert_values_stmt->execute(*session_info_);
+  return nullptr;
 }
 
 std::vector<std::shared_ptr<ResultSet>> QueryRunner::runMultipleStatements(
@@ -351,8 +346,9 @@ ExecutionResult run_select_query_with_filter_push_down(
   auto const& query_state = query_state_proxy.getQueryState();
   const auto& cat = query_state.getConstSessionInfo()->getCatalog();
   auto executor = Executor::getExecutor(cat.getCurrentDB().dbId);
-  CompilationOptions co = {
-      device_type, true, ExecutorOptLevel::LoopStrengthReduction, false};
+  CompilationOptions co = CompilationOptions::defaults(device_type);
+  co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
+
   ExecutionOptions eo = {g_enable_columnar_output,
                          true,
                          just_explain,
@@ -364,7 +360,9 @@ ExecutionResult run_select_query_with_filter_push_down(
                          10000,
                          with_filter_push_down,
                          false,
-                         g_gpu_mem_limit_percent};
+                         g_gpu_mem_limit_percent,
+                         false,
+                         1000};
   auto calcite_mgr = cat.getCalciteMgr();
   const auto query_ra = calcite_mgr
                             ->process(query_state_proxy,
@@ -372,11 +370,11 @@ ExecutionResult run_select_query_with_filter_push_down(
                                       {},
                                       true,
                                       false,
-                                      false)
+                                      false,
+                                      true)
                             .plan_result;
-  RelAlgExecutor ra_executor(executor.get(), cat);
-
-  auto result = ra_executor.executeRelAlgQuery(query_ra, co, eo, nullptr);
+  auto result = RelAlgExecutor(executor.get(), cat, query_ra)
+                    .executeRelAlgQuery(co, eo, false, nullptr);
   const auto& filter_push_down_requests = result.getPushedDownFilterInfo();
   if (!filter_push_down_requests.empty()) {
     std::vector<TFilterPushDownInfo> filter_push_down_info;
@@ -393,7 +391,8 @@ ExecutionResult run_select_query_with_filter_push_down(
                                             filter_push_down_info,
                                             true,
                                             false,
-                                            false)
+                                            false,
+                                            true)
                                   .plan_result;
     const ExecutionOptions eo_modified{eo.output_columnar_hint,
                                        eo.allow_multifrag,
@@ -406,8 +405,10 @@ ExecutionResult run_select_query_with_filter_push_down(
                                        eo.dynamic_watchdog_time_limit,
                                        /*find_push_down_candidates=*/false,
                                        /*just_calcite_explain=*/false,
-                                       eo.gpu_input_mem_limit_percent};
-    return ra_executor.executeRelAlgQuery(new_query_ra, co, eo_modified, nullptr);
+                                       eo.gpu_input_mem_limit_percent,
+                                       eo.allow_runtime_query_interrupt};
+    return RelAlgExecutor(executor.get(), cat, new_query_ra)
+        .executeRelAlgQuery(co, eo_modified, false, nullptr);
   } else {
     return result;
   }
@@ -435,8 +436,9 @@ ExecutionResult QueryRunner::runSelectQuery(const std::string& query_str,
 
   const auto& cat = session_info_->getCatalog();
   auto executor = Executor::getExecutor(cat.getCurrentDB().dbId);
-  CompilationOptions co = {
-      device_type, true, ExecutorOptLevel::LoopStrengthReduction, false};
+  CompilationOptions co = CompilationOptions::defaults(device_type);
+  co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
+
   ExecutionOptions eo = {g_enable_columnar_output,
                          true,
                          just_explain,
@@ -448,7 +450,9 @@ ExecutionResult QueryRunner::runSelectQuery(const std::string& query_str,
                          10000,
                          false,
                          false,
-                         g_gpu_mem_limit_percent};
+                         g_gpu_mem_limit_percent,
+                         false,
+                         1000};
   auto calcite_mgr = cat.getCalciteMgr();
   const auto query_ra = calcite_mgr
                             ->process(query_state->createQueryStateProxy(),
@@ -456,15 +460,140 @@ ExecutionResult QueryRunner::runSelectQuery(const std::string& query_str,
                                       {},
                                       true,
                                       false,
-                                      false)
+                                      false,
+                                      true)
                             .plan_result;
-  RelAlgExecutor ra_executor(executor.get(), cat);
-  return ra_executor.executeRelAlgQuery(query_ra, co, eo, nullptr);
+  return RelAlgExecutor(executor.get(), cat, query_ra)
+      .executeRelAlgQuery(co, eo, false, nullptr);
 }
+
+const std::shared_ptr<std::vector<int32_t>>& QueryRunner::getCachedJoinHashTable(
+    size_t idx) {
+  return JoinHashTable::getCachedHashTable(idx);
+};
+
+const std::shared_ptr<std::vector<int8_t>>& QueryRunner::getCachedBaselineHashTable(
+    size_t idx) {
+  return BaselineJoinHashTable::getCachedHashTable(idx);
+};
+
+size_t QueryRunner::getEntryCntCachedBaselineHashTable(size_t idx) {
+  return BaselineJoinHashTable::getEntryCntCachedHashTable(idx);
+}
+
+uint64_t QueryRunner::getNumberOfCachedJoinHashTables() {
+  return JoinHashTable::getNumberOfCachedHashTables();
+};
+
+uint64_t QueryRunner::getNumberOfCachedBaselineJoinHashTables() {
+  return BaselineJoinHashTable::getNumberOfCachedHashTables();
+};
 
 void QueryRunner::reset() {
   qr_instance_.reset(nullptr);
   calcite_shutdown_handler();
+}
+
+ImportDriver::ImportDriver(std::shared_ptr<Catalog_Namespace::Catalog> cat,
+                           const Catalog_Namespace::UserMetadata& user,
+                           const ExecutorDeviceType dt)
+    : QueryRunner(std::make_unique<Catalog_Namespace::SessionInfo>(cat, user, dt, "")) {}
+
+void ImportDriver::importGeoTable(const std::string& file_path,
+                                  const std::string& table_name,
+                                  const bool compression,
+                                  const bool create_table,
+                                  const bool explode_collections) {
+  using namespace Importer_NS;
+
+  CHECK(session_info_);
+  const std::string geo_column_name(OMNISCI_GEO_PREFIX);
+
+  CopyParams copy_params;
+  if (compression) {
+    copy_params.geo_coords_encoding = EncodingType::kENCODING_GEOINT;
+    copy_params.geo_coords_comp_param = 32;
+  } else {
+    copy_params.geo_coords_encoding = EncodingType::kENCODING_NONE;
+    copy_params.geo_coords_comp_param = 0;
+  }
+  copy_params.geo_assign_render_groups = true;
+  copy_params.geo_explode_collections = explode_collections;
+
+  auto cds = Importer::gdalToColumnDescriptors(file_path, geo_column_name, copy_params);
+  std::map<std::string, std::string> colname_to_src;
+  for (auto& cd : cds) {
+    const auto col_name_sanitized = ImportHelpers::sanitize_name(cd.columnName);
+    const auto ret =
+        colname_to_src.insert(std::make_pair(col_name_sanitized, cd.columnName));
+    CHECK(ret.second);
+    cd.columnName = col_name_sanitized;
+  }
+
+  auto& cat = session_info_->getCatalog();
+
+  if (create_table) {
+    const auto td = cat.getMetadataForTable(table_name);
+    if (td != nullptr) {
+      throw std::runtime_error("Error: Table " + table_name +
+                               " already exists. Possible failure to correctly re-create "
+                               "mapd_data directory.");
+    }
+    if (table_name != ImportHelpers::sanitize_name(table_name)) {
+      throw std::runtime_error("Invalid characters in table name: " + table_name);
+    }
+
+    std::string stmt{"CREATE TABLE " + table_name};
+    std::vector<std::string> col_stmts;
+
+    for (auto& cd : cds) {
+      if (cd.columnType.get_type() == SQLTypes::kINTERVAL_DAY_TIME ||
+          cd.columnType.get_type() == SQLTypes::kINTERVAL_YEAR_MONTH) {
+        throw std::runtime_error(
+            "Unsupported type: INTERVAL_DAY_TIME or INTERVAL_YEAR_MONTH for col " +
+            cd.columnName + " (table: " + table_name + ")");
+      }
+
+      if (cd.columnType.get_type() == SQLTypes::kDECIMAL) {
+        if (cd.columnType.get_precision() == 0 && cd.columnType.get_scale() == 0) {
+          cd.columnType.set_precision(14);
+          cd.columnType.set_scale(7);
+        }
+      }
+
+      std::string col_stmt;
+      col_stmt.append(cd.columnName + " " + cd.columnType.get_type_name() + " ");
+
+      if (cd.columnType.get_compression() != EncodingType::kENCODING_NONE) {
+        col_stmt.append("ENCODING " + cd.columnType.get_compression_name() + " ");
+      } else {
+        if (cd.columnType.is_string()) {
+          col_stmt.append("ENCODING NONE");
+        } else if (cd.columnType.is_geometry()) {
+          if (cd.columnType.get_output_srid() == 4326) {
+            col_stmt.append("ENCODING NONE");
+          }
+        }
+      }
+      col_stmts.push_back(col_stmt);
+    }
+
+    stmt.append(" (" + boost::algorithm::join(col_stmts, ",") + ");");
+    runDDLStatement(stmt);
+
+    LOG(INFO) << "Created table: " << table_name;
+  } else {
+    LOG(INFO) << "Not creating table: " << table_name;
+  }
+
+  const auto td = cat.getMetadataForTable(table_name);
+  if (td == nullptr) {
+    throw std::runtime_error("Error: Failed to create table " + table_name);
+  }
+
+  Importer_NS::Importer importer(cat, td, file_path, copy_params);
+  auto ms = measure<>::execution([&]() { importer.importGDAL(colname_to_src); });
+  LOG(INFO) << "Import Time for " << table_name << ": " << (double)ms / 1000.0 << " s";
 }
 
 }  // namespace QueryRunner

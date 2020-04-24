@@ -20,6 +20,9 @@
 #include "DynamicWatchdog.h"
 #include "ErrorHandling.h"
 #include "Execute.h"
+#include "ExternalExecutor.h"
+#include "SerializeToSql.h"
+#include "Shared/misc.h"
 
 #include "DataMgr/BufferMgr/BufferMgr.h"
 
@@ -75,10 +78,16 @@ void Executor::ExecutionDispatch::runImpl(
   const auto memory_level = chosen_device_type == ExecutorDeviceType::GPU
                                 ? Data_Namespace::GPU_LEVEL
                                 : Data_Namespace::CPU_LEVEL;
-  const int outer_table_id = ra_exe_unit_.input_descs[0].getTableId();
   CHECK_GE(frag_list.size(), size_t(1));
+  // frag_list[0].table_id is how we tell which query we are running for UNION ALL.
+  const int outer_table_id = ra_exe_unit_.union_all
+                                 ? frag_list[0].table_id
+                                 : ra_exe_unit_.input_descs[0].getTableId();
   CHECK_EQ(frag_list[0].table_id, outer_table_id);
   const auto& outer_tab_frag_ids = frag_list[0].fragment_ids;
+  VLOG(1) << "outer_table_id=" << outer_table_id
+          << " frag_list=" << shared::printContainer(frag_list);
+
   CHECK_GE(chosen_device_id, 0);
   CHECK_LT(chosen_device_id, max_gpu_count);
   // need to own them while query executes
@@ -95,15 +104,26 @@ void Executor::ExecutionDispatch::runImpl(
     QueryFragmentDescriptor::computeAllTablesFragments(
         all_tables_fragments, ra_exe_unit_, query_infos_);
 
-    fetch_result = executor_->fetchChunks(column_fetcher,
-                                          ra_exe_unit_,
-                                          chosen_device_id,
-                                          memory_level,
-                                          all_tables_fragments,
-                                          frag_list,
-                                          cat_,
-                                          *chunk_iterators_ptr,
-                                          chunks);
+    fetch_result = ra_exe_unit_.union_all
+                       ? executor_->fetchUnionChunks(column_fetcher,
+                                                     ra_exe_unit_,
+                                                     chosen_device_id,
+                                                     memory_level,
+                                                     all_tables_fragments,
+                                                     frag_list,
+                                                     cat_,
+                                                     *chunk_iterators_ptr,
+                                                     chunks)
+                       : executor_->fetchChunks(column_fetcher,
+                                                ra_exe_unit_,
+                                                chosen_device_id,
+                                                memory_level,
+                                                all_tables_fragments,
+                                                frag_list,
+                                                cat_,
+                                                *chunk_iterators_ptr,
+                                                chunks);
+    VLOG(1) << "fetch_result=" << fetch_result;
     if (fetch_result.num_rows.empty()) {
       return;
     }
@@ -125,6 +145,31 @@ void Executor::ExecutionDispatch::runImpl(
     return;
   }
 
+  if (eo.executor_type == ExecutorType::Extern) {
+    if (ra_exe_unit_.input_descs.size() > 1) {
+      throw std::runtime_error("Joins not supported through external execution");
+    }
+    const auto query = serialize_to_sql(&ra_exe_unit_, executor_->getCatalog());
+    GroupByAndAggregate group_by_and_aggregate(executor_,
+                                               ExecutorDeviceType::CPU,
+                                               ra_exe_unit_,
+                                               query_infos_,
+                                               executor_->row_set_mem_owner_);
+    const auto query_mem_desc =
+        group_by_and_aggregate.initQueryMemoryDescriptor(false, 0, 8, nullptr, false);
+    auto device_results = run_query_external(
+        query,
+        fetch_result,
+        executor_->plan_state_.get(),
+        ExternalQueryOutputSpec{
+            *query_mem_desc,
+            target_exprs_to_infos(ra_exe_unit_.target_exprs, *query_mem_desc),
+            executor_});
+    std::lock_guard<std::mutex> lock(reduce_mutex_);
+    VLOG(2) << "device_results->rowCount()=" << device_results->rowCount();
+    all_fragment_results_.emplace_back(std::move(device_results), outer_tab_frag_ids);
+    return;
+  }
   const CompilationResult& compilation_result = query_comp_desc.getCompilationResult();
   std::unique_ptr<QueryExecutionContext> query_exe_context_owned;
   const bool do_render = render_info_ && render_info_->isPotentialInSituRender();
@@ -140,6 +185,7 @@ void Executor::ExecutionDispatch::runImpl(
                                                            frag_row_count.end(),
                                                            total_num_input_rows);
                   });
+    VLOG(2) << "total_num_input_rows=" << total_num_input_rows;
     // TODO(adb): we may want to take this early out for all queries, but we are most
     // likely to see this query pattern on the kernel per fragment path (e.g. with HAVING
     // 0=1)
@@ -152,22 +198,24 @@ void Executor::ExecutionDispatch::runImpl(
     }
   }
 
-  try {
-    query_exe_context_owned =
-        query_mem_desc.getQueryExecutionContext(ra_exe_unit_,
-                                                executor_,
-                                                chosen_device_type,
-                                                kernel_dispatch_mode,
-                                                chosen_device_id,
-                                                total_num_input_rows,
-                                                fetch_result.col_buffers,
-                                                fetch_result.frag_offsets,
-                                                row_set_mem_owner_,
-                                                compilation_result.output_columnar,
-                                                query_mem_desc.sortOnGpu(),
-                                                do_render ? render_info_ : nullptr);
-  } catch (const OutOfHostMemory& e) {
-    throw QueryExecutionError(ERR_OUT_OF_CPU_MEM);
+  if (eo.executor_type == ExecutorType::Native) {
+    try {
+      query_exe_context_owned =
+          query_mem_desc.getQueryExecutionContext(ra_exe_unit_,
+                                                  executor_,
+                                                  chosen_device_type,
+                                                  kernel_dispatch_mode,
+                                                  chosen_device_id,
+                                                  total_num_input_rows,
+                                                  fetch_result.col_buffers,
+                                                  fetch_result.frag_offsets,
+                                                  row_set_mem_owner_,
+                                                  compilation_result.output_columnar,
+                                                  query_mem_desc.sortOnGpu(),
+                                                  do_render ? render_info_ : nullptr);
+    } catch (const OutOfHostMemory& e) {
+      throw QueryExecutionError(ERR_OUT_OF_CPU_MEM);
+    }
   }
   QueryExecutionContext* query_exe_context{query_exe_context_owned.get()};
   CHECK(query_exe_context);
@@ -199,6 +247,10 @@ void Executor::ExecutionDispatch::runImpl(
                                                ra_exe_unit_.input_descs.size(),
                                                do_render ? render_info_ : nullptr);
   } else {
+    if (ra_exe_unit_.union_all) {
+      VLOG(1) << "outer_table_id=" << outer_table_id
+              << " ra_exe_unit_.scan_limit=" << ra_exe_unit_.scan_limit;
+    }
     err = executor_->executePlanWithGroupBy(ra_exe_unit_,
                                             compilation_result,
                                             query_comp_desc.hoistLiterals(),
@@ -211,12 +263,14 @@ void Executor::ExecutionDispatch::runImpl(
                                             fetch_result.frag_offsets,
                                             &cat_.getDataMgr(),
                                             chosen_device_id,
+                                            outer_table_id,
                                             ra_exe_unit_.scan_limit,
                                             start_rowid,
                                             ra_exe_unit_.input_descs.size(),
                                             do_render ? render_info_ : nullptr);
   }
   if (device_results) {
+    VLOG(2) << "device_results->rowCount()=" << device_results->rowCount();
     std::list<std::shared_ptr<Chunk_NS::Chunk>> chunks_to_hold;
     for (const auto chunk : chunks) {
       if (need_to_hold_chunk(chunk.get(), ra_exe_unit_)) {
@@ -225,6 +279,8 @@ void Executor::ExecutionDispatch::runImpl(
     }
     device_results->holdChunks(chunks_to_hold);
     device_results->holdChunkIterators(chunk_iterators_ptr);
+  } else {
+    VLOG(1) << "null device_results.";
   }
   if (err) {
     throw QueryExecutionError(err);
@@ -263,7 +319,7 @@ Executor::ExecutionDispatch::compile(const size_t max_groups_buffer_entry_guess,
   auto query_comp_desc = std::make_unique<QueryCompilationDescriptor>();
   std::unique_ptr<QueryMemoryDescriptor> query_mem_desc;
 
-  switch (co.device_type_) {
+  switch (co.device_type) {
     case ExecutorDeviceType::CPU: {
       query_mem_desc = query_comp_desc->compile(max_groups_buffer_entry_guess,
                                                 crt_min_byte_width,

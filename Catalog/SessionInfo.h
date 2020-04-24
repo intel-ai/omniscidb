@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,31 +29,15 @@
 #include <utility>
 #include <vector>
 
-#include "../QueryEngine/CompilationOptions.h"
-#include "../SqliteConnector/SqliteConnector.h"
-#include "LeafHostInfo.h"
-#include "SysCatalog.h"
+#include "Catalog/SysCatalog.h"
+#include "QueryEngine/CompilationOptions.h"
+#include "SqliteConnector/SqliteConnector.h"
 
-namespace Importer_NS {
-class Loader;
-class TypedImportBuffer;
-}  // namespace Importer_NS
+#include "LeafHostInfo.h"
 
 namespace Catalog_Namespace {
 
 class Catalog;
-
-// this class is defined to accommodate both Thrift and non-Thrift builds.
-class MapDHandler {
- public:
-  virtual void prepare_columnar_loader(
-      const std::string& session,
-      const std::string& table_name,
-      size_t num_cols,
-      std::unique_ptr<Importer_NS::Loader>* loader,
-      std::vector<std::unique_ptr<Importer_NS::TypedImportBuffer>>* import_buffers);
-  virtual ~MapDHandler() {}
-};
 
 /*
  * @type SessionInfo
@@ -61,32 +45,23 @@ class MapDHandler {
  */
 class SessionInfo {
  public:
-  SessionInfo(std::shared_ptr<MapDHandler> mapdHandler,
-              std::shared_ptr<Catalog> cat,
+  SessionInfo(std::shared_ptr<Catalog> cat,
               const UserMetadata& user,
               const ExecutorDeviceType t,
               const std::string& sid)
-      : mapdHandler_(mapdHandler)
-      , catalog_(cat)
+      : catalog_(cat)
       , currentUser_(user)
       , executor_device_type_(t)
       , session_id_(sid)
       , last_used_time_(time(0))
       , start_time_(time(0))
       , public_session_id_(public_session_id()) {}
-  SessionInfo(std::shared_ptr<Catalog> cat,
-              const UserMetadata& user,
-              const ExecutorDeviceType t,
-              const std::string& sid)
-      : SessionInfo(std::make_shared<MapDHandler>(), cat, user, t, sid) {}
   SessionInfo(const SessionInfo& s)
-      : mapdHandler_(s.mapdHandler_)
-      , catalog_(s.catalog_)
+      : catalog_(s.catalog_)
       , currentUser_(s.currentUser_)
       , executor_device_type_(static_cast<ExecutorDeviceType>(s.executor_device_type_))
       , session_id_(s.session_id_)
       , public_session_id_(s.public_session_id_) {}
-  MapDHandler* get_mapdHandler() const { return mapdHandler_.get(); }
   Catalog& getCatalog() const { return *catalog_; }
   std::shared_ptr<Catalog> get_catalog_ptr() const { return catalog_; }
   void set_catalog_ptr(std::shared_ptr<Catalog> c) { catalog_ = c; }
@@ -104,9 +79,12 @@ class SessionInfo {
   time_t get_start_time() const { return start_time_; }
   std::string const& get_public_session_id() const { return public_session_id_; }
   operator std::string() const { return public_session_id_; }
+  std::string const& get_connection_info() const { return connection_info_; }
+  void set_connection_info(const std::string& connection) {
+    connection_info_ = connection;
+  }
 
  private:
-  std::shared_ptr<MapDHandler> mapdHandler_;
   std::shared_ptr<Catalog> catalog_;
   UserMetadata currentUser_;
   std::atomic<ExecutorDeviceType> executor_device_type_;
@@ -114,6 +92,8 @@ class SessionInfo {
   std::atomic<time_t> last_used_time_;  // for tracking active session duration
   std::atomic<time_t> start_time_;      // for invalidating session after tolerance period
   const std::string public_session_id_;
+  std::string
+      connection_info_;  // String containing connection protocol (tcp/http) and address
   std::string public_session_id() const;
 };
 

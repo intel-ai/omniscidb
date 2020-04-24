@@ -15,6 +15,8 @@
  */
 
 #include "ExtensionFunctionsBinding.h"
+#include "ExternalExecutor.h"
+
 #include <algorithm>
 
 // A rather crude function binding logic based on the types of the arguments.
@@ -31,6 +33,28 @@
  */
 
 namespace {
+
+ExtArgumentType get_array_arg_elem_type(const ExtArgumentType ext_arg_array_type) {
+  switch (ext_arg_array_type) {
+    case ExtArgumentType::ArrayInt8:
+      return ExtArgumentType::Int8;
+    case ExtArgumentType::ArrayInt16:
+      return ExtArgumentType::Int16;
+    case ExtArgumentType::ArrayInt32:
+      return ExtArgumentType::Int32;
+    case ExtArgumentType::ArrayInt64:
+      return ExtArgumentType::Int64;
+    case ExtArgumentType::ArrayFloat:
+      return ExtArgumentType::Float;
+    case ExtArgumentType::ArrayDouble:
+      return ExtArgumentType::Double;
+    case ExtArgumentType::ArrayBool:
+      return ExtArgumentType::Bool;
+    default:
+      UNREACHABLE();
+  }
+  return ExtArgumentType{};
+}
 
 static int match_arguments(const SQLTypeInfo& arg_type,
                            int sig_pos,
@@ -60,6 +84,7 @@ static int match_arguments(const SQLTypeInfo& arg_type,
    */
   auto stype = sig_types[sig_pos];
   int max_pos = sig_types.size() - 1;
+
   switch (arg_type.get_type()) {
     case kBOOLEAN:
       if (stype == ExtArgumentType::Bool) {
@@ -169,13 +194,25 @@ static int match_arguments(const SQLTypeInfo& arg_type,
     case kARRAY:
       if ((stype == ExtArgumentType::PInt8 || stype == ExtArgumentType::PInt16 ||
            stype == ExtArgumentType::PInt32 || stype == ExtArgumentType::PInt64 ||
-           stype == ExtArgumentType::PFloat || stype == ExtArgumentType::PDouble) &&
+           stype == ExtArgumentType::PFloat || stype == ExtArgumentType::PDouble ||
+           stype == ExtArgumentType::PBool) &&
           sig_pos < max_pos && sig_types[sig_pos + 1] == ExtArgumentType::Int64) {
         penalty_score += 1000;
         return 2;
       } else if (is_ext_arg_type_array(stype)) {
-        penalty_score += 1000;
-        return 1;
+        // array arguments must match exactly
+        CHECK(arg_type.is_array());
+        const auto stype_ti = ext_arg_type_to_type_info(get_array_arg_elem_type(stype));
+        if (arg_type.get_elem_type() == kBOOLEAN && stype_ti.get_type() == kTINYINT) {
+          /* Boolean array has the same low-level structure as Int8 array. */
+          penalty_score += 1000;
+          return 1;
+        } else if (arg_type.get_elem_type().get_type() == stype_ti.get_type()) {
+          penalty_score += 1000;
+          return 1;
+        } else {
+          return -1;
+        }
       }
       break;
     case kPOLYGON:
@@ -201,6 +238,9 @@ static int match_arguments(const SQLTypeInfo& arg_type,
           sig_types[sig_pos + 5] == ExtArgumentType::Int64) {
         penalty_score += 1000;
         return 6;
+      } else if (stype == ExtArgumentType::GeoMultiPolygon) {
+        penalty_score += 1000;
+        return 1;
       }
       break;
     case kDECIMAL:
@@ -217,7 +257,8 @@ static int match_arguments(const SQLTypeInfo& arg_type,
     case kNULLT:  // NULL maps to a pointer and size argument
       if ((stype == ExtArgumentType::PInt8 || stype == ExtArgumentType::PInt16 ||
            stype == ExtArgumentType::PInt32 || stype == ExtArgumentType::PInt64 ||
-           stype == ExtArgumentType::PFloat || stype == ExtArgumentType::PDouble) &&
+           stype == ExtArgumentType::PFloat || stype == ExtArgumentType::PDouble ||
+           stype == ExtArgumentType::PBool) &&
           sig_pos < max_pos && sig_types[sig_pos + 1] == ExtArgumentType::Int64) {
         penalty_score += 1000;
         return 2;
@@ -322,8 +363,8 @@ ExtensionFunction bind_function(std::string name,
     }
     auto sarg_types = ExtensionFunctionsWhitelist::toString(arg_types);
     if (!ext_funcs.size()) {
-      throw std::runtime_error("Function " + name + "(" + sarg_types +
-                               ") not supported.");
+      throw NativeExecutionError("Function " + name + "(" + sarg_types +
+                                 ") not supported.");
     }
     auto choices = ExtensionFunctionsWhitelist::toString(ext_funcs, "    ");
     throw std::runtime_error(
@@ -359,6 +400,7 @@ bool is_ext_arg_type_array(const ExtArgumentType ext_arg_type) {
     case ExtArgumentType::ArrayInt64:
     case ExtArgumentType::ArrayFloat:
     case ExtArgumentType::ArrayDouble:
+    case ExtArgumentType::ArrayBool:
       return true;
 
     default:
@@ -371,6 +413,7 @@ bool is_ext_arg_type_geo(const ExtArgumentType ext_arg_type) {
     case ExtArgumentType::GeoPoint:
     case ExtArgumentType::GeoLineString:
     case ExtArgumentType::GeoPolygon:
+    case ExtArgumentType::GeoMultiPolygon:
       return true;
 
     default:

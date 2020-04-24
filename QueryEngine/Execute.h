@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,10 +37,8 @@
 #include "WindowContext.h"
 
 #include "../Chunk/Chunk.h"
-#include "../Fragmenter/InsertOrderFragmenter.h"
-#include "../Planner/Planner.h"
 #include "../Shared/Logger.h"
-#include "../Shared/MapDParameters.h"
+#include "../Shared/SystemParameters.h"
 #include "../Shared/measure.h"
 #include "../Shared/thread_count.h"
 #include "../StringDictionary/LruCache.hpp"
@@ -53,8 +51,8 @@
 #include <llvm/Transforms/Utils/ValueMapper.h>
 #include <rapidjson/document.h>
 
-#include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -82,6 +80,7 @@ extern float g_filter_push_down_high_frac;
 extern size_t g_filter_push_down_passing_row_ubound;
 extern bool g_enable_columnar_output;
 extern bool g_enable_overlaps_hashjoin;
+extern bool g_enable_hashjoin_many_to_many;
 extern size_t g_overlaps_max_table_size_bytes;
 extern bool g_strip_join_covered_quals;
 extern size_t g_constrained_by_in_threshold;
@@ -91,6 +90,10 @@ extern bool g_enable_table_functions;
 extern size_t g_max_memory_allocation_size;
 extern double g_bump_allocator_step_reduction;
 extern bool g_enable_direct_columnarization;
+extern bool g_enable_lazy_fetch;
+extern bool g_enable_multifrag_rs;
+extern bool g_enable_runtime_query_interrupt;
+extern unsigned g_runtime_query_interrupt_frequency;
 
 class QueryCompilationDescriptor;
 using QueryCompilationDescriptorOwned = std::unique_ptr<QueryCompilationDescriptor>;
@@ -176,8 +179,8 @@ inline const ColumnDescriptor* get_column_descriptor_maybe(
   return table_id > 0 ? get_column_descriptor(col_id, table_id, cat) : nullptr;
 }
 
-inline const ResultSetPtr& get_temporary_table(const TemporaryTables* temporary_tables,
-                                               const int table_id) {
+inline const TemporaryTable& get_temporary_table(const TemporaryTables* temporary_tables,
+                                                 const int table_id) {
   CHECK_LT(table_id, 0);
   const auto it = temporary_tables->find(table_id);
   CHECK(it != temporary_tables->end());
@@ -195,7 +198,7 @@ inline const SQLTypeInfo get_column_type(const int col_id,
     return cd->columnType;
   }
   const auto& temp = get_temporary_table(temporary_tables, table_id);
-  return temp->getColType(col_id);
+  return temp.getColType(col_id);
 }
 
 template <typename PtrTy>
@@ -225,7 +228,6 @@ inline const ColumnarResults* columnarize_result(
     const ResultSetPtr& result,
     const int frag_id) {
   INJECT_TIMER(columnarize_result);
-  CHECK_EQ(0, frag_id);
   return rows_to_columnar_results(row_set_mem_owner, result, result->colCount());
 }
 
@@ -317,6 +319,8 @@ class UpdateLogForFragment : public RowDataProvider {
 
   using Callback = std::function<void(const UpdateLogForFragment&)>;
 
+  auto getResultSet() const { return rs_; }
+
  private:
   FragmentInfoType const& fragment_info_;
   size_t fragment_index_;
@@ -326,6 +330,14 @@ class UpdateLogForFragment : public RowDataProvider {
 using LLVMValueVector = std::vector<llvm::Value*>;
 
 class QueryCompilationDescriptor;
+
+struct FetchResult {
+  std::vector<std::vector<const int8_t*>> col_buffers;
+  std::vector<std::vector<int64_t>> num_rows;
+  std::vector<std::vector<uint64_t>> frag_offsets;
+};
+
+std::ostream& operator<<(std::ostream&, FetchResult const&);
 
 class Executor {
   static_assert(sizeof(float) == 4 && sizeof(double) == 8,
@@ -338,15 +350,13 @@ class Executor {
            const size_t block_size_x,
            const size_t grid_size_x,
            const std::string& debug_dir,
-           const std::string& debug_file,
-           ::QueryRenderer::QueryRenderManager* render_manager);
+           const std::string& debug_file);
 
   static std::shared_ptr<Executor> getExecutor(
       const int db_id,
       const std::string& debug_dir = "",
       const std::string& debug_file = "",
-      const MapDParameters mapd_parameters = MapDParameters(),
-      ::QueryRenderer::QueryRenderManager* render_manager = nullptr);
+      const SystemParameters system_parameters = SystemParameters());
 
   static void nukeCacheOfExecutors() {
     std::lock_guard<std::mutex> flush_lock(
@@ -356,73 +366,6 @@ class Executor {
   }
 
   static void clearMemory(const Data_Namespace::MemoryLevel memory_level);
-
-  typedef std::tuple<std::string, const Analyzer::Expr*, int64_t, const size_t> AggInfo;
-
-  std::shared_ptr<ResultSet> execute(const Planner::RootPlan* root_plan,
-                                     const Catalog_Namespace::SessionInfo& session,
-                                     const bool hoist_literals,
-                                     const ExecutorDeviceType device_type,
-                                     const ExecutorOptLevel,
-                                     const bool allow_multifrag,
-                                     const bool allow_loop_joins,
-                                     RenderInfo* render_query_data = nullptr);
-
-  std::shared_ptr<ResultSet> renderPointsNonInSitu(
-      const std::string& queryStr,
-      const ExecutionResult& results,
-      const Catalog_Namespace::SessionInfo& session,
-      const int render_widget_id,
-      const ::QueryRenderer::JSONLocation* data_loc,
-      RenderInfo* render_query_data);
-
-  std::shared_ptr<ResultSet> renderPointsInSitu(RenderInfo* render_query_data);
-
-  std::shared_ptr<ResultSet> renderPolygonsNonInSitu(
-      const std::string& queryStr,
-      const ExecutionResult& results,
-      const Catalog_Namespace::SessionInfo& session,
-      const int render_widget_id,
-      const ::QueryRenderer::JSONLocation* data_loc,
-      RenderInfo* render_query_data,
-      const std::string& poly_table_name);
-
-  std::shared_ptr<ResultSet> renderLinesNonInSitu(
-      const std::string& queryStr,
-      const ExecutionResult& results,
-      const Catalog_Namespace::SessionInfo& session,
-      const int render_widget_id,
-      const ::QueryRenderer::JSONLocation* data_loc,
-      RenderInfo* render_query_data);
-
-#if HAVE_CUDA
-  enum class InSituGeoRenderType { kPOLYGONS, kLINES };
-
-  std::shared_ptr<ResultSet> renderGeoInSitu(
-      const InSituGeoRenderType in_situ_geo_render_type,
-      const std::string& queryStr,
-      const ExecutionResult& results,
-      const Catalog_Namespace::SessionInfo& session,
-      const int render_widget_id,
-      const ::QueryRenderer::JSONLocation* data_loc,
-      RenderInfo* render_query_data,
-      const std::string& line_table_name);
-#endif
-
-  std::vector<int32_t> getStringIds(
-      const std::string& col_name,
-      const std::vector<std::string>& col_vals,
-      const ::QueryRenderer::QueryDataLayout* query_data_layout,
-      const ResultSet* results,
-      const std::shared_ptr<RowSetMemoryOwner>& row_set_mem_owner,
-      const bool warn = false) const;
-
-  std::vector<std::string> getStringsFromIds(
-      const std::string& col_name,
-      const std::vector<int32_t>& ids,
-      const ::QueryRenderer::QueryDataLayout* query_data_layout,
-      const ResultSet* results,
-      const std::shared_ptr<RowSetMemoryOwner>& row_set_mem_owner) const;
 
   StringDictionaryProxy* getStringDictionaryProxy(
       const int dictId,
@@ -462,7 +405,7 @@ class Executor {
 
   void registerActiveModule(void* module, const int device_id) const;
   void unregisterActiveModule(void* module, const int device_id) const;
-  void interrupt();
+  void interrupt(std::string query_session = "", std::string interrupt_session = "");
   void resetInterrupt();
 
   static const size_t high_scan_limit{32000000};
@@ -523,12 +466,6 @@ class Executor {
     }
     return false;
   }
-
-  struct FetchResult {
-    std::vector<std::vector<const int8_t*>> col_buffers;
-    std::vector<std::vector<int64_t>> num_rows;
-    std::vector<std::vector<uint64_t>> frag_offsets;
-  };
 
   bool needFetchAllFragments(const InputColDescriptor& col_desc,
                              const RelAlgExecutionUnit& ra_exe_unit,
@@ -601,17 +538,17 @@ class Executor {
     friend class QueryCompilationDescriptor;
   };
 
-  ResultSetPtr executeWorkUnit(size_t& max_groups_buffer_entry_guess,
-                               const bool is_agg,
-                               const std::vector<InputTableInfo>&,
-                               const RelAlgExecutionUnit&,
-                               const CompilationOptions&,
-                               const ExecutionOptions& options,
-                               const Catalog_Namespace::Catalog&,
-                               std::shared_ptr<RowSetMemoryOwner>,
-                               RenderInfo* render_info,
-                               const bool has_cardinality_estimation,
-                               ColumnCacheMap& column_cache);
+  TemporaryTable executeWorkUnit(size_t& max_groups_buffer_entry_guess,
+                                 const bool is_agg,
+                                 const std::vector<InputTableInfo>&,
+                                 const RelAlgExecutionUnit&,
+                                 const CompilationOptions&,
+                                 const ExecutionOptions& options,
+                                 const Catalog_Namespace::Catalog&,
+                                 std::shared_ptr<RowSetMemoryOwner>,
+                                 RenderInfo* render_info,
+                                 const bool has_cardinality_estimation,
+                                 ColumnCacheMap& column_cache);
 
   void executeUpdate(const RelAlgExecutionUnit& ra_exe_unit,
                      const std::vector<InputTableInfo>& table_infos,
@@ -620,7 +557,7 @@ class Executor {
                      const Catalog_Namespace::Catalog& cat,
                      std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
                      const UpdateLogForFragment::Callback& cb,
-                     const bool is_agg = false);
+                     const bool is_agg);
 
   using PerFragmentCallBack =
       std::function<void(ResultSetPtr, const Fragmenter_Namespace::FragmentInfo&)>;
@@ -667,6 +604,7 @@ class Executor {
 
   std::unordered_map<int, const Analyzer::BinOper*> getInnerTabIdToJoinCond() const;
 
+  template <typename THREAD_POOL>
   void dispatchFragments(
       const std::function<void(const ExecutorDeviceType chosen_device_type,
                                int chosen_device_id,
@@ -714,6 +652,16 @@ class Executor {
                           std::list<ChunkIter>&,
                           std::list<std::shared_ptr<Chunk_NS::Chunk>>&);
 
+  FetchResult fetchUnionChunks(const ColumnFetcher&,
+                               const RelAlgExecutionUnit& ra_exe_unit,
+                               const int device_id,
+                               const Data_Namespace::MemoryLevel,
+                               const std::map<int, const TableFragments*>&,
+                               const FragmentsList& selected_fragments,
+                               const Catalog_Namespace::Catalog&,
+                               std::list<ChunkIter>&,
+                               std::list<std::shared_ptr<Chunk_NS::Chunk>>&);
+
   std::pair<std::vector<std::vector<int64_t>>, std::vector<std::vector<uint64_t>>>
   getRowCountAndOffsetForAllFrags(
       const RelAlgExecutionUnit& ra_exe_unit,
@@ -722,6 +670,13 @@ class Executor {
       const std::map<int, const TableFragments*>& all_tables_fragments);
 
   void buildSelectedFragsMapping(
+      std::vector<std::vector<size_t>>& selected_fragments_crossjoin,
+      std::vector<size_t>& local_col_to_frag_pos,
+      const std::list<std::shared_ptr<const InputColDescriptor>>& col_global_ids,
+      const FragmentsList& selected_fragments,
+      const RelAlgExecutionUnit& ra_exe_unit);
+
+  void buildSelectedFragsMappingForUnion(
       std::vector<std::vector<size_t>>& selected_fragments_crossjoin,
       std::vector<size_t>& local_col_to_frag_pos,
       const std::list<std::shared_ptr<const InputColDescriptor>>& col_global_ids,
@@ -744,6 +699,7 @@ class Executor {
                                  const std::vector<std::vector<uint64_t>>& frag_offsets,
                                  Data_Namespace::DataMgr*,
                                  const int device_id,
+                                 const int outer_table_id,
                                  const int64_t limit,
                                  const uint32_t start_rowid,
                                  const uint32_t num_tables,
@@ -781,7 +737,7 @@ class Executor {
                              CodeCache&);
 
  private:
-  ResultSetPtr resultsUnion(ExecutionDispatch& execution_dispatch);
+  TemporaryTable resultsUnion(ExecutionDispatch& execution_dispatch, bool merge = true);
   std::vector<int64_t> getJoinHashTablePtrs(const ExecutorDeviceType device_type,
                                             const int device_id);
   ResultSetPtr reduceMultiDeviceResults(
@@ -798,20 +754,19 @@ class Executor {
       std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& all_fragment_results,
       std::shared_ptr<RowSetMemoryOwner>,
       const QueryMemoryDescriptor&) const;
-  void executeSimpleInsert(const Planner::RootPlan* root_plan);
 
-  ResultSetPtr executeWorkUnitImpl(size_t& max_groups_buffer_entry_guess,
-                                   const bool is_agg,
-                                   const bool allow_single_frag_table_opt,
-                                   const std::vector<InputTableInfo>&,
-                                   const RelAlgExecutionUnit&,
-                                   const CompilationOptions&,
-                                   const ExecutionOptions& options,
-                                   const Catalog_Namespace::Catalog&,
-                                   std::shared_ptr<RowSetMemoryOwner>,
-                                   RenderInfo* render_info,
-                                   const bool has_cardinality_estimation,
-                                   ColumnCacheMap& column_cache);
+  TemporaryTable executeWorkUnitImpl(size_t& max_groups_buffer_entry_guess,
+                                     const bool is_agg,
+                                     const bool allow_single_frag_table_opt,
+                                     const std::vector<InputTableInfo>&,
+                                     const RelAlgExecutionUnit&,
+                                     const CompilationOptions&,
+                                     const ExecutionOptions& options,
+                                     const Catalog_Namespace::Catalog&,
+                                     std::shared_ptr<RowSetMemoryOwner>,
+                                     RenderInfo* render_info,
+                                     const bool has_cardinality_estimation,
+                                     ColumnCacheMap& column_cache);
 
   std::vector<llvm::Value*> inlineHoistedLiterals();
 
@@ -869,6 +824,7 @@ class Executor {
 
   void createErrorCheckControlFlow(llvm::Function* query_func,
                                    bool run_with_dynamic_watchdog,
+                                   bool run_with_allowing_runtime_interrupt,
                                    ExecutorDeviceType device_type);
 
   void preloadFragOffsets(const std::vector<InputDescriptor>& input_descs,
@@ -923,7 +879,8 @@ class Executor {
   llvm::Value* castToFP(llvm::Value* val);
   llvm::Value* castToIntPtrTyIn(llvm::Value* val, const size_t bit_width);
 
-  RelAlgExecutionUnit addDeletedColumn(const RelAlgExecutionUnit& ra_exe_unit);
+  RelAlgExecutionUnit addDeletedColumn(const RelAlgExecutionUnit& ra_exe_unit,
+                                       const CompilationOptions& co);
 
   std::pair<bool, int64_t> skipFragment(
       const InputDescriptor& table_desc,
@@ -948,6 +905,15 @@ class Executor {
  public:
   void setupCaching(const std::unordered_set<PhysicalInput>& phys_inputs,
                     const std::unordered_set<int>& phys_table_ids);
+
+  void setCurrentQuerySession(const std::string& query_session);
+  std::string& getCurrentQuerySession();
+  bool checkCurrentQuerySession(const std::string& candidate_query_session);
+  void invalidateQuerySession();
+  bool addToQuerySessionList(const std::string& query_session);
+  bool removeFromQuerySessionList(const std::string& query_session);
+  void setQuerySessionAsInterrupted(const std::string& query_session);
+  bool checkIsQuerySessionInterrupted(const std::string& query_session);
 
  private:
   std::vector<std::pair<void*, void*>> getCodeFromCache(const CodeCacheKey&,
@@ -1004,8 +970,6 @@ class Executor {
   CodeCache cpu_code_cache_;
   CodeCache gpu_code_cache_;
 
-  ::QueryRenderer::QueryRenderManager* render_manager_;
-
   static const size_t baseline_threshold{
       1000000};  // if a perfect hash needs more entries, use baseline
   static const size_t code_cache_size{10000};
@@ -1023,13 +987,17 @@ class Executor {
   AggregatedColRange agg_col_range_cache_;
   StringDictionaryGenerations string_dictionary_generations_;
   TableGenerations table_generations_;
+  static std::mutex executor_session_mutex_;
+  static std::string current_query_session_;
+  // a pair of <query_session, interrupted_flag>
+  static std::map<std::string, bool> queries_interrupt_flag_;
 
-  static std::map<std::pair<int, ::QueryRenderer::QueryRenderManager*>,
-                  std::shared_ptr<Executor>>
-      executors_;
+  static std::map<int, std::shared_ptr<Executor>> executors_;
+  static std::atomic_flag execute_spin_lock_;
   static std::mutex execute_mutex_;
   static mapd_shared_mutex executors_cache_mutex_;
 
+ public:
   static const int32_t ERR_DIV_BY_ZERO{1};
   static const int32_t ERR_OUT_OF_GPU_MEM{2};
   static const int32_t ERR_OUT_OF_SLOTS{3};
@@ -1037,13 +1005,14 @@ class Executor {
   static const int32_t ERR_OUT_OF_RENDER_MEM{5};
   static const int32_t ERR_OUT_OF_CPU_MEM{6};
   static const int32_t ERR_OVERFLOW_OR_UNDERFLOW{7};
-  static const int32_t ERR_SPECULATIVE_TOP_OOM{8};
   static const int32_t ERR_OUT_OF_TIME{9};
   static const int32_t ERR_INTERRUPTED{10};
   static const int32_t ERR_COLUMNAR_CONVERSION_NOT_SUPPORTED{11};
   static const int32_t ERR_TOO_MANY_LITERALS{12};
   static const int32_t ERR_STRING_CONST_IN_RESULTSET{13};
   static const int32_t ERR_STREAMING_TOP_N_NOT_SUPPORTED_IN_RENDER_QUERY{14};
+  static const int32_t ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES{15};
+
   friend class BaselineJoinHashTable;
   friend class CodeGenerator;
   friend class ColumnFetcher;
@@ -1066,9 +1035,6 @@ class Executor {
   friend class TableFunctionExecutionContext;
   friend struct TargetExprCodegenBuilder;
   friend struct TargetExprCodegen;
-
-  template <typename META_TYPE_CLASS>
-  friend class AggregateReductionEgress;
 };
 
 inline std::string get_null_check_suffix(const SQLTypeInfo& lhs_ti,

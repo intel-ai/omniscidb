@@ -3,6 +3,25 @@
 set -e
 set -x
 
+# Parse inputs
+TSAN=false
+COMPRESS=false
+
+while (( $# )); do
+  case "$1" in
+    --compress)
+      COMPRESS=true
+      ;;
+    --tsan)
+      TSAN=true
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
@@ -10,7 +29,19 @@ PREFIX=/usr/local/mapd-deps
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source $SCRIPTS_DIR/common-functions.sh
+
+# Establish distro
 source /etc/os-release
+if [ "$ID" == "ubuntu" ] ; then
+  PACKAGER="apt -y"
+  if [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
+    echo "Ubuntu 19.10, 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
+    exit 1
+  fi
+else
+  echo "Only Ubuntu is supported by this script"
+  exit 1
+fi
 
 sudo mkdir -p $PREFIX
 sudo chown -R $(id -u) $PREFIX
@@ -20,8 +51,6 @@ sudo apt install -y \
     software-properties-common \
     build-essential \
     ccache \
-    cmake \
-    cmake-curses-gui \
     git \
     wget \
     curl \
@@ -60,7 +89,7 @@ sudo apt install -y \
     autoconf-archive \
     automake \
     bison \
-    flex-old \
+    flex \
     libpng-dev \
     rsync \
     unzip \
@@ -76,6 +105,10 @@ sudo apt install -y \
 export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PKG_CONFIG_PATH
 export PATH=$PREFIX/bin:$PATH
 
+install_ninja
+
+install_cmake
+
 # llvm
 # (see common-functions.sh)
 install_llvm
@@ -86,7 +119,7 @@ install_gdal
 # install AWS core and s3 sdk
 install_awscpp -j $(nproc)
 
-VERS=0.11.0
+VERS=0.13.0
 wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
 tar xvf thrift-$VERS.tar.gz
 pushd thrift-$VERS
@@ -97,6 +130,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-ruby=no \
     --with-qt4=no \
     --with-qt5=no \
+    --with-java=no \
     --prefix=$PREFIX
 make -j $(nproc)
 make install
@@ -134,6 +168,9 @@ popd
 
 download_make_install ${HTTP_DEPS}/bisonpp-1.21-45.tar.gz bison++-1.21
 
+# TBB
+install_tbb
+
 # Apache Arrow (see common-functions.sh)
 ARROW_BOOST_USE_SHARED="ON"
 install_arrow
@@ -164,7 +201,7 @@ popd
 install_rdkafka
 
 # glslang (with spirv-tools)
-VERS=7.11.3113 # 2/8/19
+VERS=7.12.3352 # 8/20/19
 rm -rf glslang
 mkdir -p glslang
 pushd glslang
@@ -185,7 +222,7 @@ popd # glslang-$VERS
 popd # glslang
 
 # spirv-cross
-VERS=2019-04-26
+VERS=2019-09-04
 rm -rf spirv-cross
 mkdir -p spirv-cross
 pushd spirv-cross
@@ -197,6 +234,7 @@ pushd build
 cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=on \
     -DSPIRV_CROSS_ENABLE_TESTS=off \
     ..
 make -j $(nproc)
@@ -206,15 +244,15 @@ popd # SPIRV-Cross-$VERS
 popd # spirv-cross
 
 # Vulkan
-VERS=1.1.101.0 # 3/1/19
+# Custom tarball which excludes the spir-v toolchain
+VERS=1.1.126.0 # 11/1/19
 rm -rf vulkan
 mkdir -p vulkan
 pushd vulkan
-wget --continue --no-cookies ${HTTP_DEPS}/vulkansdk-linux-x86_64-$VERS.tar.gz -O vulkansdk-linux-x86_64-$VERS.tar.gz
-tar xvf vulkansdk-linux-x86_64-$VERS.tar.gz
+wget --continue ${HTTP_DEPS}/vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz -O vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz
+tar xvf vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz
 rsync -av $VERS/x86_64/* $PREFIX
 popd # vulkan
-
 
 # OpenSAML
 download_make_install ${HTTP_DEPS}/xml-security-c-2.0.2.tar.gz "" "--without-xalan"
@@ -233,7 +271,7 @@ PATH=\$PREFIX/go/bin:\$PATH
 PATH=\$PREFIX/bin:\$PATH
 
 VULKAN_SDK=\$PREFIX
-VK_LAYER_PATH=\$PREFIX/etc/explicit_layer.d
+VK_LAYER_PATH=\$PREFIX/etc/vulkan/explicit_layer.d
 
 CMAKE_PREFIX_PATH=\$PREFIX:\$CMAKE_PREFIX_PATH
 
@@ -246,6 +284,11 @@ echo
 echo "Done. Be sure to source the 'mapd-deps.sh' file to pick up the required environment variables:"
 echo "    source $PREFIX/mapd-deps.sh"
 
-if [ "$1" = "--compress" ] ; then
-    tar acf mapd-deps-ubuntu-$VERSION_ID-$SUFFIX.tar.xz -C $PREFIX .
+if [ "$COMPRESS" = "true" ] ; then
+    if [ "$TSAN" = "false" ]; then
+      TARBALL_TSAN=""
+    elif [ "$TSAN" = "true" ]; then
+      TARBALL_TSAN="tsan-"
+    fi
+    tar acvf mapd-deps-ubuntu-${VERSION_ID}-${TARBALL_TSAN}${SUFFIX}.tar.xz -C ${PREFIX} .
 fi

@@ -24,7 +24,7 @@
 #include "ExpressionRewrite.h"
 #include "ExtensionFunctionsBinding.h"
 #include "ExtensionFunctionsWhitelist.h"
-#include "RelAlgAbstractInterpreter.h"
+#include "RelAlgDagBuilder.h"
 #include "WindowContext.h"
 
 #include <future>
@@ -47,8 +47,10 @@ SQLTypeInfo build_type_info(const SQLTypes sql_type,
                             const int scale,
                             const int precision) {
   SQLTypeInfo ti(sql_type, 0, 0, true);
-  ti.set_scale(scale);
-  ti.set_precision(precision);
+  if (ti.is_decimal()) {
+    ti.set_scale(scale);
+    ti.set_precision(precision);
+  }
   return ti;
 }
 
@@ -248,11 +250,11 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateAggregateRex(
 
 std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateLiteral(
     const RexLiteral* rex_literal) {
-  const auto lit_ti = build_type_info(
+  auto lit_ti = build_type_info(
       rex_literal->getType(), rex_literal->getScale(), rex_literal->getPrecision());
-  const auto target_ti = build_type_info(rex_literal->getTargetType(),
-                                         rex_literal->getTypeScale(),
-                                         rex_literal->getTypePrecision());
+  auto target_ti = build_type_info(rex_literal->getTargetType(),
+                                   rex_literal->getTypeScale(),
+                                   rex_literal->getTypePrecision());
   switch (rex_literal->getType()) {
     case kDECIMAL: {
       const auto val = rex_literal->getVal<int64_t>();
@@ -303,6 +305,12 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateLiteral(
       return makeExpr<Analyzer::Constant>(rex_literal->getType(), false, d);
     }
     case kNULLT: {
+      if (target_ti.is_array()) {
+        Analyzer::ExpressionPtrVector args;
+        // defaulting to valid sub-type for convenience
+        target_ti.set_subtype(kBOOLEAN);
+        return makeExpr<Analyzer::ArrayExpr>(target_ti, args, -1, true);
+      }
       return makeExpr<Analyzer::Constant>(rex_literal->getTargetType(), true, Datum{0});
     }
     default: {
@@ -320,14 +328,17 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateScalarSubquery(
   CHECK(rex_subquery);
   auto result = rex_subquery->getExecutionResult();
   auto row_set = result->getRows();
-  if (row_set->rowCount() > size_t(1)) {
+  const size_t row_count = row_set->rowCount();
+  if (row_count > size_t(1)) {
     throw std::runtime_error("Scalar sub-query returned multiple rows");
   }
-  if (row_set->rowCount() < size_t(1)) {
-    CHECK_EQ(row_set->rowCount(), size_t(0));
+  if (row_count == size_t(0)) {
     throw std::runtime_error("Scalar sub-query returned no results");
   }
+  CHECK_EQ(row_count, size_t(1));
+  row_set->moveToBegin();
   auto first_row = row_set->getNextRow(false, false);
+  CHECK_EQ(first_row.size(), size_t(1));
   auto scalar_tv = boost::get<ScalarTargetValue>(&first_row[0]);
   auto ti = rex_subquery->getType();
   if (ti.is_string()) {
@@ -343,7 +354,8 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateInput(
     const RexInput* rex_input) const {
   const auto source = rex_input->getSourceNode();
   const auto it_rte_idx = input_to_nest_level_.find(source);
-  CHECK(it_rte_idx != input_to_nest_level_.end());
+  CHECK(it_rte_idx != input_to_nest_level_.end())
+      << "Not found in input_to_nest_level_, source=" << source->toString();
   const int rte_idx = it_rte_idx->second;
   const auto scan_source = dynamic_cast<const RelScan*>(source);
   const auto& in_metainfo = source->getOutputMetainfo();
@@ -372,7 +384,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateInput(
     return std::make_shared<Analyzer::ColumnVar>(
         col_ti, table_desc->tableId, cd->columnId, rte_idx);
   }
-  CHECK(!in_metainfo.empty());
+  CHECK(!in_metainfo.empty()) << "for " << source->toString();
   CHECK_GE(rte_idx, 0);
   const size_t col_id = rex_input->getIndex();
   CHECK_LT(col_id, in_metainfo.size());
@@ -936,14 +948,23 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateUnlikely(
   return makeExpr<Analyzer::LikelihoodExpr>(arg, 0.0625);
 }
 
+namespace {
+
+inline void validate_datetime_datepart_argument(
+    const std::shared_ptr<Analyzer::Constant> literal_expr) {
+  if (!literal_expr || literal_expr->get_is_null()) {
+    throw std::runtime_error("The 'DatePart' argument must be a not 'null' literal.");
+  }
+}
+
+}  // namespace
+
 std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateExtract(
     const RexFunctionOperator* rex_function) const {
   CHECK_EQ(size_t(2), rex_function->size());
   const auto timeunit = translateScalarRex(rex_function->getOperand(0));
   const auto timeunit_lit = std::dynamic_pointer_cast<Analyzer::Constant>(timeunit);
-  if (!timeunit_lit) {
-    throw std::runtime_error("The time unit parameter must be a literal.");
-  }
+  validate_datetime_datepart_argument(timeunit_lit);
   const auto from_expr = translateScalarRex(rex_function->getOperand(1));
   const bool is_date_trunc = rex_function->getName() == "PG_DATE_TRUNC"sv;
   if (is_date_trunc) {
@@ -1002,11 +1023,13 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateDateadd(
   CHECK_EQ(size_t(3), rex_function->size());
   const auto timeunit = translateScalarRex(rex_function->getOperand(0));
   const auto timeunit_lit = std::dynamic_pointer_cast<Analyzer::Constant>(timeunit);
-  if (!timeunit_lit) {
-    throw std::runtime_error("The time unit parameter must be a literal.");
-  }
-
+  validate_datetime_datepart_argument(timeunit_lit);
   const auto number_units = translateScalarRex(rex_function->getOperand(1));
+  const auto number_units_const =
+      std::dynamic_pointer_cast<Analyzer::Constant>(number_units);
+  if (number_units_const && number_units_const->get_is_null()) {
+    throw std::runtime_error("The 'Interval' argument literal must not be 'null'.");
+  }
   auto cast_number_units = number_units->add_cast(SQLTypeInfo(kBIGINT, false));
   const auto datetime = translateScalarRex(rex_function->getOperand(2));
   const auto& datetime_ti = datetime->get_type_info();
@@ -1145,9 +1168,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateDatediff(
   CHECK_EQ(size_t(3), rex_function->size());
   const auto timeunit = translateScalarRex(rex_function->getOperand(0));
   const auto timeunit_lit = std::dynamic_pointer_cast<Analyzer::Constant>(timeunit);
-  if (!timeunit_lit) {
-    throw std::runtime_error("The time unit parameter must be a literal.");
-  }
+  validate_datetime_datepart_argument(timeunit_lit);
   const auto start = translateScalarRex(rex_function->getOperand(1));
   const auto end = translateScalarRex(rex_function->getOperand(2));
   const auto field = to_datediff_field(*timeunit_lit->get_constval().stringval);
@@ -1159,9 +1180,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateDatepart(
   CHECK_EQ(size_t(2), rex_function->size());
   const auto timeunit = translateScalarRex(rex_function->getOperand(0));
   const auto timeunit_lit = std::dynamic_pointer_cast<Analyzer::Constant>(timeunit);
-  if (!timeunit_lit) {
-    throw std::runtime_error("The time unit parameter must be a literal.");
-  }
+  validate_datetime_datepart_argument(timeunit_lit);
   const auto from_expr = translateScalarRex(rex_function->getOperand(1));
   return ExtractExpr::generate(
       from_expr, to_datepart_field(*timeunit_lit->get_constval().stringval));
@@ -1249,7 +1268,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateDatetime(
   const auto arg = translateScalarRex(rex_function->getOperand(0));
   const auto arg_lit = std::dynamic_pointer_cast<Analyzer::Constant>(arg);
   const std::string datetime_err{R"(Only DATETIME('NOW') supported for now.)"};
-  if (!arg_lit) {
+  if (!arg_lit || arg_lit->get_is_null()) {
     throw std::runtime_error(datetime_err);
   }
   CHECK(arg_lit->get_type_info().is_string());
@@ -1310,52 +1329,48 @@ Analyzer::ExpressionPtr RelAlgTranslator::translateArrayFunction(
     // FIX-ME:  Deal with NULL arrays
     auto translated_function_args(translateFunctionArgs(rex_function));
     if (translated_function_args.size() > 0) {
-      auto const& first_element_logical_type(
-          get_logical_type_info(translated_function_args[0]->get_type_info()));
+      const auto first_element_logical_type =
+          get_nullable_logical_type_info(translated_function_args[0]->get_type_info());
 
-      on_member_of_typeset<kCHAR, kVARCHAR, kTEXT>(
-          first_element_logical_type,
-          [&] {
-            bool same_type_status = true;
-            for (auto const& expr_ptr : translated_function_args) {
-              same_type_status =
-                  same_type_status && (expr_ptr->get_type_info().is_string());
-            }
+      auto diff_elem_itr =
+          std::find_if(translated_function_args.begin(),
+                       translated_function_args.end(),
+                       [first_element_logical_type](const auto expr) {
+                         return first_element_logical_type !=
+                                get_nullable_logical_type_info(expr->get_type_info());
+                       });
+      if (diff_elem_itr != translated_function_args.end()) {
+        throw std::runtime_error(
+            "Element " +
+            std::to_string(diff_elem_itr - translated_function_args.begin()) +
+            " is not of the same type as other elements of the array. Consider casting "
+            "to force this condition.\nElement Type: " +
+            get_nullable_logical_type_info((*diff_elem_itr)->get_type_info())
+                .to_string() +
+            "\nArray type: " + first_element_logical_type.to_string());
+      }
 
-            if (same_type_status == false) {
-              throw std::runtime_error(
-                  "All elements of the array are not of the same logical subtype; "
-                  "consider casting to force this condition.");
-            }
-
-            sql_type.set_subtype(first_element_logical_type.get_type());
-            sql_type.set_compression(kENCODING_FIXED);
-            sql_type.set_comp_param(TRANSIENT_DICT_ID);
-          },
-          [&] {
-            // Non string types
-            bool same_type_status = true;
-            for (auto const& expr_ptr : translated_function_args) {
-              same_type_status =
-                  same_type_status && (first_element_logical_type ==
-                                       get_logical_type_info(expr_ptr->get_type_info()));
-            }
-
-            if (same_type_status == false) {
-              throw std::runtime_error(
-                  "All elements of the array are not of the same logical subtype; "
-                  "consider casting to force this condition.");
-            }
-            sql_type.set_subtype(first_element_logical_type.get_type());
-            sql_type.set_scale(first_element_logical_type.get_scale());
-            sql_type.set_precision(first_element_logical_type.get_precision());
-          });
+      if (first_element_logical_type.is_string() &&
+          !first_element_logical_type.is_dict_encoded_string()) {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_compression(kENCODING_FIXED);
+      } else if (first_element_logical_type.is_dict_encoded_string()) {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_comp_param(TRANSIENT_DICT_ID);
+      } else {
+        sql_type.set_subtype(first_element_logical_type.get_type());
+        sql_type.set_scale(first_element_logical_type.get_scale());
+        sql_type.set_precision(first_element_logical_type.get_precision());
+      }
 
       feature_stash_.setCPUOnlyExecutionRequired();
       return makeExpr<Analyzer::ArrayExpr>(
           sql_type, translated_function_args, feature_stash_.getAndBumpArrayExprCount());
     } else {
-      throw std::runtime_error("NULL ARRAY[] expressions not supported yet.  FIX-ME.");
+      // defaulting to valid sub-type for convenience
+      sql_type.set_subtype(kBOOLEAN);
+      return makeExpr<Analyzer::ArrayExpr>(
+          sql_type, translated_function_args, feature_stash_.getAndBumpArrayExprCount());
     }
   } else {
     feature_stash_.setCPUOnlyExecutionRequired();
@@ -1518,6 +1533,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
                    "ST_Intersects"sv,
                    "ST_Disjoint"sv,
                    "ST_Contains"sv,
+                   "ST_Overlaps"sv,
                    "ST_Within"sv)) {
     CHECK_EQ(rex_function->size(), size_t(2));
     return translateBinaryGeoFunction(rex_function);
@@ -1543,6 +1559,12 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
   }
 
   auto arg_expr_list = translateFunctionArgs(rex_function);
+  if (rex_function->getName() == std::string("||") ||
+      rex_function->getName() == std::string("SUBSTRING")) {
+    SQLTypeInfo ret_ti(kTEXT, false);
+    return makeExpr<Analyzer::FunctionOper>(
+        ret_ti, rex_function->getName(), arg_expr_list);
+  }
   // Reset possibly wrong return type of rex_function to the return
   // type of the optimal valid implementation. The return type can be
   // wrong in the case of multiple implementations of UDF functions

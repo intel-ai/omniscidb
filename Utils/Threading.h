@@ -1,7 +1,7 @@
 #pragma once
 
-#include <arrow/util/task-group.h>
-#include <arrow/util/thread-pool.h>
+#include <arrow/util/task_group.h>
+#include <arrow/util/thread_pool.h>
 #include <future>
 
 namespace utils {

@@ -19,9 +19,19 @@
 
 #include <cstdint>
 #include <string>
-#include "../DataMgr/MemoryLevel.h"
-#include "../Fragmenter/AbstractFragmenter.h"
-#include "../Shared/sqldefs.h"
+
+#include "DataMgr/MemoryLevel.h"
+#include "Fragmenter/AbstractFragmenter.h"
+#include "Shared/sqldefs.h"
+
+/**
+ * @type StorageType
+ * @brief Encapsulates an enumeration of table storage type strings
+ */
+struct StorageType {
+  static constexpr char const* FOREIGN_TABLE = "FOREIGN_TABLE";
+  static constexpr char const* LOCAL_TABLE = "LOCAL_TABLE";
+};
 
 /**
  * @type TableDescriptor
@@ -44,11 +54,14 @@ struct TableDescriptor {
   int64_t maxChunkSize;    // max number of rows per fragment
   int32_t fragPageSize;    // page size
   int64_t maxRows;         // max number of rows in the table
+  int64_t skipRows;        // number of skipped rows of data in CSV file
+  std::string delimiter;   // delimiter of values in the CSV file
+  bool hasHeader;          // does table has a header in CSV file
   std::string partitions;  // distributed partition scheme
   std::string
       keyMetainfo;  // meta-information about shard keys and shared dictionary, as JSON
 
-  Fragmenter_Namespace::AbstractFragmenter*
+  std::shared_ptr<Fragmenter_Namespace::AbstractFragmenter>
       fragmenter;  // point to fragmenter object for the table.  it's instantiated upon
                    // first use.
   int32_t
@@ -61,6 +74,7 @@ struct TableDescriptor {
   // Spi means Sequential Positional Index which is equivalent to the input index in a
   // RexInput node
   std::vector<int> columnIdBySpi_;  // spi = 1,2,3,...
+  std::string storageType;          // foreign/local storage
 
   // write mutex, only to be used inside catalog package
   std::shared_ptr<std::mutex> mutex_;
@@ -68,12 +82,17 @@ struct TableDescriptor {
   TableDescriptor()
       : tableId(-1)
       , shard(-1)
+      , skipRows(0)
+      , delimiter(",")
+      , hasHeader(true)
       , nShards(0)
       , shardedColumnId(0)
       , sortedColumnId(0)
       , persistenceLevel(Data_Namespace::MemoryLevel::DISK_LEVEL)
       , hasDeletedCol(true)
       , mutex_(std::make_shared<std::mutex>()) {}
+
+  virtual ~TableDescriptor() = default;
 };
 
 inline bool table_is_replicated(const TableDescriptor* td) {
@@ -83,6 +102,10 @@ inline bool table_is_replicated(const TableDescriptor* td) {
 // compare for lowest id
 inline bool compare_td_id(const TableDescriptor* first, const TableDescriptor* second) {
   return (first->tableId < second->tableId);
+}
+
+inline bool table_is_temporary(const TableDescriptor* const td) {
+  return td->persistenceLevel == Data_Namespace::MemoryLevel::CPU_LEVEL;
 }
 
 #endif  // TABLE_DESCRIPTOR

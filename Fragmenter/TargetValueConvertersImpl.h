@@ -17,16 +17,22 @@
 #ifndef TARGET_VALUE_CONVERTERS_IMPL_H_
 #define TARGET_VALUE_CONVERTERS_IMPL_H_
 
-#include "../StringDictionary/StringDictionary.h"
-#include "TargetValueConverters.h"
+#include "Fragmenter/TargetValueConverters.h"
+#include "Shared/geo_compression.h"
+#include "StringDictionary/StringDictionary.h"
 
 #include <atomic>
 #include <future>
 #include <thread>
 
-namespace Importer_NS {
-std::vector<uint8_t> compress_coords(std::vector<double>& coords, const SQLTypeInfo& ti);
-}  // namespace Importer_NS
+template <typename T>
+T get_fixed_array_null_value() {
+  if (std::is_floating_point<T>::value) {
+    return static_cast<T>(inline_fp_null_array_value<T>());
+  } else {
+    return static_cast<T>(inline_int_null_array_value<T>());
+  }
+}
 
 template <typename SOURCE_TYPE, typename TARGET_TYPE>
 struct NumericValueConverter : public TargetValueConverter {
@@ -37,6 +43,7 @@ struct NumericValueConverter : public TargetValueConverter {
   TARGET_TYPE null_value_;
   SOURCE_TYPE null_check_value_;
   bool do_null_check_;
+  TARGET_TYPE fixed_array_null_value_;
 
   boost_variant_accessor<SOURCE_TYPE> SOURCE_TYPE_ACCESSOR;
 
@@ -49,12 +56,21 @@ struct NumericValueConverter : public TargetValueConverter {
       , null_value_(nullValue)
       , null_check_value_(nullCheckValue)
       , do_null_check_(doNullCheck) {
+    fixed_array_null_value_ = get_fixed_array_null_value<TARGET_TYPE>();
     if (num_rows) {
       allocateColumnarData(num_rows);
     }
   }
 
   ~NumericValueConverter() override {}
+
+  bool allowFixedNullArray() { return true; }
+
+  void populateFixedArrayNullSentinel(size_t num_rows) {
+    allocateColumnarData(num_rows);
+    CHECK(fixed_array_null_value_ != 0);
+    column_data_.get()[0] = fixed_array_null_value_;
+  }
 
   void allocateColumnarData(size_t num_rows) override {
     CHECK(num_rows > 0);
@@ -72,8 +88,8 @@ struct NumericValueConverter : public TargetValueConverter {
       size_t row,
       typename ElementsBufferColumnPtr::pointer columnData,
       const ScalarTargetValue* scalarValue) {
-    auto mapd_p = checked_get<SOURCE_TYPE>(row, scalarValue, SOURCE_TYPE_ACCESSOR);
-    auto val = *mapd_p;
+    auto db_p = checked_get<SOURCE_TYPE>(row, scalarValue, SOURCE_TYPE_ACCESSOR);
+    auto val = *db_p;
 
     if (do_null_check_ && null_check_value_ == val) {
       columnData[row] = null_value_;
@@ -163,11 +179,11 @@ struct DictionaryValueConverter : public NumericValueConverter<int64_t, TARGET_T
       source_dict_desc_ = cat.getMetadataForDict(std::abs(sourceDictId), true);
       CHECK(source_dict_desc_);
     } else {
-      CHECK(literals_dict);
-
-      for (auto& entry : literals_dict->getTransientMapping()) {
-        auto newId = target_dict_desc_->stringDict->getOrAdd(entry.second);
-        literals_lookup_[entry.first] = newId;
+      if (literals_dict) {
+        for (auto& entry : literals_dict->getTransientMapping()) {
+          auto newId = target_dict_desc_->stringDict->getOrAdd(entry.second);
+          literals_lookup_[entry.first] = newId;
+        }
       }
 
       literals_lookup_[buffer_null_sentinal_] = buffer_null_sentinal_;
@@ -182,6 +198,8 @@ struct DictionaryValueConverter : public NumericValueConverter<int64_t, TARGET_T
 
   ~DictionaryValueConverter() override {}
 
+  bool allowFixedNullArray() { return false; }
+
   ElementsBufferColumnPtr allocateColumnarBuffer(size_t num_rows) {
     CHECK(num_rows > 0);
     return std::make_unique<std::vector<int32_t>>(num_rows);
@@ -191,8 +209,8 @@ struct DictionaryValueConverter : public NumericValueConverter<int64_t, TARGET_T
       size_t row,
       typename ElementsBufferColumnPtr::pointer columnBuffer,
       const ScalarTargetValue* scalarValue) {
-    auto mapd_p = checked_get<int64_t>(row, scalarValue, this->SOURCE_TYPE_ACCESSOR);
-    auto val = *mapd_p;
+    auto db_p = checked_get<int64_t>(row, scalarValue, this->SOURCE_TYPE_ACCESSOR);
+    auto val = *db_p;
 
     if (this->do_null_check_ && this->null_check_value_ == val) {
       (*columnBuffer)[row] = this->buffer_null_sentinal_;
@@ -396,8 +414,8 @@ struct StringValueConverter : public TargetValueConverter {
   void convertToColumnarFormatFromDict(size_t row, const TargetValue* value) {
     auto scalarValue =
         checked_get<ScalarTargetValue>(row, value, SCALAR_TARGET_VALUE_ACCESSOR);
-    auto mapd_p = checked_get<int64_t>(row, scalarValue, this->SOURCE_TYPE_ACCESSOR);
-    auto val = *mapd_p;
+    auto db_p = checked_get<int64_t>(row, scalarValue, this->SOURCE_TYPE_ACCESSOR);
+    auto val = *db_p;
 
     if (std::numeric_limits<int32_t>::min() == val) {
       (*column_data_)[row] = std::string("");
@@ -419,12 +437,11 @@ struct StringValueConverter : public TargetValueConverter {
   void convertToColumnarFormatFromString(size_t row, const TargetValue* value) {
     auto scalarValue =
         checked_get<ScalarTargetValue>(row, value, SCALAR_TARGET_VALUE_ACCESSOR);
-    auto mapd_p = checked_get<NullableString>(row, scalarValue, NULLABLE_STRING_ACCESSOR);
+    auto db_p = checked_get<NullableString>(row, scalarValue, NULLABLE_STRING_ACCESSOR);
+    const auto db_str_p = checked_get<std::string>(row, db_p, STRING_ACCESSOR);
 
-    const auto mapd_str_p = checked_get<std::string>(row, mapd_p, STRING_ACCESSOR);
-
-    if (nullptr != mapd_str_p) {
-      (*column_data_)[row] = *mapd_str_p;
+    if (nullptr != db_str_p) {
+      (*column_data_)[row] = *db_str_p;
     } else {
       (*column_data_)[row] = std::string("");
     }
@@ -456,6 +473,9 @@ struct ArrayValueConverter : public TargetValueConverter {
   SQLTypeInfo element_type_info_;
   bool do_check_null_;
   bool data_finalized_ = false;
+  int8_t* fixed_array_null_sentinel_;
+  size_t fixed_array_size_;
+  size_t fixed_array_elements_count_;
 
   boost_variant_accessor<ArrayTargetValue> ARRAY_VALUE_ACCESSOR;
 
@@ -469,6 +489,19 @@ struct ArrayValueConverter : public TargetValueConverter {
       , do_check_null_(do_check_null) {
     if (num_rows) {
       allocateColumnarData(num_rows);
+    }
+
+    if (cd->columnType.get_size() > 0) {
+      fixed_array_size_ = cd->columnType.get_size();
+      fixed_array_elements_count_ =
+          fixed_array_size_ / sizeof(ELEMENT_CONVERTER::fixed_array_null_value_);
+      element_converter_->populateFixedArrayNullSentinel(fixed_array_elements_count_);
+      fixed_array_null_sentinel_ =
+          reinterpret_cast<int8_t*>(element_converter_->column_data_.get());
+    } else {
+      fixed_array_size_ = 0;
+      fixed_array_elements_count_ = 0;
+      fixed_array_null_sentinel_ = nullptr;
     }
   }
 
@@ -489,6 +522,14 @@ struct ArrayValueConverter : public TargetValueConverter {
     if (arrayValue->is_initialized()) {
       const auto& vec = arrayValue->get();
       bool is_null = false;
+
+      if (fixed_array_elements_count_) {
+        if (fixed_array_elements_count_ != vec.size()) {
+          throw std::runtime_error(
+              "Incorrect number of array elements for fixed length array column");
+        }
+      }
+
       if (vec.size()) {
         typename ELEMENT_CONVERTER::ElementsBufferColumnPtr elementBuffer =
             element_converter_->allocateColumnarBuffer(vec.size());
@@ -506,10 +547,17 @@ struct ArrayValueConverter : public TargetValueConverter {
         (*column_data_)[row] = ArrayDatum(0, nullptr, is_null, DoNothingDeleter());
       }
     } else {
-      // TODO: what does it mean if do_check_null_ is set to false and we get a NULL?
-      // CHECK(do_check_null_);  // May need to check
+      if (!do_check_null_) {
+        throw std::runtime_error("NULL assignment of non null column not allowed");
+      }
+
+      if (fixed_array_elements_count_ && !element_converter_->allowFixedNullArray()) {
+        throw std::runtime_error("NULL assignment of fixed length array not allowed");
+      }
+
       bool is_null = true;  // do_check_null_;
-      (*column_data_)[row] = ArrayDatum(0, nullptr, is_null, DoNothingDeleter());
+      (*column_data_)[row] = ArrayDatum(
+          fixed_array_size_, fixed_array_null_sentinel_, is_null, DoNothingDeleter());
       (*column_data_)[row].is_null = is_null;
     }
   }
@@ -557,12 +605,13 @@ struct GeoPointValueConverter : public TargetValueConverter {
     signed_compressed_coords_data_ = std::make_unique<std::vector<ArrayDatum>>(num_rows);
   }
 
+  boost_variant_accessor<GeoTargetValue> GEO_VALUE_ACCESSOR;
   boost_variant_accessor<GeoPointTargetValue> GEO_POINT_VALUE_ACCESSOR;
 
   inline ArrayDatum toCompressedCoords(
       const std::shared_ptr<std::vector<double>>& coords) {
     const auto compressed_coords_vector =
-        Importer_NS::compress_coords(*coords, column_descriptor_->columnType);
+        geospatial::compress_coords(*coords, column_descriptor_->columnType);
 
     uint8_t* compressed_coords_array = reinterpret_cast<uint8_t*>(
         checked_malloc(sizeof(uint8_t) * compressed_coords_vector.size()));
@@ -576,12 +625,23 @@ struct GeoPointValueConverter : public TargetValueConverter {
   }
 
   void convertToColumnarFormat(size_t row, const TargetValue* value) override {
-    auto geoValue = checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
-    auto geoPoint =
-        checked_get<GeoPointTargetValue>(row, geoValue, GEO_POINT_VALUE_ACCESSOR);
-
-    (*column_data_)[row] = "";
-    (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoPoint->coords);
+    const auto geoValue = checked_get<GeoTargetValue>(row, value, GEO_VALUE_ACCESSOR);
+    CHECK(geoValue);
+    if (geoValue->is_initialized()) {
+      const auto geo = geoValue->get();
+      const auto geoPoint =
+          checked_get<GeoPointTargetValue>(row, &geo, GEO_POINT_VALUE_ACCESSOR);
+      CHECK(geoPoint);
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoPoint->coords);
+    } else {
+      // NULL point
+      (*column_data_)[row] = "";
+      auto coords = std::make_shared<std::vector<double>>(NULL_ARRAY_DOUBLE, NULL_DOUBLE);
+      auto coords_datum = toCompressedCoords(coords);
+      coords_datum.is_null = true;
+      (*signed_compressed_coords_data_)[row] = coords_datum;
+    }
   }
 
   void addDataBlocksToInsertData(Fragmenter_Namespace::InsertData& insertData) override {
@@ -665,14 +725,28 @@ struct GeoLinestringValueConverter : public GeoPointValueConverter {
   boost_variant_accessor<GeoLineStringTargetValue> GEO_LINESTRING_VALUE_ACCESSOR;
 
   void convertToColumnarFormat(size_t row, const TargetValue* value) override {
-    auto geoValue = checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
-    auto geoLinestring = checked_get<GeoLineStringTargetValue>(
-        row, geoValue, GEO_LINESTRING_VALUE_ACCESSOR);
+    const auto geoValue =
+        checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
+    CHECK(geoValue);
+    if (geoValue->is_initialized()) {
+      const auto geo = geoValue->get();
+      const auto geoLinestring =
+          checked_get<GeoLineStringTargetValue>(row, &geo, GEO_LINESTRING_VALUE_ACCESSOR);
 
-    (*column_data_)[row] = "";
-    (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoLinestring->coords);
-    auto bounds = compute_bounds_of_coords(geoLinestring->coords);
-    (*bounds_data_)[row] = to_array_datum(bounds);
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoLinestring->coords);
+      auto bounds = compute_bounds_of_coords(geoLinestring->coords);
+      (*bounds_data_)[row] = to_array_datum(bounds);
+    } else {
+      // NULL Linestring
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = ArrayDatum(0, nullptr, true);
+      std::vector<double> bounds = {
+          NULL_ARRAY_DOUBLE, NULL_DOUBLE, NULL_DOUBLE, NULL_DOUBLE};
+      auto bounds_datum = to_array_datum(bounds);
+      bounds_datum.is_null = true;
+      (*bounds_data_)[row] = bounds_datum;
+    }
   }
 
   void addDataBlocksToInsertData(Fragmenter_Namespace::InsertData& insertData) override {
@@ -728,17 +802,33 @@ struct GeoPolygonValueConverter : public GeoPointValueConverter {
   boost_variant_accessor<GeoPolyTargetValue> GEO_POLY_VALUE_ACCESSOR;
 
   void convertToColumnarFormat(size_t row, const TargetValue* value) override {
-    auto geoValue = checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
-    auto geoPoly =
-        checked_get<GeoPolyTargetValue>(row, geoValue, GEO_POLY_VALUE_ACCESSOR);
+    const auto geoValue =
+        checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
+    CHECK(geoValue);
+    if (geoValue->is_initialized()) {
+      const auto geo = geoValue->get();
+      const auto geoPoly =
+          checked_get<GeoPolyTargetValue>(row, &geo, GEO_POLY_VALUE_ACCESSOR);
 
-    (*column_data_)[row] = "";
-    (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoPoly->coords);
-    (*ring_sizes_data_)[row] = to_array_datum(geoPoly->ring_sizes);
-    auto bounds = compute_bounds_of_coords(geoPoly->coords);
-    (*bounds_data_)[row] = to_array_datum(bounds);
-    render_group_data_[row] =
-        render_group_analyzer_.insertBoundsAndReturnRenderGroup(bounds);
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoPoly->coords);
+      (*ring_sizes_data_)[row] = to_array_datum(geoPoly->ring_sizes);
+      auto bounds = compute_bounds_of_coords(geoPoly->coords);
+      (*bounds_data_)[row] = to_array_datum(bounds);
+      render_group_data_[row] =
+          render_group_analyzer_.insertBoundsAndReturnRenderGroup(bounds);
+    } else {
+      // NULL Polygon
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = ArrayDatum(0, nullptr, true);
+      (*ring_sizes_data_)[row] = ArrayDatum(0, nullptr, true);
+      std::vector<double> bounds = {
+          NULL_ARRAY_DOUBLE, NULL_DOUBLE, NULL_DOUBLE, NULL_DOUBLE};
+      auto bounds_datum = to_array_datum(bounds);
+      bounds_datum.is_null = true;
+      (*bounds_data_)[row] = bounds_datum;
+      render_group_data_[row] = NULL_INT;
+    }
   }
 
   void addDataBlocksToInsertData(Fragmenter_Namespace::InsertData& insertData) override {
@@ -808,18 +898,35 @@ struct GeoMultiPolygonValueConverter : public GeoPointValueConverter {
   boost_variant_accessor<GeoMultiPolyTargetValue> GEO_MULTI_POLY_VALUE_ACCESSOR;
 
   void convertToColumnarFormat(size_t row, const TargetValue* value) override {
-    auto geoValue = checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
-    auto geoMultiPoly = checked_get<GeoMultiPolyTargetValue>(
-        row, geoValue, GEO_MULTI_POLY_VALUE_ACCESSOR);
+    const auto geoValue =
+        checked_get<GeoTargetValue>(row, value, GEO_TARGET_VALUE_ACCESSOR);
+    CHECK(geoValue);
+    if (geoValue->is_initialized()) {
+      const auto geo = geoValue->get();
+      const auto geoMultiPoly =
+          checked_get<GeoMultiPolyTargetValue>(row, &geo, GEO_MULTI_POLY_VALUE_ACCESSOR);
 
-    (*column_data_)[row] = "";
-    (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoMultiPoly->coords);
-    (*ring_sizes_data_)[row] = to_array_datum(geoMultiPoly->ring_sizes);
-    (*poly_rings_data_)[row] = to_array_datum(geoMultiPoly->poly_rings);
-    auto bounds = compute_bounds_of_coords(geoMultiPoly->coords);
-    (*bounds_data_)[row] = to_array_datum(bounds);
-    render_group_data_[row] =
-        render_group_analyzer_.insertBoundsAndReturnRenderGroup(bounds);
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = toCompressedCoords(geoMultiPoly->coords);
+      (*ring_sizes_data_)[row] = to_array_datum(geoMultiPoly->ring_sizes);
+      (*poly_rings_data_)[row] = to_array_datum(geoMultiPoly->poly_rings);
+      auto bounds = compute_bounds_of_coords(geoMultiPoly->coords);
+      (*bounds_data_)[row] = to_array_datum(bounds);
+      render_group_data_[row] =
+          render_group_analyzer_.insertBoundsAndReturnRenderGroup(bounds);
+    } else {
+      // NULL MultiPolygon
+      (*column_data_)[row] = "";
+      (*signed_compressed_coords_data_)[row] = ArrayDatum(0, nullptr, true);
+      (*ring_sizes_data_)[row] = ArrayDatum(0, nullptr, true);
+      (*poly_rings_data_)[row] = ArrayDatum(0, nullptr, true);
+      std::vector<double> bounds = {
+          NULL_ARRAY_DOUBLE, NULL_DOUBLE, NULL_DOUBLE, NULL_DOUBLE};
+      auto bounds_datum = to_array_datum(bounds);
+      bounds_datum.is_null = true;
+      (*bounds_data_)[row] = bounds_datum;
+      render_group_data_[row] = NULL_INT;
+    }
   }
 
   void addDataBlocksToInsertData(Fragmenter_Namespace::InsertData& insertData) override {

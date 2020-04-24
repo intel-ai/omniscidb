@@ -42,6 +42,7 @@ public class ExtensionFunction {
     PInt64,
     PFloat,
     PDouble,
+    PBool,
     Bool,
     ArrayInt8,
     ArrayInt16,
@@ -49,10 +50,12 @@ public class ExtensionFunction {
     ArrayInt64,
     ArrayFloat,
     ArrayDouble,
+    ArrayBool,
     GeoPoint,
     GeoLineString,
     Cursor,
-    GeoPolygon
+    GeoPolygon,
+    GeoMultiPolygon
   }
   ;
 
@@ -134,18 +137,22 @@ public class ExtensionFunction {
         return "float*";
       case PDouble:
         return "double*";
+      case PBool:
+        return "i1*";
       case ArrayInt8:
-        return "array_i8";
+        return "{i8*, i64, i8}*";
       case ArrayInt16:
-        return "array_i16";
+        return "{i16*, i64, i8}*";
       case ArrayInt32:
-        return "array_i32";
+        return "{i32*, i64, i8}*";
       case ArrayInt64:
-        return "array_i64";
+        return "{i64*, i64, i8}*";
       case ArrayFloat:
-        return "array_float";
+        return "{float*, i64, i8}*";
       case ArrayDouble:
-        return "array_double";
+        return "{double*, i64, i8}*";
+      case ArrayBool:
+        return "{i1*, i64, i8}*";
       case GeoPoint:
         return "geo_point";
       case Cursor:
@@ -154,6 +161,8 @@ public class ExtensionFunction {
         return "geo_linestring";
       case GeoPolygon:
         return "geo_polygon";
+      case GeoMultiPolygon:
+        return "geo_multi_polygon";
     }
     MAPDLOGGER.info("Extensionfunction::typeName: unknown type=`" + type + "`");
     assert false;

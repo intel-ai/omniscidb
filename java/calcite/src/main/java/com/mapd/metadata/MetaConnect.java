@@ -16,18 +16,22 @@
 package com.mapd.metadata;
 
 import com.google.common.collect.ImmutableList;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.mapd.calcite.parser.MapDParser;
 import com.mapd.calcite.parser.MapDTable;
 import com.mapd.calcite.parser.MapDUser;
 import com.mapd.calcite.parser.MapDView;
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TDatumType;
-import com.mapd.thrift.server.TEncodingType;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TTableDetails;
-import com.mapd.thrift.server.TTypeInfo;
+import com.omnisci.thrift.server.OmniSci;
+import com.omnisci.thrift.server.TColumnType;
+import com.omnisci.thrift.server.TDatumType;
+import com.omnisci.thrift.server.TEncodingType;
+import com.omnisci.thrift.server.TOmniSciException;
+import com.omnisci.thrift.server.TTableDetails;
+import com.omnisci.thrift.server.TTypeInfo;
 
 import org.apache.calcite.schema.Table;
 import org.apache.thrift.TException;
@@ -40,6 +44,9 @@ import org.apache.thrift.transport.TTransportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -48,6 +55,7 @@ import java.sql.Statement;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -187,7 +195,7 @@ public class MetaConnect {
       if (!transport.isOpen()) transport.open();
       protocol = new TBinaryProtocol(transport);
 
-      MapD.Client client = new MapD.Client(protocol);
+      OmniSci.Client client = new OmniSci.Client(protocol);
 
       List<String> tablesList = client.get_tables(currentUser.getSession());
       Set<String> ts = new HashSet<String>(tablesList.size());
@@ -203,7 +211,7 @@ public class MetaConnect {
       MAPDLOGGER.error("TTransportException on port [" + mapdPort + "]");
       MAPDLOGGER.error(ex.toString());
       throw new RuntimeException(ex.toString());
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       MAPDLOGGER.error(ex.toString());
       throw new RuntimeException(ex.toString());
     } catch (TException ex) {
@@ -237,6 +245,40 @@ public class MetaConnect {
       throw new RuntimeException(err);
     }
     disconnectFromDBCatalog();
+
+    try {
+      // open temp table json file
+      final String filePath = dataDir + "/mapd_catalogs/" + db + "_temp_tables.json";
+      MAPDLOGGER.debug("Opening temp table file at " + filePath);
+      String tempTablesJsonStr;
+      try {
+        File tempTablesFile = new File(filePath);
+        FileInputStream tempTablesStream = new FileInputStream(tempTablesFile);
+        byte[] data = new byte[(int) tempTablesFile.length()];
+        tempTablesStream.read(data);
+        tempTablesStream.close();
+
+        tempTablesJsonStr = new String(data, "UTF-8");
+      } catch (java.io.FileNotFoundException e) {
+        return tableSet;
+      }
+
+      Gson gson = new Gson();
+      JsonObject fileParentObject = gson.fromJson(tempTablesJsonStr, JsonObject.class);
+      for (Entry<String, JsonElement> member : fileParentObject.entrySet()) {
+        String tableName = member.getKey();
+        tableSet.add(tableName);
+        /*--*/
+        MAPDLOGGER.debug("Temp table object name = " + tableName);
+      }
+
+    } catch (Exception e) {
+      String err = "error trying to load temporary tables from json file, error was "
+              + e.getMessage();
+      MAPDLOGGER.error(err);
+      throw new RuntimeException(err);
+    }
+
     return tableSet;
   }
 
@@ -257,7 +299,7 @@ public class MetaConnect {
       if (!transport.isOpen()) transport.open();
       protocol = new TBinaryProtocol(transport);
 
-      MapD.Client client = new MapD.Client(protocol);
+      OmniSci.Client client = new OmniSci.Client(protocol);
 
       TTableDetails td =
               client.get_internal_table_details(currentUser.getSession(), tableName);
@@ -269,7 +311,7 @@ public class MetaConnect {
     } catch (TTransportException ex) {
       MAPDLOGGER.error(ex.toString());
       throw new RuntimeException(ex.toString());
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       MAPDLOGGER.error(ex.toString());
       throw new RuntimeException(ex.toString());
     } catch (TException ex) {
@@ -304,9 +346,13 @@ public class MetaConnect {
     td.getRow_descIterator();
     int id = getTableId(tableName);
     if (id == -1) {
-      String err = "Table '" + tableName + "' does not exist for DB '" + db + "'";
-      MAPDLOGGER.error(err);
-      throw new RuntimeException(err);
+      try {
+        return get_table_detail_JSON(tableName);
+      } catch (Exception e) {
+        String err = "Table '" + tableName + "' does not exist for DB '" + db + "'";
+        MAPDLOGGER.error(err);
+        throw new RuntimeException(err);
+      }
     }
 
     // read data from table
@@ -395,6 +441,106 @@ public class MetaConnect {
     return td;
   }
 
+  private TTableDetails get_table_detail_JSON(String tableName)
+          throws IOException, RuntimeException {
+    TTableDetails td = new TTableDetails();
+    td.getRow_descIterator();
+
+    // open table json file
+    final String filePath = dataDir + "/mapd_catalogs/" + db + "_temp_tables.json";
+    MAPDLOGGER.debug("Opening temp table file at " + filePath);
+
+    String tempTablesJsonStr;
+    try {
+      File tempTablesFile = new File(filePath);
+      FileInputStream tempTablesStream = new FileInputStream(tempTablesFile);
+      byte[] data = new byte[(int) tempTablesFile.length()];
+      tempTablesStream.read(data);
+      tempTablesStream.close();
+
+      tempTablesJsonStr = new String(data, "UTF-8");
+    } catch (java.io.FileNotFoundException e) {
+      throw new RuntimeException("Failed to read temporary tables file.");
+    }
+
+    Gson gson = new Gson();
+    JsonObject fileParentObject = gson.fromJson(tempTablesJsonStr, JsonObject.class);
+    if (fileParentObject == null) {
+      throw new IOException("Malformed temporary tables file.");
+    }
+
+    JsonObject tableObject = fileParentObject.getAsJsonObject(tableName);
+    if (tableObject == null) {
+      throw new RuntimeException(
+              "Failed to find table " + tableName + " in temporary tables file.");
+    }
+
+    String jsonTableName = tableObject.get("name").getAsString();
+    assert (tableName == jsonTableName);
+    int id = tableObject.get("id").getAsInt();
+    MAPDLOGGER.debug("table id is " + id);
+    MAPDLOGGER.debug("table name is " + tableName);
+
+    JsonArray jsonColumns = tableObject.getAsJsonArray("columns");
+    assert (jsonColumns != null);
+
+    int skip_physical_cols = 0;
+    for (JsonElement columnElement : jsonColumns) {
+      JsonObject columnObject = columnElement.getAsJsonObject();
+
+      String colName = columnObject.get("name").getAsString();
+      MAPDLOGGER.debug("name = " + colName);
+      int colType = columnObject.get("coltype").getAsInt();
+      MAPDLOGGER.debug("coltype = " + colType);
+      int colSubType = columnObject.get("colsubtype").getAsInt();
+      MAPDLOGGER.debug("colsubtype = " + colSubType);
+      int colDim = columnObject.get("coldim").getAsInt();
+      MAPDLOGGER.debug("coldim = " + colDim);
+      int colScale = columnObject.get("colscale").getAsInt();
+      MAPDLOGGER.debug("colscale = " + colScale);
+      boolean isNotNull = columnObject.get("is_notnull").getAsBoolean();
+      MAPDLOGGER.debug("is_notnull = " + isNotNull);
+      boolean isSystemCol = columnObject.get("is_systemcol").getAsBoolean();
+      MAPDLOGGER.debug("is_systemcol = " + isSystemCol);
+      boolean isVirtualCol = columnObject.get("is_virtualcol").getAsBoolean();
+      MAPDLOGGER.debug("is_vitrualcol = " + isVirtualCol);
+      boolean isDeletedCol = columnObject.get("is_deletedcol").getAsBoolean();
+      MAPDLOGGER.debug("is_deletedcol = " + isDeletedCol);
+      MAPDLOGGER.debug("");
+
+      if (isDeletedCol) {
+        MAPDLOGGER.debug("Skipping delete column.");
+        continue;
+      }
+
+      TColumnType tct = new TColumnType();
+      TTypeInfo tti = new TTypeInfo();
+      TDatumType tdt;
+
+      if (colType == KARRAY) {
+        tti.is_array = true;
+        tdt = typeToThrift(colSubType);
+      } else {
+        tti.is_array = false;
+        tdt = typeToThrift(colType);
+      }
+
+      tti.nullable = !isNotNull;
+      tti.encoding = TEncodingType.NONE;
+      tti.type = tdt;
+      tti.scale = colScale;
+      tti.precision = colDim;
+
+      tct.col_name = colName;
+      tct.col_type = tti;
+
+      if (skip_physical_cols <= 0) skip_physical_cols = get_physical_cols(colType);
+      if (is_geometry(colType) || skip_physical_cols-- <= 0) td.addToRow_desc(tct);
+    }
+
+    return td;
+  }
+
   private int getTableId(String tableName) {
     Statement stmt = null;
     ResultSet rs = null;
@@ -480,7 +626,7 @@ public class MetaConnect {
         if (!transport.isOpen()) transport.open();
         protocol = new TBinaryProtocol(transport);
 
-        MapD.Client client = new MapD.Client(protocol);
+        OmniSci.Client client = new OmniSci.Client(protocol);
 
         TTableDetails td = client.get_table_details(currentUser.getSession(), tableName);
 
@@ -491,7 +637,7 @@ public class MetaConnect {
       } catch (TTransportException ex) {
         MAPDLOGGER.error(ex.toString());
         throw new RuntimeException(ex.toString());
-      } catch (TMapDException ex) {
+      } catch (TOmniSciException ex) {
         MAPDLOGGER.error(ex.toString());
         throw new RuntimeException(ex.toString());
       } catch (TException ex) {

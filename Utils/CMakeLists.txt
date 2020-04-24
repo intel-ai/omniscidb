@@ -3,6 +3,7 @@ set(utils_source_files
     Regexp.cpp
     ChunkIter.cpp
     ChunkAccessorTable.cpp
+    DdlUtils.cpp
 )
 
 include_directories(${Arrow_INCLUDE_DIRS})

@@ -66,16 +66,8 @@ void Executor::executeUpdate(const RelAlgExecutionUnit& ra_exe_unit_in,
                              const UpdateLogForFragment::Callback& cb,
                              const bool is_agg) {
   CHECK(cb);
-  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in);
+  const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in, co);
   ColumnCacheMap column_cache;
-
-  const auto count =
-      makeExpr<Analyzer::AggExpr>(SQLTypeInfo(g_bigint_count ? kBIGINT : kINT, false),
-                                  kCOUNT,
-                                  nullptr,
-                                  false,
-                                  nullptr);
-  const auto count_all_exe_unit = create_count_all_execution_unit(ra_exe_unit, count);
 
   ColumnFetcher column_fetcher(this, column_cache);
   CHECK_GT(ra_exe_unit.input_descs.size(), size_t(0));
@@ -117,7 +109,7 @@ void Executor::executeUpdate(const RelAlgExecutionUnit& ra_exe_unit_in,
     fragments[0] = {table_id, {fragment_index}};
 
     current_fragment_execution_dispatch.run(
-        co.device_type_,
+        co.device_type,
         0,
         eo,
         column_fetcher,

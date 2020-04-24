@@ -26,6 +26,7 @@
 #include "TypePunning.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -205,6 +206,7 @@ extern "C" ALWAYS_INLINE int64_t scale_decimal_down_not_nullable(const int64_t o
     return operand == null_val ? null_val : -operand;                                \
   }
 
+DEF_UMINUS_NULLABLE(int8_t, int8_t)
 DEF_UMINUS_NULLABLE(int16_t, int16_t)
 DEF_UMINUS_NULLABLE(int32_t, int32_t)
 DEF_UMINUS_NULLABLE(int64_t, int64_t)
@@ -353,6 +355,24 @@ extern "C" ALWAYS_INLINE void agg_id(int64_t* agg, const int64_t val) {
   *agg = val;
 }
 
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id(int64_t* agg,
+                                                       const int64_t val,
+                                                       const int64_t null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == val) {
+    return 0;
+  } else if (*agg == null_val) {
+    *agg = val;
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
+}
+
 extern "C" ALWAYS_INLINE void agg_count_distinct_bitmap_skip_val(int64_t* agg,
                                                                  const int64_t val,
                                                                  const int64_t min_val,
@@ -406,10 +426,33 @@ DEF_AGG_MIN_INT(8)
     *agg = val;                                                                        \
   }
 
+#define DEF_CHECKED_SINGLE_AGG_ID_INT(n)                                  \
+  extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_int##n(          \
+      int##n##_t* agg, const int##n##_t val, const int##n##_t null_val) { \
+    if (val == null_val) {                                                \
+      return 0;                                                           \
+    }                                                                     \
+    if (*agg == val) {                                                    \
+      return 0;                                                           \
+    } else if (*agg == null_val) {                                        \
+      *agg = val;                                                         \
+      return 0;                                                           \
+    } else {                                                              \
+      /* see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES*/            \
+      return 15;                                                          \
+    }                                                                     \
+  }
+
 DEF_AGG_ID_INT(32)
 DEF_AGG_ID_INT(16)
 DEF_AGG_ID_INT(8)
+
+DEF_CHECKED_SINGLE_AGG_ID_INT(32)
+DEF_CHECKED_SINGLE_AGG_ID_INT(16)
+DEF_CHECKED_SINGLE_AGG_ID_INT(8)
+
 #undef DEF_AGG_ID_INT
+#undef DEF_CHECKED_SINGLE_AGG_ID_INT
 
 #define DEF_WRITE_PROJECTION_INT(n)                                     \
   extern "C" ALWAYS_INLINE void write_projection_int##n(                \
@@ -538,6 +581,24 @@ extern "C" ALWAYS_INLINE void agg_id_double(int64_t* agg, const double val) {
   *agg = *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)));
 }
 
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_double(int64_t* agg,
+                                                              const double val,
+                                                              const double null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)))) {
+    return 0;
+  } else if (*agg == *(reinterpret_cast<const int64_t*>(may_alias_ptr(&null_val)))) {
+    *agg = *(reinterpret_cast<const int64_t*>(may_alias_ptr(&val)));
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
+}
+
 extern "C" ALWAYS_INLINE uint32_t agg_count_float(uint32_t* agg, const float val) {
   return (*agg)++;
 }
@@ -559,6 +620,24 @@ extern "C" ALWAYS_INLINE void agg_min_float(int32_t* agg, const float val) {
 
 extern "C" ALWAYS_INLINE void agg_id_float(int32_t* agg, const float val) {
   *agg = *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)));
+}
+
+extern "C" ALWAYS_INLINE int32_t checked_single_agg_id_float(int32_t* agg,
+                                                             const float val,
+                                                             const float null_val) {
+  if (val == null_val) {
+    return 0;
+  }
+
+  if (*agg == *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)))) {
+    return 0;
+  } else if (*agg == *(reinterpret_cast<const int32_t*>(may_alias_ptr(&null_val)))) {
+    *agg = *(reinterpret_cast<const int32_t*>(may_alias_ptr(&val)));
+    return 0;
+  } else {
+    // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+    return 15;
+  }
 }
 
 extern "C" ALWAYS_INLINE uint64_t agg_count_double_skip_val(uint64_t* agg,
@@ -704,6 +783,43 @@ DEF_SHARED_AGG_RET_STUBS(agg_count)
 DEF_SHARED_AGG_STUBS(agg_max)
 DEF_SHARED_AGG_STUBS(agg_min)
 DEF_SHARED_AGG_STUBS(agg_id)
+
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_shared(int64_t* agg,
+                                                            const int64_t val,
+                                                            const int64_t null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_int32_shared(int32_t* agg,
+                                   const int32_t val,
+                                   const int32_t null_val) {
+  return 0;
+}
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_int16_shared(int16_t* agg,
+                                   const int16_t val,
+                                   const int16_t null_val) {
+  return 0;
+}
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_int8_shared(int8_t* agg,
+                                                                 const int8_t val,
+                                                                 const int8_t null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t
+checked_single_agg_id_double_shared(int64_t* agg,
+                                    const double val,
+                                    const double null_val) {
+  return 0;
+}
+
+extern "C" GPU_RT_STUB int32_t checked_single_agg_id_float_shared(int32_t* agg,
+                                                                  const float val,
+                                                                  const float null_val) {
+  return 0;
+}
 
 extern "C" GPU_RT_STUB void agg_max_int16_skip_val_shared(int16_t* agg,
                                                           const int16_t val,
@@ -1028,6 +1144,19 @@ extern "C" ALWAYS_INLINE int64_t* get_matching_group_value_perfect_hash(
   return groups_buffer + off + key_count;
 }
 
+/**
+ * For a particular hashed index (only used with multi-column perfect hash group by)
+ * it returns the row-wise offset of the group in the output buffer.
+ * Since it is intended for keyless hash use, it assumes there is no group columns
+ * prepending the output buffer.
+ */
+extern "C" ALWAYS_INLINE int64_t* get_matching_group_value_perfect_hash_keyless(
+    int64_t* groups_buffer,
+    const uint32_t hashed_index,
+    const uint32_t row_size_quad) {
+  return groups_buffer + row_size_quad * hashed_index;
+}
+
 /*
  * For a particular hashed_index, find and initialize (if necessary) all the group
  * columns corresponding to a key. It is assumed that all group columns are 64-bit wide.
@@ -1253,4 +1382,31 @@ extern "C" void multifrag_query(const int8_t*** col_buffers,
                total_matched,
                error_code);
   }
+}
+
+extern "C" ALWAYS_INLINE DEVICE bool check_interrupt() {
+  if (check_interrupt_init(static_cast<unsigned>(INT_CHECK))) {
+    return true;
+  }
+  return false;
+}
+
+extern "C" bool check_interrupt_init(unsigned command) {
+  static std::atomic_bool runtime_interrupt_flag{false};
+
+  if (command == static_cast<unsigned>(INT_CHECK)) {
+    if (runtime_interrupt_flag.load()) {
+      return true;
+    }
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_ABORT)) {
+    runtime_interrupt_flag = true;
+    return false;
+  }
+  if (command == static_cast<unsigned>(INT_RESET)) {
+    runtime_interrupt_flag = false;
+    return false;
+  }
+  return false;
 }

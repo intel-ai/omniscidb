@@ -165,7 +165,7 @@ The general format of a log entry is::
 
 Example::
 
-    2019-09-18T16:25:25.659248 I 26481 MapDHandler.cpp:181 OmniSci Server 4.9.0dev-20190918-bd97353685
+    2019-09-18T16:25:25.659248 I 26481 DBHandler.cpp:181 OmniSci Server 4.9.0dev-20190918-bd97353685
 
 Field descriptions:
 
@@ -223,7 +223,7 @@ optionally catch the ``SIGABRT`` signal.
 STDLOG
 """"""
 
-``MapDHandler`` uses a logging helper class ``StdLog`` for logging query-specific information in
+``DBHandler`` uses a logging helper class ``StdLog`` for logging query-specific information in
 a standard format::
 
  (timestamp) (severity) (process_id) (filename:line_number) stdlog (function_name) (match_id)
@@ -238,8 +238,8 @@ Example usage is given in the `QueryState`_ documentation.
 
 Example entries::
 
- 2019-09-20T17:15:28.215590 1 13080 MapDHandler.cpp:846 stdlog_begin sql_execute 2 0 omnisci testuser 528-dyM2 {"query_str"} {"SELECT * FROM omnisci_counties LIMIT 1;"}
- 2019-09-20T17:15:28.924512 I 13080 MapDHandler.cpp:846 stdlog sql_execute 2 709 omnisci testuser 528-dyM2 {"query_str","execution_time_ms","total_time_ms"} {"SELECT * FROM omnisci_counties LIMIT 1;","708","709"}
+ 2019-09-20T17:15:28.215590 1 13080 DBHandler.cpp:846 stdlog_begin sql_execute 2 0 omnisci testuser 528-dyM2 {"query_str"} {"SELECT * FROM omnisci_counties LIMIT 1;"}
+ 2019-09-20T17:15:28.924512 I 13080 DBHandler.cpp:846 stdlog sql_execute 2 709 omnisci testuser 528-dyM2 {"query_str","execution_time_ms","total_time_ms"} {"SELECT * FROM omnisci_counties LIMIT 1;","708","709"}
 
 The first 4 fields are same as in the above `Format`_ section.  Additional field descriptions:
 
@@ -295,48 +295,54 @@ Upon the destruction of the ``timer`` object within ``foo()``, a log entry simil
 
     2019-10-17T15:22:53.981002 I 8980 foobar.cpp:70 DEBUG_TIMER thread_id(140719710320384)
     19ms total duration for foo
-      17ms bar foobar.cpp:100
-        13ms bar2 foobar.cpp:130
+      17ms start(10ms) bar foobar.cpp:100
+        13ms start(10ms) bar2 foobar.cpp:130
 
-This is assuming that no other ``DEBUG_TIMER`` instance exists in the thread's call stack prior to ``foo()``.
-Accordingly, when ``bar()`` is called from ``foo()``, ``bar()``'s instance of ``timer`` will NOT cause its
-own log entry to be made, but instead will record its duration and relative depth in the call stack within
-a global data structure. Same with ``bar2()``.  Once the outer-most ``timer`` object destructs, the entire
-``DurationTree`` of recorded times are logged together into a single multi-line log entry, one line per
-``timer`` instance.
+Fields for the ``Duration`` lines (last two line above) are:
 
-There is also a ``DebugTimer::stop()`` method that manually stops the timer, and will log the entire
-``DurationTree`` if it is the base timer. The destructor in this case will have no further effect.
+#. Lifetime of ``timer`` object.
+#. Time after start of current thread. (This can be used to find gaps in timing coverage.)
+#. String parameter to ``DEBUG_TIMER`` (``__func__`` in above examples.)
+#. File\:Line where ``DEBUG_TIMER`` was called from.
+
+The first root ``DEBUG_TIMER`` instance is in ``foo()``, and the two others in ``bar()`` and ``bar2()`` are initiated
+upon subsequent calls into the call stack, represented by the indentations.  Once the first root ``timer`` object
+destructs, the entire ``DurationTree`` of recorded times are logged together into a single multi-line log entry,
+one line per ``timer`` instance.
+
+There is a ``DebugTimer::stop()`` method that manually stops the timer, serving the same function
+as the destructor. The destructor then will have no further effect.
 
 To embed timers in a spawned child thread, call ``DEBUG_TIMER_NEW_THREAD(parent_thread_id);`` from the child
-thread. This will not start a timer, but will record the child-parent relationship so that subsequent
-``DEBUG_TIMER`` calls are stored in the correct node of the parent tree. An example of a resulting report::
+thread. The ``parent_thread_id`` must get its value from ``logger::thread_id()`` before the new thread is spawned.
+This will not start a timer, but will record the child-parent relationship so that subsequent ``DEBUG_TIMER``
+calls are stored in the correct node of the parent tree. An example of a resulting report::
 
-    2019-10-17T15:22:53.981002 I 8980 RelAlgExecutor.cpp:70 DEBUG_TIMER thread_id(140719710320384)
-    322ms total duration for executeRelAlgQuery
-      232ms executeWorkUnit RelAlgExecutor.cpp:1922
-        183ms compileWorkUnit NativeCodegen.cpp:1572
-          New thread(140718009964288)
-            2ms fetchChunks Execute.cpp:2028
-            0ms getQueryExecutionContext QueryMemoryDescriptor.cpp:695
-            45ms executePlanWithGroupBy Execute.cpp:2423
-              41ms launchGpuCode QueryExecutionContext.cpp:195
-              0ms reduceMultiDeviceResultSets Execute.cpp:865
-          End thread(140718009964288)
+    2020-01-30T16:58:19.926148 I 33266 DBHandler.cpp:956 DEBUG_TIMER thread_id(4)
+    591ms total duration for sql_execute
+      511ms start(41ms) executeRelAlgQuery RelAlgExecutor.cpp:71
+        6ms start(41ms) executeWorkUnit RelAlgExecutor.cpp:1858
+          4ms start(41ms) compileWorkUnit NativeCodegen.cpp:1571
+            New thread(5)
+              0ms start(0ms) fetchChunks Execute.cpp:2024
+              0ms start(0ms) getQueryExecutionContext QueryMemoryDescriptor.cpp:711
+              0ms start(0ms) executePlanWithoutGroupBy Execute.cpp:2276
+                0ms start(0ms) launchGpuCode QueryExecutionContext.cpp:195
+            End thread(5)
 
 .. note::
 
     Any timer that is created in a thread when no other timers are active in the same or parent thread is
-    called a *base timer*. The timer stack is logged when the base timer destructs, or ``stop()`` is called,
+    called a *root timer*. The timer stack is logged when the root timer destructs, or ``stop()`` is called,
     after which memory used for tracking the timer trees are freed.  The performance cost of this should be
     kept in mind when placing timers within the code.
 
 .. warning::
 
-    Non-base timers that end *after* their base timer ends will result in a **segmentation fault** (but only
+    Non-root timers that end *after* their root timer ends will result in a **segmentation fault** (but only
     when the ``--enable-debug-timer`` option is active). This is easily avoided by not interleaving timer
     lifetimes with one another in the same block of code, and making sure that all child threads end prior
-    to the ending of any corresponding base timer.
+    to the ending of any corresponding root timer.
 
 The high-level class relationships are:
 
@@ -348,7 +354,7 @@ The high-level class relationships are:
     class DurationTree
     note right: Each node of DurationTree is of type\n**boost::variant<Duration, DurationTree&>**\nto hold both Durations and\nDurationTrees of child threads.
     class DurationTreeMap
-    note right: Global singleton:\nlogger::gDurationTreeMap
+    note right: Global singleton:\nlogger::g_duration_tree_map
     class Duration {
       int depth_
       Clock::time_point start_

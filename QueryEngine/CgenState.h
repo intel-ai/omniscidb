@@ -206,7 +206,8 @@ struct CgenState {
       const std::string& fname,
       llvm::Type* ret_type,
       const std::vector<llvm::Value*> args,
-      const std::vector<llvm::Attribute::AttrKind>& fnattrs = {}) {
+      const std::vector<llvm::Attribute::AttrKind>& fnattrs = {},
+      const bool has_struct_return = false) {
     std::vector<llvm::Type*> arg_types;
     for (const auto arg : args) {
       arg_types.push_back(arg->getType());
@@ -216,14 +217,60 @@ struct CgenState {
     if (!fnattrs.empty()) {
       std::vector<std::pair<unsigned, llvm::Attribute>> indexedAttrs;
       indexedAttrs.reserve(fnattrs.size());
-      for (auto attr : fnattrs)
+      for (auto attr : fnattrs) {
         indexedAttrs.emplace_back(llvm::AttributeList::FunctionIndex,
                                   llvm::Attribute::get(context_, attr));
+      }
       attrs = llvm::AttributeList::get(context_,
                                        {&indexedAttrs.front(), indexedAttrs.size()});
     }
+
     auto func_p = module_->getOrInsertFunction(fname, func_ty, attrs);
     CHECK(func_p);
+#if LLVM_VERSION_MAJOR > 8
+    auto callee = func_p.getCallee();
+#else
+    auto callee = func_p;
+#endif
+    llvm::Function* func{nullptr};
+    if (auto callee_cast = llvm::dyn_cast<llvm::ConstantExpr>(callee)) {
+      // Get or insert function automatically adds a ConstantExpr cast if the return type
+      // of the existing function does not match the supplied return type.
+      CHECK(callee_cast->isCast());
+      CHECK_EQ(callee_cast->getNumOperands(), size_t(1));
+      func = llvm::dyn_cast<llvm::Function>(callee_cast->getOperand(0));
+    } else {
+      func = llvm::dyn_cast<llvm::Function>(callee);
+    }
+    CHECK(func);
+#if LLVM_VERSION_MAJOR > 8
+    llvm::FunctionType* func_type = func_p.getFunctionType();
+#else
+    llvm::FunctionType* func_type = func->getFunctionType();
+#endif
+    CHECK(func_type);
+    if (has_struct_return) {
+      const auto arg_ti = func_type->getParamType(0);
+      CHECK(arg_ti->isPointerTy() && arg_ti->getPointerElementType()->isStructTy());
+      auto attr_list = func->getAttributes();
+      llvm::AttrBuilder arr_arg_builder(attr_list.getParamAttributes(0));
+      arr_arg_builder.addAttribute(llvm::Attribute::StructRet);
+      func->addParamAttrs(0, arr_arg_builder);
+    }
+    const size_t arg_start = has_struct_return ? 1 : 0;
+    for (size_t i = arg_start; i < func->arg_size(); i++) {
+      const auto arg_ti = func_type->getParamType(i);
+      if (arg_ti->isPointerTy() && arg_ti->getPointerElementType()->isStructTy()) {
+        auto attr_list = func->getAttributes();
+        llvm::AttrBuilder arr_arg_builder(attr_list.getParamAttributes(i));
+#if LLVM_VERSION_MAJOR > 8
+        arr_arg_builder.addByValAttr(arg_ti->getPointerElementType());
+#else
+        arr_arg_builder.addAttribute(llvm::Attribute::ByVal);
+#endif
+        func->addParamAttrs(i, arr_arg_builder);
+      }
+    }
     llvm::Value* result = ir_builder_.CreateCall(func_p, args);
     // check the assumed type
     CHECK_EQ(result->getType(), ret_type);
@@ -260,6 +307,8 @@ struct CgenState {
   }
 
   llvm::ConstantInt* llBool(const bool v) const { return ::ll_bool(v, context_); }
+
+  void emitErrorCheck(llvm::Value* condition, llvm::Value* errorCode, std::string label);
 
   llvm::Module* module_;
   llvm::Function* row_func_;

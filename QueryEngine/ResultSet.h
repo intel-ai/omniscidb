@@ -93,6 +93,8 @@ class ResultSetStorage {
 
   int8_t* getUnderlyingBuffer() const;
 
+  size_t getEntryCount() const { return query_mem_desc_.getEntryCount(); }
+
   template <class KeyType>
   void moveEntriesToBuffer(int8_t* new_buff, const size_t new_entry_count) const;
 
@@ -162,6 +164,13 @@ class ResultSetStorage {
                              const ResultSetStorage& that) const;
 
   ALWAYS_INLINE
+  void reduceOneSlotSingleValue(int8_t* this_ptr1,
+                                const TargetInfo& target_info,
+                                const size_t target_slot_idx,
+                                const size_t init_agg_val_idx,
+                                const int8_t* that_ptr1) const;
+
+  ALWAYS_INLINE
   void reduceOneSlot(int8_t* this_ptr1,
                      int8_t* this_ptr2,
                      const int8_t* that_ptr1,
@@ -192,6 +201,8 @@ class ResultSetStorage {
   void addCountDistinctSetPointerMapping(const int64_t remote_ptr, const int64_t ptr);
 
   int64_t mappedPtr(const int64_t) const;
+
+  size_t binSearchRowCount() const;
 
   const std::vector<TargetInfo> targets_;
   QueryMemoryDescriptor query_mem_desc_;
@@ -287,6 +298,8 @@ class ResultSetRowIterator {
 };
 
 class TSerializedRows;
+
+using AppendedStorage = std::vector<std::unique_ptr<ResultSetStorage>>;
 
 class ResultSet {
  public:
@@ -469,7 +482,7 @@ class ResultSet {
   static std::unique_ptr<ResultSet> unserialize(const TSerializedRows& serialized_rows,
                                                 const Executor*);
 
-  size_t getLimit();
+  size_t getLimit() const;
 
   /**
    * Geo return type options when accessing geo columns from a result set.
@@ -493,6 +506,9 @@ class ResultSet {
   bool isDirectColumnarConversionPossible() const;
 
   bool didOutputColumnar() const { return this->query_mem_desc_.didOutputColumnar(); }
+
+  bool isZeroCopyColumnarConversionPossible(size_t column_idx) const;
+  const int8_t* getColumnarBuffer(size_t column_idx) const;
 
   QueryDescriptionType getQueryDescriptionType() const {
     return query_mem_desc_.getQueryDescriptionType();
@@ -524,6 +540,9 @@ class ResultSet {
   ENTRY_TYPE getEntryAt(const size_t row_idx,
                         const size_t target_idx,
                         const size_t slot_idx) const;
+
+  void lock() { user_mutex_.lock(); }
+  void unlock() { user_mutex_.unlock(); }
 
  private:
   void advanceCursorToNextEntry(ResultSetRowIterator& iter) const;
@@ -560,6 +579,8 @@ class ResultSet {
   ENTRY_TYPE getColumnarBaselineEntryAt(const size_t row_idx,
                                         const size_t target_idx,
                                         const size_t slot_idx) const;
+
+  size_t binSearchRowCount() const;
 
   size_t parallelRowCount() const;
 
@@ -802,7 +823,7 @@ class ResultSet {
   const int device_id_;
   QueryMemoryDescriptor query_mem_desc_;
   mutable std::unique_ptr<ResultSetStorage> storage_;
-  std::vector<std::unique_ptr<ResultSetStorage>> appended_storage_;
+  AppendedStorage appended_storage_;
   mutable size_t crt_row_buff_idx_;
   mutable size_t fetched_so_far_;
   size_t drop_first_;
@@ -845,6 +866,9 @@ class ResultSet {
   // the createComparator method)
   std::unique_ptr<ResultSetComparator<RowWiseTargetAccessor>> row_wise_comparator_;
   std::unique_ptr<ResultSetComparator<ColumnWiseTargetAccessor>> column_wise_comparator_;
+
+  // Used to lock a result set for exclusive use, e.g. for scan by fetcher
+  std::mutex user_mutex_;
 
   friend class ResultSetManager;
   friend class ResultSetRowIterator;

@@ -48,12 +48,25 @@ constexpr inline CalciteDMLPathSelection yield_dml_path_selector() {
   return static_cast<CalciteDMLPathSelection>(selector);
 }
 
+struct ExplainInfo {
+  bool explain;
+  bool explain_optimized;
+  bool explain_plan;
+  bool calcite_explain;
+
+  static ExplainInfo defaults() { return ExplainInfo{false, false, false, false}; }
+
+  bool justExplain() const { return explain || explain_plan || explain_optimized; }
+
+  bool justCalciteExplain() const { return calcite_explain; }
+};
+
 class ParserWrapper {
  public:
   // HACK:  This needs to go away as calcite takes over parsing
   enum class DMLType : int { Insert = 0, Delete, Update, Upsert, NotDML };
 
-  enum class ExplainType { None, IR, OptimizedIR, Calcite, Other };
+  enum class ExplainType { None, IR, OptimizedIR, Calcite, ExecutionPlan, Other };
 
   ParserWrapper(std::string query_string);
   std::string process(std::string user,
@@ -64,6 +77,8 @@ class ParserWrapper {
   virtual ~ParserWrapper();
 
   bool is_ddl = false;
+  // is_update_dml does not imply UPDATE,
+  // but rather any of the statement types: INSERT DELETE UPDATE UPSERT
   bool is_update_dml = false;
   bool is_ctas = false;
   bool is_itas = false;
@@ -75,13 +90,18 @@ class ParserWrapper {
 
   DMLType getDMLType() const { return dml_type_; }
 
+  ExplainInfo getExplainInfo() const;
+
   ExplainType getExplainType() const { return explain_type_; }
 
   bool isCalciteExplain() const { return explain_type_ == ExplainType::Calcite; }
 
+  bool isPlanExplain() const { return explain_type_ == ExplainType::ExecutionPlan; }
+
   bool isSelectExplain() const {
     return explain_type_ == ExplainType::Calcite || explain_type_ == ExplainType::IR ||
-           explain_type_ == ExplainType::OptimizedIR;
+           explain_type_ == ExplainType::OptimizedIR ||
+           explain_type_ == ExplainType::ExecutionPlan;
   }
 
   bool isIRExplain() const {
@@ -89,9 +109,9 @@ class ParserWrapper {
   }
 
   bool isCalcitePathPermissable(bool read_only_mode = false) {
-    return (!is_ddl && !is_optimize && !is_validate &&
-            isCalcitePermissableDml(read_only_mode) &&
-            !(explain_type_ == ExplainType::Other));
+    return is_calcite_ddl_ || (!is_legacy_ddl_ && !is_optimize && !is_validate &&
+                               isCalcitePermissableDml(read_only_mode) &&
+                               !(explain_type_ == ExplainType::Other));
   }
 
   bool isOtherExplain() const { return explain_type_ == ExplainType::Other; }
@@ -116,6 +136,8 @@ class ParserWrapper {
     }
   }
 
+  bool isCalciteDdl() const { return is_calcite_ddl_; }
+
  private:
   DMLType dml_type_ = DMLType::NotDML;
   ExplainType explain_type_ = ExplainType::None;
@@ -125,6 +147,10 @@ class ParserWrapper {
   static const std::string explain_str;
   static const std::string calcite_explain_str;
   static const std::string optimized_explain_str;
+  static const std::string plan_explain_str;
   static const std::string optimize_str;
   static const std::string validate_str;
+
+  bool is_legacy_ddl_ = false;
+  bool is_calcite_ddl_ = false;
 };

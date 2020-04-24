@@ -66,8 +66,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Utilities for converting {@link org.apache.calcite.rel.RelNode}
- * into JSON format.
+ * Utilities for converting {@link org.apache.calcite.rel.RelNode} into JSON
+ * format.
  */
 public class MapDRelJson {
   private final Map<String, Constructor> constructorMap =
@@ -331,11 +331,7 @@ public class MapDRelJson {
         if (value2 instanceof TimeUnitRange) {
           map.put("literal", value2.toString());
         } else {
-          if (value2 instanceof String) {
-            map.put("literal", ((String) value2).replace("\\", "\\\\"));
-          } else {
-            map.put("literal", value2);
-          }
+          map.put("literal", value2);
         }
         map.put("type", literal.getTypeName().name());
         map.put("target_type", literal.getType().getSqlTypeName().toString());

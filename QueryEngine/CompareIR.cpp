@@ -243,6 +243,10 @@ llvm::Value* CodeGenerator::codegenOverlaps(const SQLOps optype,
   // TODO(adb): we should never get here, but going to leave this in place for now since
   // it will likely be useful in factoring the bounds check out of ST_Contains
   const auto lhs_ti = lhs->get_type_info();
+  if (g_enable_overlaps_hashjoin) {
+    LOG(FATAL) << "Fatal error when generating code for qualifier "
+               << lhs_ti.get_type_name();
+  }
   CHECK(lhs_ti.is_geometry());
 
   if (lhs_ti.is_geometry()) {
@@ -500,7 +504,7 @@ llvm::Value* CodeGenerator::codegenQualifierCmp(const SQLOps optype,
           "Comparison between a dictionary-encoded and a none-encoded string would be "
           "slow");
     }
-    if (co.device_type_ == ExecutorDeviceType::GPU) {
+    if (co.device_type == ExecutorDeviceType::GPU) {
       throw QueryMustRunOnCpu();
     }
     CHECK_EQ(kENCODING_NONE, target_ti.get_compression());

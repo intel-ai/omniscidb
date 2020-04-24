@@ -159,6 +159,7 @@ __device__ int64_t dw_sm_cycle_start[128];  // Set from host before launching th
 // TODO(Saman): make this cycle budget something constant in codegen level
 __device__ int64_t dw_cycle_budget = 0;  // Set from host before launching the kernel
 __device__ int32_t dw_abort = 0;         // TBD: set from host (async)
+__device__ int32_t runtime_interrupt_flag = 0;
 
 __inline__ __device__ uint32_t get_smid(void) {
   uint32_t ret;
@@ -167,13 +168,13 @@ __inline__ __device__ uint32_t get_smid(void) {
 }
 
 /*
- * The main objective of this funciton is to return true, if any of the following two
- * scnearios happen:
+ * The main objective of this function is to return true, if any of the following two
+ * scenarios happen:
  * 1. receives a host request for aborting the kernel execution
  * 2. kernel execution takes longer clock cycles than it was initially allowed
  * The assumption is that all (or none) threads within a block return true for the
  * watchdog, and the first thread within each block compares the recorded clock cycles for
- * its occupying SM with the allowed budget. It also assumess that all threads entering
+ * its occupying SM with the allowed budget. It also assumes that all threads entering
  * this function are active (no critical edge exposure)
  * NOTE: dw_cycle_budget, dw_abort, and dw_sm_cycle_start[] are all variables in global
  * memory scope.
@@ -220,6 +221,10 @@ extern "C" __device__ bool dynamic_watchdog() {
   }
   __syncthreads();
   return dw_should_terminate;
+}
+
+extern "C" __device__ bool check_interrupt() {
+  return (runtime_interrupt_flag == 1) ? true : false;
 }
 
 template <typename T = unsigned long long>
@@ -715,6 +720,33 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
   *agg = val;
 }
 
+extern "C" __device__ int32_t checked_single_agg_id_shared(int64_t* agg,
+                                                           const int64_t val,
+                                                           const int64_t null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != null_val) {
+      if (static_cast<int64_t>(old) != val) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, val);
+  } while (assumed != old);
+
+  return 0;
+}
+
 #define DEF_AGG_ID_INT_SHARED(n)                                            \
   extern "C" __device__ void agg_id_int##n##_shared(int##n##_t* agg,        \
                                                     const int##n##_t val) { \
@@ -724,18 +756,102 @@ extern "C" __device__ void agg_id_shared(int64_t* agg, const int64_t val) {
 DEF_AGG_ID_INT_SHARED(32)
 DEF_AGG_ID_INT_SHARED(16)
 DEF_AGG_ID_INT_SHARED(8)
+
 #undef DEF_AGG_ID_INT_SHARED
 
 extern "C" __device__ void agg_id_double_shared(int64_t* agg, const double val) {
   *agg = *(reinterpret_cast<const int64_t*>(&val));
 }
 
+extern "C" __device__ int32_t checked_single_agg_id_double_shared(int64_t* agg,
+                                                                  const double val,
+                                                                  const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_double_shared_slow(int64_t* agg, const double* val) {
   *agg = *(reinterpret_cast<const int64_t*>(val));
 }
 
+extern "C" __device__ int32_t
+checked_single_agg_id_double_shared_slow(int64_t* agg,
+                                         const double* valp,
+                                         const double null_val) {
+  unsigned long long int* address_as_ull = reinterpret_cast<unsigned long long int*>(agg);
+  unsigned long long int old = *address_as_ull, assumed;
+  double val = *valp;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (static_cast<int64_t>(old) != __double_as_longlong(null_val)) {
+      if (static_cast<int64_t>(old) != __double_as_longlong(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val));
+  } while (assumed != old);
+
+  return 0;
+}
+
 extern "C" __device__ void agg_id_float_shared(int32_t* agg, const float val) {
   *agg = __float_as_int(val);
+}
+
+extern "C" __device__ int32_t checked_single_agg_id_float_shared(int32_t* agg,
+                                                                 const float val,
+                                                                 const float null_val) {
+  int* address_as_ull = reinterpret_cast<int*>(agg);
+  int old = *address_as_ull, assumed;
+
+  if (val == null_val) {
+    return 0;
+  }
+
+  do {
+    if (old != __float_as_int(null_val)) {
+      if (old != __float_as_int(val)) {
+        // see Execute::ERR_SINGLE_VALUE_FOUND_MULTIPLE_VALUES
+        return 15;
+      } else {
+        break;
+      }
+    }
+
+    assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __float_as_int(val));
+  } while (assumed != old);
+
+  return 0;
 }
 
 #define DEF_SKIP_AGG(base_agg_func)                             \

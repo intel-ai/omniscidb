@@ -228,7 +228,7 @@ class ColumnVar : public Expr {
  protected:
   int table_id;   // the global table id
   int column_id;  // the column id
-  int rte_idx;    // 0-based range table index. only used by the analyzer and planner.
+  int rte_idx;    // 0-based range table index, used for table ordering in multi-joins
 };
 
 /*
@@ -1425,11 +1425,13 @@ class ArrayExpr : public Expr {
   ArrayExpr(SQLTypeInfo const& array_ti,
             ExpressionPtrVector const& array_exprs,
             int expr_index,
+            bool is_null = false,
             bool local_alloc = false)
-      : Expr(preInitTweakedTypeInfo(array_ti))
+      : Expr(array_ti)
       , contained_expressions_(array_exprs)
       , expr_index_(expr_index)
-      , local_alloc_(local_alloc) {}
+      , local_alloc_(local_alloc)
+      , is_null_(is_null) {}
 
   Analyzer::ExpressionPtr deep_copy() const override;
   std::string toString() const override;
@@ -1437,6 +1439,7 @@ class ArrayExpr : public Expr {
   size_t getElementCount() const { return contained_expressions_.size(); }
   int32_t getExprIndex() const { return expr_index_; }
   bool isLocalAlloc() const { return local_alloc_; }
+  bool isNull() const { return is_null_; }
 
   const Analyzer::Expr* getElement(const size_t i) const {
     CHECK_LT(i, contained_expressions_.size());
@@ -1444,16 +1447,10 @@ class ArrayExpr : public Expr {
   }
 
  private:
-  SQLTypeInfo& preInitTweakedTypeInfo(SQLTypeInfo const& array_ti) {
-    tweaked_type_info_ = array_ti;
-    tweaked_type_info_.setStandardBufferPackaging();
-    return tweaked_type_info_;
-  }
-
-  SQLTypeInfo tweaked_type_info_;
   ExpressionPtrVector contained_expressions_;
   int expr_index_;
   bool local_alloc_;
+  bool is_null_;  // constant is NULL
 };
 
 /*

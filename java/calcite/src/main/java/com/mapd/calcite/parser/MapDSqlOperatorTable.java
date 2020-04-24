@@ -23,6 +23,7 @@ import com.mapd.parser.server.ExtensionFunction;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.sql.SqlAggFunction;
+import org.apache.calcite.sql.SqlCallBinding;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlFunctionCategory;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -31,6 +32,7 @@ import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlOperatorBinding;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.SqlSyntax;
+import org.apache.calcite.sql.fun.SqlArrayValueConstructor;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.SqlTypeFamily;
@@ -83,6 +85,9 @@ class CaseInsensitiveListSqlOperatorTable extends ListSqlOperatorTable {
  * @author michael
  */
 public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
+  public static final SqlArrayValueConstructorAllowingEmpty ARRAY_VALUE_CONSTRUCTOR =
+          new SqlArrayValueConstructorAllowingEmpty();
+
   static {
     try {
       // some nasty bit to remove the std APPROX_COUNT_DISTINCT function definition
@@ -94,7 +99,8 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         for (Iterator i = operators.entries().iterator(); i.hasNext();) {
           Map.Entry entry = (Map.Entry) i.next();
           if (entry.getValue() == SqlStdOperatorTable.APPROX_COUNT_DISTINCT
-                  || entry.getValue() == SqlStdOperatorTable.AVG) {
+                  || entry.getValue() == SqlStdOperatorTable.AVG
+                  || entry.getValue() == SqlStdOperatorTable.ARRAY_VALUE_CONSTRUCTOR) {
             i.remove();
           }
         }
@@ -108,11 +114,14 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         for (Iterator i = operators.entries().iterator(); i.hasNext();) {
           Map.Entry entry = (Map.Entry) i.next();
           if (entry.getValue() == SqlStdOperatorTable.APPROX_COUNT_DISTINCT
-                  || entry.getValue() == SqlStdOperatorTable.AVG) {
+                  || entry.getValue() == SqlStdOperatorTable.AVG
+                  || entry.getValue() == SqlStdOperatorTable.ARRAY_VALUE_CONSTRUCTOR) {
             i.remove();
           }
         }
       }
+
+      SqlStdOperatorTable.instance().register(ARRAY_VALUE_CONSTRUCTOR);
 
     } catch (Exception e) {
       throw new RuntimeException(e);
@@ -177,6 +186,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     opTab.addOperator(new Truncate());
     opTab.addOperator(new ST_Contains());
     opTab.addOperator(new ST_Intersects());
+    opTab.addOperator(new ST_Overlaps());
     opTab.addOperator(new ST_Disjoint());
     opTab.addOperator(new ST_Within());
     opTab.addOperator(new ST_DWithin());
@@ -230,7 +240,7 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         continue;
       }
       demangledNames.add(demangledName);
-      opTab.addOperator(new ExtFunction(extSig.getKey(), extSig.getValue()));
+      opTab.addOperator(new ExtFunction(demangledName, extSig.getValue()));
     }
   }
 
@@ -240,7 +250,27 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       return str;
     }
     assert suffix_idx > 0;
-    return str.substring(0, suffix_idx - 1);
+    return str.substring(0, suffix_idx);
+  }
+
+  public static class SqlArrayValueConstructorAllowingEmpty
+          extends SqlArrayValueConstructor {
+    @Override
+    protected RelDataType getComponentType(
+            RelDataTypeFactory typeFactory, List<RelDataType> argTypes) {
+      if (argTypes.isEmpty()) {
+        return typeFactory.createSqlType(SqlTypeName.NULL);
+      }
+      return super.getComponentType(typeFactory, argTypes);
+    }
+
+    @Override
+    public boolean checkOperandTypes(SqlCallBinding callBinding, boolean throwOnFailure) {
+      if (callBinding.operands().isEmpty()) {
+        return true;
+      }
+      return super.checkOperandTypes(callBinding, throwOnFailure);
+    }
   }
 
   /**
@@ -768,7 +798,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -794,7 +827,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -803,6 +839,32 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       st_intersects_sig.add(SqlTypeFamily.ANY);
       st_intersects_sig.add(SqlTypeFamily.ANY);
       return st_intersects_sig;
+    }
+  }
+
+  static class ST_Overlaps extends SqlFunction {
+    ST_Overlaps() {
+      super("ST_Overlaps",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 2;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> st_overlaps_sig =
+              new java.util.ArrayList<SqlTypeFamily>();
+      st_overlaps_sig.add(SqlTypeFamily.ANY);
+      st_overlaps_sig.add(SqlTypeFamily.ANY);
+      return st_overlaps_sig;
     }
   }
 
@@ -820,7 +882,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -846,7 +911,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -872,7 +940,11 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 3;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable()
+                      || opBinding.getOperandType(2).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -899,7 +971,11 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 3;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.BOOLEAN),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable()
+                      || opBinding.getOperandType(2).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -926,7 +1002,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -952,7 +1031,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 2;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable()
+                      || opBinding.getOperandType(1).isNullable());
     }
 
     private static java.util.List<SqlTypeFamily> signature() {
@@ -1016,7 +1098,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1034,7 +1118,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1052,7 +1138,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1070,7 +1158,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1088,7 +1178,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1106,7 +1198,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1124,7 +1218,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1142,7 +1238,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1160,7 +1258,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1178,7 +1278,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1196,7 +1298,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1214,7 +1318,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1232,7 +1338,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.DOUBLE),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1250,7 +1358,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1268,7 +1378,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1286,7 +1398,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1304,7 +1418,9 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
-      return typeFactory.createSqlType(SqlTypeName.INTEGER);
+      return typeFactory.createTypeWithNullability(
+              typeFactory.createSqlType(SqlTypeName.INTEGER),
+              opBinding.getOperandType(0).isNullable());
     }
   }
 
@@ -1479,7 +1595,8 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
               || type == ExtensionFunction.ExtArgumentType.PInt32
               || type == ExtensionFunction.ExtArgumentType.PInt64
               || type == ExtensionFunction.ExtArgumentType.PFloat
-              || type == ExtensionFunction.ExtArgumentType.PDouble;
+              || type == ExtensionFunction.ExtArgumentType.PDouble
+              || type == ExtensionFunction.ExtArgumentType.PBool;
     }
 
     @Override
@@ -1509,6 +1626,8 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
           return ExtensionFunction.ExtArgumentType.Float;
         case PDouble:
           return ExtensionFunction.ExtArgumentType.Double;
+        case PBool:
+          return ExtensionFunction.ExtArgumentType.Bool;
       }
       MAPDLOGGER.error("getValueType: no value for type " + type);
       assert false;
@@ -1538,16 +1657,19 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
         case PInt64:
         case PFloat:
         case PDouble:
+        case PBool:
         case ArrayInt8:
         case ArrayInt16:
         case ArrayInt32:
         case ArrayInt64:
         case ArrayFloat:
         case ArrayDouble:
+        case ArrayBool:
           return SqlTypeName.ARRAY;
         case GeoPoint:
         case GeoLineString:
         case GeoPolygon:
+        case GeoMultiPolygon:
           return SqlTypeName.GEOMETRY;
         case Cursor:
           return SqlTypeName.CURSOR;

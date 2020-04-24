@@ -17,15 +17,17 @@
 #ifndef QUERYENGINE_RELALGEXECUTOR_H
 #define QUERYENGINE_RELALGEXECUTOR_H
 
-#include "../Shared/scope.h"
-#include "Descriptors/RelAlgExecutionDescriptor.h"
 #include "Distributed/AggregatedResult.h"
-#include "Execute.h"
-#include "InputMetadata.h"
-#include "JoinFilterPushDown.h"
-#include "QueryRewrite.h"
-#include "SpeculativeTopN.h"
-#include "StreamingTopN.h"
+#include "QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/InputMetadata.h"
+#include "QueryEngine/JoinFilterPushDown.h"
+#include "QueryEngine/QueryRewrite.h"
+#include "QueryEngine/RelAlgDagBuilder.h"
+#include "QueryEngine/SpeculativeTopN.h"
+#include "QueryEngine/StreamingTopN.h"
+#include "Shared/scope.h"
+#include "ThriftHandler/QueryState.h"
 
 #include <ctime>
 #include <sstream>
@@ -53,16 +55,45 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
  public:
   using TargetInfoList = std::vector<TargetInfo>;
 
-  RelAlgExecutor(Executor* executor, const Catalog_Namespace::Catalog& cat)
+  RelAlgExecutor(Executor* executor,
+                 const Catalog_Namespace::Catalog& cat,
+                 std::shared_ptr<const query_state::QueryState> query_state = nullptr)
       : StorageIOFacility(executor, cat)
       , executor_(executor)
       , cat_(cat)
+      , query_state_(std::move(query_state))
       , now_(0)
       , queue_time_ms_(0) {}
 
-  ExecutionResult executeRelAlgQuery(const std::string& query_ra,
-                                     const CompilationOptions& co,
+  RelAlgExecutor(Executor* executor,
+                 const Catalog_Namespace::Catalog& cat,
+                 const std::string& query_ra,
+                 std::shared_ptr<const query_state::QueryState> query_state = nullptr)
+      : StorageIOFacility(executor, cat)
+      , executor_(executor)
+      , cat_(cat)
+      , query_dag_(std::make_unique<RelAlgDagBuilder>(query_ra, cat_, nullptr))
+      , query_state_(std::move(query_state))
+      , now_(0)
+      , queue_time_ms_(0) {}
+
+  RelAlgExecutor(Executor* executor,
+                 const Catalog_Namespace::Catalog& cat,
+                 std::unique_ptr<RelAlgDagBuilder> query_dag,
+                 std::shared_ptr<const query_state::QueryState> query_state = nullptr)
+      : StorageIOFacility(executor, cat)
+      , executor_(executor)
+      , cat_(cat)
+      , query_dag_(std::move(query_dag))
+      , query_state_(std::move(query_state))
+      , now_(0)
+      , queue_time_ms_(0) {}
+
+  size_t getOuterFragmentCount(const CompilationOptions& co, const ExecutionOptions& eo);
+
+  ExecutionResult executeRelAlgQuery(const CompilationOptions& co,
                                      const ExecutionOptions& eo,
+                                     const bool just_explain_plan,
                                      RenderInfo* render_info);
 
   ExecutionResult executeRelAlgQueryWithFilterPushDown(const RaExecutionSequence& seq,
@@ -101,19 +132,20 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
     CHECK(it_ok.second);
   }
 
-  void registerSubquery(std::shared_ptr<RexSubQuery> subquery) noexcept {
-    subqueries_.push_back(subquery);
+  const RelAlgNode& getRootRelAlgNode() const {
+    CHECK(query_dag_);
+    return query_dag_->getRootNode();
   }
-
   const std::vector<std::shared_ptr<RexSubQuery>>& getSubqueries() const noexcept {
-    return subqueries_;
+    CHECK(query_dag_);
+    return query_dag_->getSubqueries();
   };
 
-  AggregatedColRange computeColRangesCache(const RelAlgNode* ra);
+  ExecutionResult executeSimpleInsert(const Analyzer::Query& insert_query);
 
-  StringDictionaryGenerations computeStringDictionaryGenerations(const RelAlgNode* ra);
-
-  TableGenerations computeTableGenerations(const RelAlgNode* ra);
+  AggregatedColRange computeColRangesCache();
+  StringDictionaryGenerations computeStringDictionaryGenerations();
+  TableGenerations computeTableGenerations();
 
   Executor* getExecutor() const;
 
@@ -122,9 +154,9 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
   static std::string getErrorMessageFromCode(const int32_t error_code);
 
  private:
-  ExecutionResult executeRelAlgQueryNoRetry(const std::string& query_ra,
-                                            const CompilationOptions& co,
+  ExecutionResult executeRelAlgQueryNoRetry(const CompilationOptions& co,
                                             const ExecutionOptions& eo,
+                                            const bool just_explain_plan,
                                             RenderInfo* render_info);
 
   void executeRelAlgStep(const RaExecutionSequence& seq,
@@ -134,27 +166,15 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
                          RenderInfo*,
                          const int64_t queue_time_ms);
 
-  void executeUpdateViaCompound(const RelCompound* compound,
-                                const CompilationOptions& co,
-                                const ExecutionOptions& eo,
-                                RenderInfo* render_info,
-                                const int64_t queue_time_ms);
-  void executeUpdateViaProject(const RelProject*,
-                               const CompilationOptions&,
-                               const ExecutionOptions&,
-                               RenderInfo*,
-                               const int64_t queue_time_ms);
+  void executeUpdate(const RelAlgNode* node,
+                     const CompilationOptions& co,
+                     const ExecutionOptions& eo,
+                     const int64_t queue_time_ms);
 
-  void executeDeleteViaCompound(const RelCompound* compound,
-                                const CompilationOptions& co,
-                                const ExecutionOptions& eo,
-                                RenderInfo* render_info,
-                                const int64_t queue_time_ms);
-  void executeDeleteViaProject(const RelProject*,
-                               const CompilationOptions&,
-                               const ExecutionOptions&,
-                               RenderInfo*,
-                               const int64_t queue_time_ms);
+  void executeDelete(const RelAlgNode* node,
+                     const CompilationOptions& co,
+                     const ExecutionOptions& eo_in,
+                     const int64_t queue_time_ms);
 
   ExecutionResult executeCompound(const RelCompound*,
                                   const CompilationOptions&,
@@ -209,7 +229,14 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
                               const int64_t queue_time_ms);
 
   ExecutionResult executeLogicalValues(const RelLogicalValues*, const ExecutionOptions&);
+
   ExecutionResult executeModify(const RelModify* modify, const ExecutionOptions& eo);
+
+  ExecutionResult executeUnion(const RelLogicalUnion*,
+                               const CompilationOptions&,
+                               const ExecutionOptions&,
+                               RenderInfo*,
+                               const int64_t queue_time_ms);
 
   // TODO(alex): just move max_groups_buffer_entry_guess to RelAlgExecutionUnit once
   //             we deprecate the plan-based executor paths and remove WorkUnit
@@ -227,7 +254,7 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
     const RelAlgNode* body;
   };
 
-  WorkUnit createSortInputWorkUnit(const RelSort*, const bool just_explain);
+  WorkUnit createSortInputWorkUnit(const RelSort*, const ExecutionOptions& eo);
 
   ExecutionResult executeWorkUnit(const WorkUnit& work_unit,
                                   const std::vector<TargetMetaInfo>& targets_meta,
@@ -273,32 +300,29 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
   // appropriate exception corresponding to the query error code.
   static void handlePersistentError(const int32_t error_code);
 
-  WorkUnit createWorkUnit(const RelAlgNode*, const SortInfo&, const bool just_explain);
+  WorkUnit createWorkUnit(const RelAlgNode*, const SortInfo&, const ExecutionOptions& eo);
 
-  WorkUnit createModifyCompoundWorkUnit(const RelCompound* compound,
-                                        const SortInfo& sort_info,
-                                        const bool just_explain);
   WorkUnit createCompoundWorkUnit(const RelCompound*,
                                   const SortInfo&,
-                                  const bool just_explain);
+                                  const ExecutionOptions& eo);
 
   WorkUnit createAggregateWorkUnit(const RelAggregate*,
                                    const SortInfo&,
                                    const bool just_explain);
 
-  WorkUnit createModifyProjectWorkUnit(const RelProject* project,
-                                       const SortInfo& sort_info,
-                                       const bool just_explain);
-
   WorkUnit createProjectWorkUnit(const RelProject*,
                                  const SortInfo&,
-                                 const bool just_explain);
+                                 const ExecutionOptions& eo);
 
   WorkUnit createFilterWorkUnit(const RelFilter*,
                                 const SortInfo&,
                                 const bool just_explain);
 
   WorkUnit createJoinWorkUnit(const RelJoin*, const SortInfo&, const bool just_explain);
+
+  WorkUnit createUnionWorkUnit(const RelLogicalUnion*,
+                               const SortInfo&,
+                               const ExecutionOptions& eo);
 
   TableFunctionWorkUnit createTableFunctionWorkUnit(const RelTableFunction* table_func,
                                                     const bool just_explain);
@@ -307,6 +331,12 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
     CHECK_LT(size_t(0), result->colCount());
     CHECK_LT(table_id, 0);
     const auto it_ok = temporary_tables_.emplace(table_id, result);
+    CHECK(it_ok.second);
+  }
+
+  void addTemporaryTable(const int table_id, const TemporaryTable& table) {
+    CHECK_LT(table_id, 0);
+    const auto it_ok = temporary_tables_.emplace(table_id, table);
     CHECK(it_ok.second);
   }
 
@@ -330,10 +360,11 @@ class RelAlgExecutor : private StorageIOFacility<RelAlgExecutorTraits> {
 
   Executor* executor_;
   const Catalog_Namespace::Catalog& cat_;
+  std::unique_ptr<RelAlgDagBuilder> query_dag_;
+  std::shared_ptr<const query_state::QueryState> query_state_;
   TemporaryTables temporary_tables_;
   time_t now_;
   std::vector<std::shared_ptr<Analyzer::Expr>> target_exprs_owned_;  // TODO(alex): remove
-  std::vector<std::shared_ptr<RexSubQuery>> subqueries_;
   std::unordered_map<unsigned, AggregatedResult> leaf_results_;
   int64_t queue_time_ms_;
   static SpeculativeTopNBlacklist speculative_topn_blacklist_;

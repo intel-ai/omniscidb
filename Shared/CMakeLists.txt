@@ -3,6 +3,7 @@ set(shared_source_files
     timegm.cpp
     mapd_glob.cpp
     StringTransform.cpp
+    geo_compression.cpp
     geo_types.cpp
     SysInfo.cpp
     File.cpp
@@ -10,7 +11,10 @@ set(shared_source_files
     base64.cpp
     Logger.cpp
     thread_count.cpp
+    Asio.cpp
 )
+
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/funcannotations.h DESTINATION ${CMAKE_BINARY_DIR}/Shared/)
 
 add_library(Shared ${shared_source_files})
 target_link_libraries(Shared ${Boost_LIBRARIES} ${GDAL_LIBRARIES})

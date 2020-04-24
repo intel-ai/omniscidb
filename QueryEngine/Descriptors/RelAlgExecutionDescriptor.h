@@ -27,10 +27,16 @@ class ResultSet;
 
 class ExecutionResult {
  public:
-  ExecutionResult(const std::shared_ptr<ResultSet>& rows,
+  ExecutionResult(const ResultSetPtr& rows,
                   const std::vector<TargetMetaInfo>& targets_meta);
 
   ExecutionResult(ResultSetPtr&& result, const std::vector<TargetMetaInfo>& targets_meta);
+
+  ExecutionResult(const TemporaryTable& results,
+                  const std::vector<TargetMetaInfo>& targets_meta);
+
+  ExecutionResult(TemporaryTable&& results,
+                  const std::vector<TargetMetaInfo>& targets_meta);
 
   ExecutionResult(const ExecutionResult& that);
 
@@ -41,11 +47,19 @@ class ExecutionResult {
 
   ExecutionResult& operator=(const ExecutionResult& that);
 
-  const std::shared_ptr<ResultSet>& getRows() const { return result_; }
+  const ResultSetPtr& getRows() const {
+    CHECK_EQ(results_.getFragCount(), 1);
+    return results_[0];
+  }
 
-  bool empty() const { return !result_; }
+  bool empty() const { return results_.empty(); }
 
-  const ResultSetPtr& getDataPtr() const { return result_; }
+  const ResultSetPtr& getDataPtr() const {
+    CHECK_EQ(results_.getFragCount(), 1);
+    return results_[0];
+  }
+
+  const TemporaryTable& getTable() const { return results_; }
 
   const std::vector<TargetMetaInfo>& getTargetsMeta() const { return targets_meta_; }
 
@@ -54,12 +68,12 @@ class ExecutionResult {
   const bool isFilterPushDownEnabled() const { return filter_push_down_enabled_; }
 
   void setQueueTime(const int64_t queue_time_ms) {
-    CHECK(result_);
-    result_->setQueueTime(queue_time_ms);
+    CHECK(!results_.empty());
+    results_[0]->setQueueTime(queue_time_ms);
   }
 
  private:
-  ResultSetPtr result_;
+  TemporaryTable results_;
   std::vector<TargetMetaInfo> targets_meta_;
   // filters chosen to be pushed down
   std::vector<PushedDownFilterInfo> pushed_down_filter_info_;
@@ -115,11 +129,11 @@ class RaExecutionSequence {
   RaExecutionDesc* next();
 
   /**
-   * Returns the index of the next execution descriptor in the graph. If after_reduction
+   * Returns the index of the next execution descriptor in the graph. If after_broadcast
    * is true, returns the index of the first execution descriptor after the next global
-   * reduction. Returns -1 if no execution descriptors remain in the graph.
+   * broadcast. Returns -1 if no execution descriptors remain in the graph.
    */
-  ssize_t nextStepId(const bool after_reduction) const;
+  ssize_t nextStepId(const bool after_broadcast) const;
 
   bool executionFinished() const;
 
@@ -133,6 +147,8 @@ class RaExecutionSequence {
 
   size_t totalDescriptorsCount() const;
 
+  bool hasTableFunctions() const { return table_functions_ > 0; }
+
  private:
   DAG graph_;
 
@@ -140,16 +156,17 @@ class RaExecutionSequence {
   std::vector<Vertex> ordering_;  // reverse order topological sort of graph_
   size_t current_vertex_ = 0;
   size_t scan_count_ = 0;
+  size_t table_functions_ = 0;
 
   /**
    * Starting from the current vertex, iterate the graph counting the number of execution
-   * descriptors remaining before the next required reduction step. The current vertex is
-   * counted as the first step before a reduction is required; i.e. a return value of 0
+   * descriptors remaining before the next required broadcast step. The current vertex is
+   * counted as the first step before a broadcast is required; i.e. a return value of 0
    * indicates no additional steps in the graph can be executed without a global
-   * reduction, and a return value of 2 indicates the current vertex and both subsequent
-   * vertices can be executed before a global reduction is needed.
+   * broadcast, and a return value of 2 indicates the current vertex and both subsequent
+   * vertices can be executed before a global broacast is needed.
    */
-  size_t stepsToNextReduction() const;
+  size_t stepsToNextBroadcast() const;
 
   // The execution descriptors hold the pointers to their results. We need to push them
   // back into this vector as they are created, so we don't lose the intermediate results

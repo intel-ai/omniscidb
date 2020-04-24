@@ -55,10 +55,11 @@ class FixedLengthArrayNoneEncoder : public Encoder {
     return dataSize / array_size;
   }
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
+  ChunkMetadata appendData(int8_t*& src_data,
+                           const size_t num_elems_to_append,
+                           const SQLTypeInfo& ti,
+                           const bool replicating = false,
+                           const int64_t offset = -1) override {
     CHECK(false);  // should never be called for arrays
     return ChunkMetadata{};
   }
@@ -111,6 +112,10 @@ class FixedLengthArrayNoneEncoder : public Encoder {
 
   void reduceStats(const Encoder&) override { CHECK(false); }
 
+  void updateStats(const int8_t* const dst, const size_t numBytes) override {
+    CHECK(false);
+  }
+
   void writeMetadata(FILE* f) override {
     // assumes pointer is already in right place
     fwrite((int8_t*)&num_elems_, sizeof(size_t), 1, f);
@@ -143,20 +148,11 @@ class FixedLengthArrayNoneEncoder : public Encoder {
     update_elem_stats(ArrayDatum(array_size, array, is_null(array), DoNothingDeleter()));
   }
 
-  Datum elem_min;
-  Datum elem_max;
-  bool has_nulls;
-  bool initialized;
-
- private:
-  std::mutex EncoderMutex_;
-  size_t array_size;
-
-  bool is_null(int8_t* array) {
-    if (buffer_->sql_type.get_notnull()) {
+  static bool is_null(const SQLTypeInfo& type, int8_t* array) {
+    if (type.get_notnull()) {
       return false;
     }
-    switch (buffer_->sql_type.get_subtype()) {
+    switch (type.get_subtype()) {
       case kBOOLEAN: {
         const bool* bool_array = (bool*)array;
         return ((int8_t)bool_array[0] == NULL_ARRAY_BOOLEAN);
@@ -196,7 +192,7 @@ class FixedLengthArrayNoneEncoder : public Encoder {
       case kCHAR:
       case kVARCHAR:
       case kTEXT: {
-        CHECK_EQ(buffer_->sql_type.get_compression(), kENCODING_DICT);
+        CHECK_EQ(type.get_compression(), kENCODING_DICT);
         const int32_t* int_array = (int32_t*)array;
         return (int_array[0] == NULL_ARRAY_INT);
       }
@@ -205,6 +201,17 @@ class FixedLengthArrayNoneEncoder : public Encoder {
     }
     return false;
   }
+
+  Datum elem_min;
+  Datum elem_max;
+  bool has_nulls;
+  bool initialized;
+
+ private:
+  std::mutex EncoderMutex_;
+  size_t array_size;
+
+  bool is_null(int8_t* array) { return is_null(buffer_->sql_type, array); }
 
   void update_elem_stats(const ArrayDatum& array) {
     if (array.is_null) {

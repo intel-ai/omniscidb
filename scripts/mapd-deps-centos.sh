@@ -3,6 +3,25 @@
 set -e
 set -x
 
+# Parse inputs
+TSAN=false
+COMPRESS=false
+
+while (( $# )); do
+  case "$1" in
+    --compress)
+      COMPRESS=true
+      ;;
+    --tsan)
+      TSAN=true
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
 SUFFIX=${SUFFIX:=$(date +%Y%m%d)}
 PREFIX=${MAPD_PATH:="/usr/local/mapd-deps/$SUFFIX"}
 if [ ! -w $(dirname $PREFIX) ] ; then
@@ -40,7 +59,8 @@ sudo yum install -y \
     curl \
     openldap-devel
 sudo yum install -y \
-    jq
+    jq \
+    pxz
 
 # gmp, mpc, mpfr, autoconf, automake
 # note: if gmp fails on POWER8:
@@ -55,7 +75,7 @@ download_make_install ftp://ftp.gnu.org/gnu/autoconf/autoconf-2.69.tar.xz # "" "
 download_make_install ftp://ftp.gnu.org/gnu/automake/automake-1.16.1.tar.xz
 
 # gcc
-VERS=7.4.0
+VERS=8.4.0
 download ftp://ftp.gnu.org/gnu/gcc/gcc-$VERS/gcc-$VERS.tar.xz
 extract gcc-$VERS.tar.xz
 pushd gcc-$VERS
@@ -83,7 +103,12 @@ popd
 export CC=$PREFIX/bin/gcc
 export CXX=$PREFIX/bin/g++
 
+install_ninja
+
+install_cmake
+
 download_make_install ftp://ftp.gnu.org/gnu/libtool/libtool-2.4.6.tar.gz
+
 # http://zlib.net/zlib-1.2.8.tar.xz
 download_make_install ${HTTP_DEPS}/zlib-1.2.8.tar.xz
 
@@ -96,8 +121,8 @@ makej
 make install PREFIX=$PREFIX
 popd
 
-# https://www.openssl.org/source/openssl-1.0.2p.tar.gz
-download_make_install ${HTTP_DEPS}/openssl-1.0.2p.tar.gz "" "linux-$(uname -m) no-shared no-dso -fPIC"
+# https://www.openssl.org/source/openssl-1.0.2u.tar.gz
+download_make_install ${HTTP_DEPS}/openssl-1.0.2u.tar.gz "" "linux-$(uname -m) no-shared no-dso -fPIC"
 
 # libarchive
 download_make_install ${HTTP_DEPS}/xz-5.2.4.tar.xz "" "--disable-shared"
@@ -105,14 +130,14 @@ download_make_install ${HTTP_DEPS}/libarchive-3.3.2.tar.gz "" "--without-openssl
 
 CFLAGS="-fPIC" download_make_install ftp://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.1.tar.gz # "" "--build=powerpc64le-unknown-linux-gnu"
 
-download_make_install ftp://ftp.gnu.org/gnu/bison/bison-3.0.4.tar.xz # "" "--build=powerpc64le-unknown-linux-gnu"
+download_make_install ftp://ftp.gnu.org/gnu/bison/bison-3.4.2.tar.xz # "" "--build=powerpc64le-unknown-linux-gnu"
 
 # https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/flexpp-bisonpp/bisonpp-1.21-45.tar.gz
 download_make_install ${HTTP_DEPS}/bisonpp-1.21-45.tar.gz bison++-1.21
 
 CFLAGS="-fPIC" download_make_install ftp://ftp.gnu.org/gnu/readline/readline-7.0.tar.gz
 
-VERS=1_67_0
+VERS=1_72_0
 # http://downloads.sourceforge.net/project/boost/boost/${VERS//_/.}/boost_$VERS.tar.bz2
 download ${HTTP_DEPS}/boost_$VERS.tar.bz2
 extract boost_$VERS.tar.bz2
@@ -120,9 +145,6 @@ pushd boost_$VERS
 ./bootstrap.sh --prefix=$PREFIX
 ./b2 cxxflags=-fPIC install --prefix=$PREFIX || true
 popd
-
-# https://github.com/Kitware/CMake/releases/download/v3.14.5/cmake-3.14.5.tar.gz
-CXXFLAGS="-pthread" CFLAGS="-pthread" download_make_install ${HTTP_DEPS}/cmake-3.14.5.tar.gz
 
 VERS=3.1.5
 download https://github.com/google/double-conversion/archive/v$VERS.tar.gz
@@ -166,17 +188,24 @@ download_make_install ${HTTP_DEPS}/libedit-20170329-3.1.tar.gz
 # (see common-functions.sh)
 install_llvm
 
-VERS=7.65.1
+VERS=7.69.0
 # https://curl.haxx.se/download/curl-$VERS.tar.xz
 download_make_install ${HTTP_DEPS}/curl-$VERS.tar.xz "" "--disable-ldap --disable-ldaps"
 
 # thrift
-VERS=0.11.0
+VERS=0.13.0
 # http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
 download ${HTTP_DEPS}/thrift-$VERS.tar.gz
 extract thrift-$VERS.tar.gz
 pushd thrift-$VERS
-CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
+if [ "$TSAN" = "false" ]; then
+  THRIFT_CFLAGS="-fPIC"
+  THRIFT_CXXFLAGS="-fPIC"
+elif [ "$TSAN" = "true" ]; then
+  THRIFT_CFLAGS="-fPIC -fsanitize=thread -fPIC -O1 -fno-omit-frame-pointer"
+  THRIFT_CXXFLAGS="-fPIC -fsanitize=thread -fPIC -O1 -fno-omit-frame-pointer"
+fi
+CFLAGS="$THRIFT_CFLAGS" CXXFLAGS="$THRIFT_CXXFLAGS" JAVA_PREFIX=$PREFIX/lib ./configure \
     --prefix=$PREFIX \
     --with-lua=no \
     --with-python=no \
@@ -184,6 +213,7 @@ CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-ruby=no \
     --with-qt4=no \
     --with-qt5=no \
+    --with-java=no \
     --with-boost-libdir=$PREFIX/lib
 makej
 make install
@@ -235,6 +265,9 @@ popd
 # Geo Support
 install_gdal
 
+# TBB
+install_tbb static
+
 # Apache Arrow (see common-functions.sh)
 install_arrow
 
@@ -245,7 +278,7 @@ install_go
 install_awscpp -j $(nproc)
 
 # glslang (with spirv-tools)
-VERS=7.11.3113 # 2/8/19
+VERS=7.12.3352 # 8/20/19
 rm -rf glslang
 mkdir -p glslang
 pushd glslang
@@ -266,7 +299,7 @@ popd # glslang-$VERS
 popd # glslang
 
 # spirv-cross
-VERS=2019-04-26
+VERS=2019-09-04
 rm -rf spirv-cross
 mkdir -p spirv-cross
 pushd spirv-cross
@@ -278,6 +311,7 @@ pushd build
 cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=on \
     -DSPIRV_CROSS_ENABLE_TESTS=off \
     ..
 make -j $(nproc)
@@ -287,12 +321,13 @@ popd # SPIRV-Cross-$VERS
 popd # spirv-cross
 
 # Vulkan
-VERS=1.1.101.0 # 3/1/19
+# Custom tarball which excludes the spir-v toolchain
+VERS=1.1.126.0 # 11/1/19
 rm -rf vulkan
 mkdir -p vulkan
 pushd vulkan
-wget --continue --no-cookies ${HTTP_DEPS}/vulkansdk-linux-x86_64-$VERS.tar.gz -O vulkansdk-linux-x86_64-$VERS.tar.gz
-tar xvf vulkansdk-linux-x86_64-$VERS.tar.gz
+wget --continue ${HTTP_DEPS}/vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz -O vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz
+tar xvf vulkansdk-linux-x86_64-no-spirv-$VERS.tar.gz
 rsync -av $VERS/x86_64/* $PREFIX
 popd # vulkan
 
@@ -317,7 +352,11 @@ sed -e "s|%MAPD_DEPS_ROOT%|$PREFIX|g" mapd-deps.sh.in > mapd-deps-$SUFFIX.sh
 
 cp mapd-deps-$SUFFIX.sh mapd-deps-$SUFFIX.modulefile $PREFIX
 
-if [ "$1" = "--compress" ] ; then
-    tar acvf mapd-deps-$SUFFIX.tar.xz -C $(dirname $PREFIX) $SUFFIX
+if [ "$COMPRESS" = "true" ] ; then
+    if [ "$TSAN" = "false" ]; then
+      TARBALL_TSAN=""
+    elif [ "$TSAN" = "true" ]; then
+      TARBALL_TSAN="tsan-"
+    fi
+    tar --use-compress-program=pxz -acvf mapd-deps-${TARBALL_TSAN}${SUFFIX}.tar.xz -C $(dirname $PREFIX) $SUFFIX
 fi
-

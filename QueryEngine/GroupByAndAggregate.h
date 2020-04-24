@@ -26,7 +26,6 @@
 #include "Rendering/RenderInfo.h"
 #include "RuntimeFunctions.h"
 
-#include "../Planner/Planner.h"
 #include "../Shared/sqltypes.h"
 #include "Shared/Logger.h"
 
@@ -284,6 +283,8 @@ class GroupByAndAggregate {
                                           const CompilationOptions& co);
 
   llvm::Value* emitCall(const std::string& fname, const std::vector<llvm::Value*>& args);
+
+  void checkErrorCode(llvm::Value* retCode);
 
   bool needsUnnestDoublePatch(llvm::Value* val_ptr,
                               const std::string& agg_base_name,

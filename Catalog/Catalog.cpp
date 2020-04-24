@@ -21,42 +21,56 @@
  *
  * Copyright (c) 2014 MapD Technologies, Inc.  All rights reserved.
  **/
+
+#include "Catalog.h"
+#include "SysCatalog.h"
+
 #include <sys/wait.h>
 
 #include <algorithm>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/range/adaptor/map.hpp>
+#include <boost/version.hpp>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <list>
 #include <memory>
 #include <random>
 #include <regex>
 #include <sstream>
-#include "Catalog.h"
-#include "SysCatalog.h"
-
-#include <boost/algorithm/string/predicate.hpp>
-#include <boost/filesystem.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/version.hpp>
 #if BOOST_VERSION >= 106600
 #include <boost/uuid/detail/sha1.hpp>
 #else
 #include <boost/uuid/sha1.hpp>
 #endif
+#include <rapidjson/document.h>
+#include <rapidjson/istreamwrapper.h>
+#include <rapidjson/ostreamwrapper.h>
+#include <rapidjson/writer.h>
 
-#include "../Fragmenter/Fragmenter.h"
-#include "../Fragmenter/SortedOrderFragmenter.h"
-#include "../LockMgr/TableLockMgr.h"
-#include "../Parser/ParserNode.h"
-#include "../QueryEngine/Execute.h"
-#include "../QueryEngine/TableOptimizer.h"
-#include "../Shared/File.h"
-#include "../Shared/StringTransform.h"
-#include "../Shared/measure.h"
-#include "../StringDictionary/StringDictionaryClient.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/TableOptimizer.h"
+
+#include "DataMgr/FileMgr/FileMgr.h"
+#include "DataMgr/FileMgr/GlobalFileMgr.h"
+#include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
+#include "Fragmenter/Fragmenter.h"
+#include "Fragmenter/SortedOrderFragmenter.h"
+#include "LockMgr/LockMgr.h"
+#include "MigrationMgr/MigrationMgr.h"
+#include "Parser/ParserNode.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/TableOptimizer.h"
+#include "Shared/File.h"
+#include "Shared/StringTransform.h"
+#include "Shared/measure.h"
+#include "StringDictionary/StringDictionaryClient.h"
+
 #include "MapDRelease.h"
 #include "RWLocks.h"
 #include "SharedDictionaryValidator.h"
@@ -71,8 +85,13 @@ using std::runtime_error;
 using std::string;
 using std::vector;
 
-int g_test_against_columnId_gap = 0;
+int g_test_against_columnId_gap{0};
+bool g_enable_fsi{false};
 extern bool g_cache_string_hash;
+
+// Serialize temp tables to a json file in the Catalogs directory for Calcite parsing
+// under unit testing.
+bool g_serialize_temp_tables{false};
 
 namespace Catalog_Namespace {
 
@@ -126,6 +145,16 @@ void Catalog::updateFrontendViewsToDashboards() {
   sqliteConnector_.query("END TRANSACTION");
 }
 
+namespace {
+
+inline auto table_json_filepath(const std::string& base_path,
+                                const std::string& db_name) {
+  return boost::filesystem::path(base_path + "/mapd_catalogs/" + db_name +
+                                 "_temp_tables.json");
+}
+
+}  // namespace
+
 Catalog::Catalog(const string& basePath,
                  const DBMetadata& curDB,
                  std::shared_ptr<Data_Namespace::DataMgr> dataMgr,
@@ -151,6 +180,9 @@ Catalog::Catalog(const string& basePath,
   if (!is_new_db) {
     CheckAndExecuteMigrationsPostBuildMaps();
   }
+  if (g_serialize_temp_tables) {
+    boost::filesystem::remove(table_json_filepath(basePath_, currentDB_.dbName));
+  }
 }
 
 Catalog::~Catalog() {
@@ -159,9 +191,7 @@ Catalog::~Catalog() {
   for (TableDescriptorMap::iterator tableDescIt = tableDescriptorMap_.begin();
        tableDescIt != tableDescriptorMap_.end();
        ++tableDescIt) {
-    if (tableDescIt->second->fragmenter != nullptr) {
-      delete tableDescIt->second->fragmenter;
-    }
+    tableDescIt->second->fragmenter = nullptr;
     delete tableDescIt->second;
   }
 
@@ -174,6 +204,10 @@ Catalog::~Catalog() {
   }
 
   // ColumnDescriptorMapById points to the same descriptors.  No need to delete
+
+  if (g_serialize_temp_tables) {
+    boost::filesystem::remove(table_json_filepath(basePath_, currentDB_.dbName));
+  }
 }
 
 void Catalog::updateTableDescriptorSchema() {
@@ -221,6 +255,10 @@ void Catalog::updateTableDescriptorSchema() {
       sqliteConnector_.query(
           "ALTER TABLE mapd_tables ADD sort_column_id INTEGER DEFAULT 0");
     }
+    if (std::find(cols.begin(), cols.end(), std::string("storage_type")) == cols.end()) {
+      string queryString("ALTER TABLE mapd_tables ADD storage_type TEXT DEFAULT ''");
+      sqliteConnector_.query(queryString);
+    }
   } catch (std::exception& e) {
     sqliteConnector_.query("ROLLBACK TRANSACTION");
     throw;
@@ -258,6 +296,46 @@ void Catalog::updateFixlenArrayColumns() {
     // Upating all fixlen array columns
     string queryString("UPDATE mapd_columns SET is_notnull=1 WHERE coltype=" +
                        std::to_string(kARRAY) + " AND size>0;");
+    sqliteConnector_.query(queryString);
+  } catch (std::exception& e) {
+    sqliteConnector_.query("ROLLBACK TRANSACTION");
+    throw;
+  }
+  sqliteConnector_.query("END TRANSACTION");
+}
+
+void Catalog::updateGeoColumns() {
+  cat_sqlite_lock sqlite_lock(this);
+  sqliteConnector_.query("BEGIN TRANSACTION");
+  try {
+    sqliteConnector_.query(
+        "select name from sqlite_master WHERE type='table' AND "
+        "name='mapd_version_history'");
+    if (sqliteConnector_.getNumRows() == 0) {
+      sqliteConnector_.query(
+          "CREATE TABLE mapd_version_history(version integer, migration_history text "
+          "unique)");
+    } else {
+      sqliteConnector_.query(
+          "select * from mapd_version_history where migration_history = "
+          "'notnull_geo_columns'");
+      if (sqliteConnector_.getNumRows() != 0) {
+        // legacy geo columns had migrated
+        // no need for further execution
+        sqliteConnector_.query("END TRANSACTION");
+        return;
+      }
+    }
+    // Insert check for migration
+    sqliteConnector_.query_with_text_params(
+        "INSERT INTO mapd_version_history(version, migration_history) values(?,?)",
+        std::vector<std::string>{std::to_string(MAPD_VERSION), "notnull_geo_columns"});
+    LOG(INFO) << "Updating mapd_columns, legacy geo columns";
+    // Upating all geo columns
+    string queryString(
+        "UPDATE mapd_columns SET is_notnull=1 WHERE coltype=" + std::to_string(kPOINT) +
+        " OR coltype=" + std::to_string(kLINESTRING) + " OR coltype=" +
+        std::to_string(kPOLYGON) + " OR coltype=" + std::to_string(kMULTIPOLYGON) + ";");
     sqliteConnector_.query(queryString);
   } catch (std::exception& e) {
     sqliteConnector_.query("ROLLBACK TRANSACTION");
@@ -525,6 +603,81 @@ void Catalog::updateDictionarySchema() {
   sqliteConnector_.query("END TRANSACTION");
 }
 
+void Catalog::createFsiSchemasAndDefaultServers() {
+  cat_sqlite_lock sqlite_lock(this);
+  sqliteConnector_.query("BEGIN TRANSACTION");
+  try {
+    sqliteConnector_.query(
+        "CREATE TABLE IF NOT EXISTS omnisci_foreign_servers("
+        "id integer primary key, "
+        "name text unique, "
+        "data_wrapper_type text, "
+        "owner_user_id integer, "
+        "options text)");
+    createDefaultServersIfNotExists();
+    sqliteConnector_.query(
+        "CREATE TABLE IF NOT EXISTS omnisci_foreign_tables("
+        "table_id integer unique, "
+        "server_id integer, "
+        "options text, "
+        "FOREIGN KEY(table_id) REFERENCES mapd_tables(tableid), "
+        "FOREIGN KEY(server_id) REFERENCES omnisci_foreign_servers(id))");
+  } catch (std::exception& e) {
+    sqliteConnector_.query("ROLLBACK TRANSACTION");
+    throw;
+  }
+  sqliteConnector_.query("END TRANSACTION");
+}
+
+void Catalog::dropFsiSchemasAndTables() {
+  std::vector<foreign_storage::ForeignTable> foreign_tables{};
+  {
+    cat_sqlite_lock sqlite_lock(this);
+    sqliteConnector_.query("BEGIN TRANSACTION");
+    try {
+      sqliteConnector_.query(
+          "SELECT name FROM sqlite_master WHERE type='table' AND "
+          "name IN ('omnisci_foreign_servers', 'omnisci_foreign_tables')");
+      if (sqliteConnector_.getNumRows() > 0) {
+        sqliteConnector_.query(
+            "SELECT tableid, name, isview, storage_type FROM mapd_tables "
+            "WHERE storage_type = 'FOREIGN_TABLE'");
+        auto num_rows = sqliteConnector_.getNumRows();
+        for (size_t r = 0; r < num_rows; r++) {
+          foreign_storage::ForeignTable foreign_table{};
+          foreign_table.tableId = sqliteConnector_.getData<int>(r, 0);
+          foreign_table.tableName = sqliteConnector_.getData<std::string>(r, 1);
+          foreign_table.isView = sqliteConnector_.getData<bool>(r, 2);
+          foreign_table.storageType = sqliteConnector_.getData<std::string>(r, 3);
+          foreign_tables.emplace_back(foreign_table);
+        }
+        for (auto& foreign_table : foreign_tables) {
+          tableDescriptorMap_[to_upper(foreign_table.tableName)] = &foreign_table;
+          tableDescriptorMapById_[foreign_table.tableId] = &foreign_table;
+          executeDropTableSqliteQueries(&foreign_table);
+        }
+        sqliteConnector_.query("SELECT COUNT(*) FROM omnisci_foreign_tables");
+        CHECK_EQ(size_t(1), sqliteConnector_.getNumRows());
+        CHECK_EQ(0, sqliteConnector_.getData<int>(0, 0));
+
+        sqliteConnector_.query("DROP TABLE omnisci_foreign_tables");
+        sqliteConnector_.query("DROP TABLE omnisci_foreign_servers");
+      }
+    } catch (std::exception& e) {
+      sqliteConnector_.query("ROLLBACK TRANSACTION");
+      throw;
+    }
+    sqliteConnector_.query("END TRANSACTION");
+  }
+
+  for (auto& foreign_table : foreign_tables) {
+    SysCatalog::instance().revokeDBObjectPrivilegesFromAll(
+        DBObject(foreign_table.tableName, TableDBObjectType), this);
+    tableDescriptorMap_.erase(to_upper(foreign_table.tableName));
+    tableDescriptorMapById_.erase(foreign_table.tableId);
+  }
+}
+
 void Catalog::recordOwnershipOfObjectsInObjectPermissions() {
   cat_sqlite_lock sqlite_lock(this);
   sqliteConnector_.query("BEGIN TRANSACTION");
@@ -567,7 +720,8 @@ void Catalog::recordOwnershipOfObjectsInObjectPermissions() {
             {DatabaseDBObjectType, AccessPrivileges::ALL_DATABASE},
             {TableDBObjectType, AccessPrivileges::ALL_TABLE},
             {DashboardDBObjectType, AccessPrivileges::ALL_DASHBOARD},
-            {ViewDBObjectType, AccessPrivileges::ALL_VIEW}};
+            {ViewDBObjectType, AccessPrivileges::ALL_VIEW},
+            {ServerDBObjectType, AccessPrivileges::ALL_SERVER}};
 
     // grant owner all permissions on DB
     DBObjectKey key;
@@ -654,113 +808,8 @@ void Catalog::recordOwnershipOfObjectsInObjectPermissions() {
 
 void Catalog::checkDateInDaysColumnMigration() {
   cat_sqlite_lock sqlite_lock(this);
-  std::vector<int> tables_migrated = {};
-  std::unordered_map<int, std::vector<std::string>> tables_to_migrate;
-  sqliteConnector_.query("BEGIN TRANSACTION");
-  try {
-    sqliteConnector_.query(
-        "select name from sqlite_master WHERE type='table' AND "
-        "name='mapd_version_history'");
-    if (sqliteConnector_.getNumRows() == 0) {
-      sqliteConnector_.query(
-          "CREATE TABLE mapd_version_history(version integer, migration_history text "
-          "unique)");
-      sqliteConnector_.query(
-          "CREATE TABLE mapd_date_in_days_column_migration_tmp(table_id integer primary "
-          "key)");
-    } else {
-      sqliteConnector_.query(
-          "select * from mapd_version_history where migration_history = "
-          "'date_in_days_column'");
-      if (sqliteConnector_.getNumRows() != 0) {
-        // no need for further execution
-        sqliteConnector_.query("END TRANSACTION");
-        return;
-      }
-      LOG(INFO) << "Performing Date in days columns migration.";
-      sqliteConnector_.query(
-          "select name from sqlite_master where type='table' AND "
-          "name='mapd_date_in_days_column_migration_tmp'");
-      if (sqliteConnector_.getNumRows() != 0) {
-        sqliteConnector_.query(
-            "select table_id from mapd_date_in_days_column_migration_tmp");
-        if (sqliteConnector_.getNumRows() != 0) {
-          for (size_t i = 0; i < sqliteConnector_.getNumRows(); i++) {
-            tables_migrated.push_back(sqliteConnector_.getData<int>(i, 0));
-          }
-        }
-      } else {
-        sqliteConnector_.query(
-            "CREATE TABLE mapd_date_in_days_column_migration_tmp(table_id integer "
-            "primary key)");
-      }
-    }
-    sqliteConnector_.query_with_text_params(
-        "SELECT tables.tableid, tables.name, columns.name FROM mapd_tables tables, "
-        "mapd_columns columns where tables.tableid = columns.tableid AND "
-        "columns.coltype = ?1 AND columns.compression = ?2",
-        std::vector<std::string>{
-            std::to_string(static_cast<int>(SQLTypes::kDATE)),
-            std::to_string(static_cast<int>(EncodingType::kENCODING_DATE_IN_DAYS))});
-    if (sqliteConnector_.getNumRows() != 0) {
-      for (size_t i = 0; i < sqliteConnector_.getNumRows(); i++) {
-        tables_to_migrate[sqliteConnector_.getData<int>(i, 0)] = {
-            sqliteConnector_.getData<std::string>(i, 1),
-            sqliteConnector_.getData<std::string>(i, 2)};
-      }
-    }
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "Failed to complete migraion on date in days column: " << e.what();
-    sqliteConnector_.query("ROLLBACK");
-    throw;
-  }
-  sqliteConnector_.query("END TRANSACTION");
-
-  for (auto& id_names : tables_to_migrate) {
-    if (std::find(tables_migrated.begin(), tables_migrated.end(), id_names.first) ==
-        tables_migrated.end()) {
-      sqliteConnector_.query("BEGIN TRANSACTION");
-      try {
-        LOG(INFO) << "Table: " << id_names.second[0]
-                  << " may suffer from issues with DATE column: " << id_names.second[1]
-                  << ". Running an OPTIMIZE command to solve any issues with metadata.";
-
-        auto executor = Executor::getExecutor(getCurrentDB().dbId);
-        TableDescriptorMapById::iterator tableDescIt =
-            tableDescriptorMapById_.find(id_names.first);
-        if (tableDescIt == tableDescriptorMapById_.end()) {
-          throw runtime_error("Table descriptor does not exist for table " +
-                              id_names.second[0] + " does not exist.");
-        }
-        auto td = tableDescIt->second;
-        TableOptimizer optimizer(td, executor.get(), *this);
-        optimizer.recomputeMetadata();
-
-        sqliteConnector_.query_with_text_params(
-            "INSERT INTO mapd_date_in_days_column_migration_tmp VALUES(?)",
-            std::vector<std::string>{std::to_string(id_names.first)});
-      } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to complete migraion on date in days column: " << e.what();
-        sqliteConnector_.query("ROLLBACK");
-        throw;
-      }
-      sqliteConnector_.query("COMMIT");
-    }
-  }
-
-  sqliteConnector_.query("BEGIN TRANSACTION");
-  try {
-    sqliteConnector_.query("DROP TABLE mapd_date_in_days_column_migration_tmp");
-    sqliteConnector_.query_with_text_params(
-        "INSERT INTO mapd_version_history(version, migration_history) values(?,?)",
-        std::vector<std::string>{std::to_string(MAPD_VERSION), "date_in_days_column"});
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "Failed to complete migraion on date in days column: " << e.what();
-    sqliteConnector_.query("ROLLBACK");
-    throw;
-  }
-  sqliteConnector_.query("END TRANSACTION");
-  LOG(INFO) << "Migration successfull on Date in days columns";
+  migrations::MigrationMgr::migrateDateInDaysMetadata(
+      tableDescriptorMapById_, getCurrentDB().dbId, this, sqliteConnector_);
 }
 
 void Catalog::createDashboardSystemRoles() {
@@ -834,6 +883,7 @@ void Catalog::createDashboardSystemRoles() {
 void Catalog::CheckAndExecuteMigrations() {
   updateTableDescriptorSchema();
   updateFixlenArrayColumns();
+  updateGeoColumns();
   updateFrontendViewAndLinkUsers();
   updateFrontendViewSchema();
   updateLinkSchema();
@@ -844,6 +894,12 @@ void Catalog::CheckAndExecuteMigrations() {
   updateDeletedColumnIndicator();
   updateFrontendViewsToDashboards();
   recordOwnershipOfObjectsInObjectPermissions();
+
+  if (g_enable_fsi) {
+    createFsiSchemasAndDefaultServers();
+  } else {
+    dropFsiSchemasAndTables();
+  }
 }
 
 void Catalog::CheckAndExecuteMigrationsPostBuildMaps() {
@@ -888,12 +944,30 @@ void Catalog::buildMaps() {
       "SELECT tableid, name, ncolumns, isview, fragments, frag_type, max_frag_rows, "
       "max_chunk_size, frag_page_size, "
       "max_rows, partitions, shard_column_id, shard, num_shards, key_metainfo, userid, "
-      "sort_column_id "
+      "sort_column_id, storage_type "
       "from mapd_tables");
   sqliteConnector_.query(tableQuery);
   numRows = sqliteConnector_.getNumRows();
   for (size_t r = 0; r < numRows; ++r) {
-    TableDescriptor* td = new TableDescriptor();
+    TableDescriptor* td;
+    const auto& storage_type = sqliteConnector_.getData<string>(r, 17);
+    if (!storage_type.empty() &&
+        (!g_enable_fsi || storage_type != StorageType::FOREIGN_TABLE)) {
+      const auto table_id = sqliteConnector_.getData<int>(r, 0);
+      const auto& table_name = sqliteConnector_.getData<string>(r, 1);
+      LOG(FATAL) << "Unable to read Catalog metadata: storage type is currently not a "
+                    "supported table option (table "
+                 << table_name << " [" << table_id << "] in database "
+                 << currentDB_.dbName << ").";
+    }
+
+    if (storage_type == StorageType::FOREIGN_TABLE) {
+      td = new foreign_storage::ForeignTable();
+    } else {
+      td = new TableDescriptor();
+    }
+
+    td->storageType = storage_type;
     td->tableId = sqliteConnector_.getData<int>(r, 0);
     td->tableName = sqliteConnector_.getData<string>(r, 1);
     td->nColumns = sqliteConnector_.getData<int>(r, 2);
@@ -917,9 +991,16 @@ void Catalog::buildMaps() {
       td->fragmenter = nullptr;
     }
     td->hasDeletedCol = false;
+
     tableDescriptorMap_[to_upper(td->tableName)] = td;
     tableDescriptorMapById_[td->tableId] = td;
   }
+
+  if (g_enable_fsi) {
+    buildForeignServerMap();
+    addForeignTableDetails();
+  }
+
   string columnQuery(
       "SELECT tableid, columnid, name, coltype, colsubtype, coldim, colscale, "
       "is_notnull, compression, comp_param, "
@@ -1048,15 +1129,25 @@ void Catalog::buildMaps() {
   }
 }
 
-void Catalog::addTableToMap(TableDescriptor& td,
+void Catalog::addTableToMap(const TableDescriptor* td,
                             const list<ColumnDescriptor>& columns,
                             const list<DictDescriptor>& dicts) {
   cat_write_lock write_lock(this);
-  TableDescriptor* new_td = new TableDescriptor();
-  *new_td = td;
+  TableDescriptor* new_td;
+
+  auto foreign_table = dynamic_cast<const foreign_storage::ForeignTable*>(td);
+  if (foreign_table) {
+    auto new_foreign_table = new foreign_storage::ForeignTable();
+    *new_foreign_table = *foreign_table;
+    new_td = new_foreign_table;
+  } else {
+    new_td = new TableDescriptor();
+    *new_td = *td;
+  }
+
   new_td->mutex_ = std::make_shared<std::mutex>();
-  tableDescriptorMap_[to_upper(td.tableName)] = new_td;
-  tableDescriptorMapById_[td.tableId] = new_td;
+  tableDescriptorMap_[to_upper(td->tableName)] = new_td;
+  tableDescriptorMapById_[td->tableId] = new_td;
   for (auto cd : columns) {
     ColumnDescriptor* new_cd = new ColumnDescriptor();
     *new_cd = cd;
@@ -1116,9 +1207,8 @@ void Catalog::removeTableFromMap(const string& tableName,
 
   tableDescriptorMapById_.erase(tableDescIt);
   tableDescriptorMap_.erase(to_upper(tableName));
-  if (td->fragmenter != nullptr) {
-    delete td->fragmenter;
-  }
+  td->fragmenter = nullptr;
+
   bool isTemp = td->persistenceLevel == Data_Namespace::MemoryLevel::CPU_LEVEL;
   delete td;
 
@@ -1281,29 +1371,30 @@ void Catalog::instantiateFragmenter(TableDescriptor* td) const {
     Chunk::translateColumnDescriptorsToChunkVec(columnDescs, chunkVec);
     ChunkKey chunkKeyPrefix = {currentDB_.dbId, td->tableId};
     if (td->sortedColumnId > 0) {
-      td->fragmenter = new SortedOrderFragmenter(chunkKeyPrefix,
-                                                 chunkVec,
-                                                 dataMgr_.get(),
-                                                 const_cast<Catalog*>(this),
-                                                 td->tableId,
-                                                 td->shard,
-                                                 td->maxFragRows,
-                                                 td->maxChunkSize,
-                                                 td->fragPageSize,
-                                                 td->maxRows,
-                                                 td->persistenceLevel);
+      td->fragmenter = std::make_shared<SortedOrderFragmenter>(chunkKeyPrefix,
+                                                               chunkVec,
+                                                               dataMgr_.get(),
+                                                               const_cast<Catalog*>(this),
+                                                               td->tableId,
+                                                               td->shard,
+                                                               td->maxFragRows,
+                                                               td->maxChunkSize,
+                                                               td->fragPageSize,
+                                                               td->maxRows,
+                                                               td->persistenceLevel);
     } else {
-      td->fragmenter = new InsertOrderFragmenter(chunkKeyPrefix,
-                                                 chunkVec,
-                                                 dataMgr_.get(),
-                                                 const_cast<Catalog*>(this),
-                                                 td->tableId,
-                                                 td->shard,
-                                                 td->maxFragRows,
-                                                 td->maxChunkSize,
-                                                 td->fragPageSize,
-                                                 td->maxRows,
-                                                 td->persistenceLevel);
+      td->fragmenter = std::make_shared<InsertOrderFragmenter>(chunkKeyPrefix,
+                                                               chunkVec,
+                                                               dataMgr_.get(),
+                                                               const_cast<Catalog*>(this),
+                                                               td->tableId,
+                                                               td->shard,
+                                                               td->maxFragRows,
+                                                               td->maxChunkSize,
+                                                               td->fragPageSize,
+                                                               td->maxRows,
+                                                               td->persistenceLevel,
+                                                               !td->storageType.empty());
     }
   });
   LOG(INFO) << "Instantiating Fragmenter for table " << td->tableName << " took "
@@ -1636,26 +1727,34 @@ DictRef Catalog::addDictionary(ColumnDescriptor& cd) {
   return dd.dictRef;
 }
 
-// TODO this all looks incorrect there is no reference count being checked here
-// this code needs to be fixed
 void Catalog::delDictionary(const ColumnDescriptor& cd) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
   if (!(cd.columnType.is_string() || cd.columnType.is_string_array())) {
     return;
   }
   if (!(cd.columnType.get_compression() == kENCODING_DICT)) {
     return;
   }
-  if (!(cd.columnType.get_comp_param() > 0)) {
+  const auto dictId = cd.columnType.get_comp_param();
+  CHECK_GT(dictId, 0);
+  // decrement and zero check dict ref count
+  const auto td = getMetadataForTable(cd.tableId);
+  CHECK(td);
+  sqliteConnector_.query_with_text_param(
+      "UPDATE mapd_dictionaries SET refcount = refcount - 1 WHERE dictid = ?",
+      std::to_string(dictId));
+  sqliteConnector_.query_with_text_param(
+      "SELECT refcount FROM mapd_dictionaries WHERE dictid = ?", std::to_string(dictId));
+  const auto refcount = sqliteConnector_.getData<int>(0, 0);
+  VLOG(3) << "Dictionary " << dictId << "from dropped table has reference count "
+          << refcount;
+  if (refcount > 0) {
     return;
   }
-
-  const auto& td = *tableDescriptorMapById_[cd.tableId];
-  const auto dictId = cd.columnType.get_comp_param();
   const DictRef dictRef(currentDB_.dbId, dictId);
-  const auto dictName =
-      td.tableName + "_" + cd.columnName + "_dict" + std::to_string(dictId);
-  sqliteConnector_.query_with_text_param("DELETE FROM mapd_dictionaries WHERE name = ?",
-                                         dictName);
+  sqliteConnector_.query_with_text_param("DELETE FROM mapd_dictionaries WHERE dictid = ?",
+                                         std::to_string(dictId));
   File_Namespace::renameForDelete(basePath_ + "/mapd_data/DB_" +
                                   std::to_string(currentDB_.dbId) + "_DICT_" +
                                   std::to_string(dictId));
@@ -1700,8 +1799,15 @@ void Catalog::getDictionary(const ColumnDescriptor& cd,
 }
 
 void Catalog::addColumn(const TableDescriptor& td, ColumnDescriptor& cd) {
+  cat_write_lock write_lock(this);
   // caller must handle sqlite/chunk transaction TOGETHER
   cd.tableId = td.tableId;
+  if (td.nShards > 0 && td.shard < 0) {
+    for (const auto shard : getPhysicalTablesDescriptors(&td)) {
+      auto shard_cd = cd;
+      addColumn(*shard, shard_cd);
+    }
+  }
   if (cd.columnType.get_compression() == kENCODING_DICT) {
     addDictionary(cd);
   }
@@ -1749,7 +1855,39 @@ void Catalog::addColumn(const TableDescriptor& td, ColumnDescriptor& cd) {
   columnDescriptorsForRoll.emplace_back(nullptr, ncd);
 }
 
+void Catalog::dropColumn(const TableDescriptor& td, const ColumnDescriptor& cd) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+  // caller must handle sqlite/chunk transaction TOGETHER
+  sqliteConnector_.query_with_text_params(
+      "DELETE FROM mapd_columns where tableid = ? and columnid = ?",
+      std::vector<std::string>{std::to_string(td.tableId), std::to_string(cd.columnId)});
+
+  sqliteConnector_.query_with_text_params(
+      "UPDATE mapd_tables SET ncolumns = ncolumns - 1 WHERE tableid = ?",
+      std::vector<std::string>{std::to_string(td.tableId)});
+
+  ColumnDescriptorMap::iterator columnDescIt =
+      columnDescriptorMap_.find(ColumnKey(cd.tableId, to_upper(cd.columnName)));
+  CHECK(columnDescIt != columnDescriptorMap_.end());
+
+  columnDescriptorsForRoll.emplace_back(columnDescIt->second, nullptr);
+
+  columnDescriptorMap_.erase(columnDescIt);
+  columnDescriptorMapById_.erase(ColumnIdKey(cd.tableId, cd.columnId));
+  --tableDescriptorMapById_[td.tableId]->nColumns;
+  // for each shard
+  if (td.nShards > 0 && td.shard < 0) {
+    for (const auto shard : getPhysicalTablesDescriptors(&td)) {
+      const auto shard_cd = getMetadataForColumn(shard->tableId, cd.columnId);
+      CHECK(shard_cd);
+      dropColumn(*shard, *shard_cd);
+    }
+  }
+}
+
 void Catalog::roll(const bool forward) {
+  cat_write_lock write_lock(this);
   std::set<const TableDescriptor*> tds;
 
   for (const auto& cdr : columnDescriptorsForRoll) {
@@ -1814,7 +1952,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
       case kPOINT: {
         ColumnDescriptor physical_cd_coords(true);
         physical_cd_coords.columnName = cd.columnName + "_coords";
-        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         // Raw data: compressed/uncompressed coords
         coords_ti.set_subtype(kTINYINT);
         size_t unit_size;
@@ -1836,7 +1974,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
       case kLINESTRING: {
         ColumnDescriptor physical_cd_coords(true);
         physical_cd_coords.columnName = cd.columnName + "_coords";
-        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         // Raw data: compressed/uncompressed coords
         coords_ti.set_subtype(kTINYINT);
         physical_cd_coords.columnType = coords_ti;
@@ -1844,7 +1982,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
 
         ColumnDescriptor physical_cd_bounds(true);
         physical_cd_bounds.columnName = cd.columnName + "_bounds";
-        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         bounds_ti.set_subtype(kDOUBLE);
         bounds_ti.set_size(4 * sizeof(double));
         physical_cd_bounds.columnType = bounds_ti;
@@ -1857,7 +1995,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
       case kPOLYGON: {
         ColumnDescriptor physical_cd_coords(true);
         physical_cd_coords.columnName = cd.columnName + "_coords";
-        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         // Raw data: compressed/uncompressed coords
         coords_ti.set_subtype(kTINYINT);
         physical_cd_coords.columnType = coords_ti;
@@ -1865,14 +2003,14 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
 
         ColumnDescriptor physical_cd_ring_sizes(true);
         physical_cd_ring_sizes.columnName = cd.columnName + "_ring_sizes";
-        SQLTypeInfo ring_sizes_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo ring_sizes_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         ring_sizes_ti.set_subtype(kINT);
         physical_cd_ring_sizes.columnType = ring_sizes_ti;
         columns.push_back(physical_cd_ring_sizes);
 
         ColumnDescriptor physical_cd_bounds(true);
         physical_cd_bounds.columnName = cd.columnName + "_bounds";
-        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         bounds_ti.set_subtype(kDOUBLE);
         bounds_ti.set_size(4 * sizeof(double));
         physical_cd_bounds.columnType = bounds_ti;
@@ -1880,7 +2018,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
 
         ColumnDescriptor physical_cd_render_group(true);
         physical_cd_render_group.columnName = cd.columnName + "_render_group";
-        SQLTypeInfo render_group_ti = SQLTypeInfo(kINT, true);
+        SQLTypeInfo render_group_ti = SQLTypeInfo(kINT, col_ti.get_notnull());
         physical_cd_render_group.columnType = render_group_ti;
         columns.push_back(physical_cd_render_group);
 
@@ -1891,7 +2029,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
       case kMULTIPOLYGON: {
         ColumnDescriptor physical_cd_coords(true);
         physical_cd_coords.columnName = cd.columnName + "_coords";
-        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo coords_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         // Raw data: compressed/uncompressed coords
         coords_ti.set_subtype(kTINYINT);
         physical_cd_coords.columnType = coords_ti;
@@ -1899,21 +2037,21 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
 
         ColumnDescriptor physical_cd_ring_sizes(true);
         physical_cd_ring_sizes.columnName = cd.columnName + "_ring_sizes";
-        SQLTypeInfo ring_sizes_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo ring_sizes_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         ring_sizes_ti.set_subtype(kINT);
         physical_cd_ring_sizes.columnType = ring_sizes_ti;
         columns.push_back(physical_cd_ring_sizes);
 
         ColumnDescriptor physical_cd_poly_rings(true);
         physical_cd_poly_rings.columnName = cd.columnName + "_poly_rings";
-        SQLTypeInfo poly_rings_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo poly_rings_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         poly_rings_ti.set_subtype(kINT);
         physical_cd_poly_rings.columnType = poly_rings_ti;
         columns.push_back(physical_cd_poly_rings);
 
         ColumnDescriptor physical_cd_bounds(true);
         physical_cd_bounds.columnName = cd.columnName + "_bounds";
-        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, true);
+        SQLTypeInfo bounds_ti = SQLTypeInfo(kARRAY, col_ti.get_notnull());
         bounds_ti.set_subtype(kDOUBLE);
         bounds_ti.set_size(4 * sizeof(double));
         physical_cd_bounds.columnType = bounds_ti;
@@ -1921,7 +2059,7 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
 
         ColumnDescriptor physical_cd_render_group(true);
         physical_cd_render_group.columnName = cd.columnName + "_render_group";
-        SQLTypeInfo render_group_ti = SQLTypeInfo(kINT, true);
+        SQLTypeInfo render_group_ti = SQLTypeInfo(kINT, col_ti.get_notnull());
         physical_cd_render_group.columnType = render_group_ti;
         columns.push_back(physical_cd_render_group);
 
@@ -1942,11 +2080,20 @@ void Catalog::createTable(
     const std::vector<Parser::SharedDictionaryDef>& shared_dict_defs,
     bool isLogicalTable) {
   cat_write_lock write_lock(this);
-  list<ColumnDescriptor> cds;
+  list<ColumnDescriptor> cds = cols;
   list<DictDescriptor> dds;
   std::set<std::string> toplevel_column_names;
   list<ColumnDescriptor> columns;
-  for (auto cd : cols) {
+
+  if (!td.storageType.empty() &&
+      (!g_enable_fsi || td.storageType != StorageType::FOREIGN_TABLE)) {
+    if (td.persistenceLevel == Data_Namespace::MemoryLevel::DISK_LEVEL) {
+      throw std::runtime_error("Only temporary tables can be backed by foreign storage.");
+    }
+    ForeignStorageInterface::prepareTable(getCurrentDB().dbId, td, cds);
+  }
+
+  for (auto cd : cds) {
     if (cd.columnName == "rowid") {
       throw std::runtime_error(
           "Cannot create column with name rowid. rowid is a system defined column.");
@@ -1957,6 +2104,7 @@ void Catalog::createTable(
       expandGeoColumn(cd, columns);
     }
   }
+  cds.clear();
 
   ColumnDescriptor cd;
   // add row_id column -- Must be last column in the table
@@ -1989,14 +2137,7 @@ void Catalog::createTable(
   if (td.persistenceLevel == Data_Namespace::MemoryLevel::DISK_LEVEL) {
     try {
       sqliteConnector_.query_with_text_params(
-          "INSERT INTO mapd_tables (name, userid, ncolumns, isview, fragments, "
-          "frag_type, max_frag_rows, "
-          "max_chunk_size, "
-          "frag_page_size, max_rows, partitions, shard_column_id, shard, num_shards, "
-          "sort_column_id, "
-          "key_metainfo) VALUES (?, ?, ?, "
-          "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-
+          R"(INSERT INTO mapd_tables (name, userid, ncolumns, isview, fragments, frag_type, max_frag_rows, max_chunk_size, frag_page_size, max_rows, partitions, shard_column_id, shard, num_shards, sort_column_id, storage_type, key_metainfo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))",
           std::vector<std::string>{td.tableName,
                                    std::to_string(td.userId),
                                    std::to_string(td.nColumns),
@@ -2012,6 +2153,7 @@ void Catalog::createTable(
                                    std::to_string(td.shard),
                                    std::to_string(td.nShards),
                                    std::to_string(td.sortedColumnId),
+                                   td.storageType,
                                    td.keyMetainfo});
 
       // now get the auto generated tableid
@@ -2071,11 +2213,19 @@ void Catalog::createTable(
             "INSERT INTO mapd_views (tableid, sql) VALUES (?,?)",
             std::vector<std::string>{std::to_string(td.tableId), td.viewSQL});
       }
+      if (td.storageType == StorageType::FOREIGN_TABLE) {
+        auto& foreignTable = dynamic_cast<foreign_storage::ForeignTable&>(td);
+        sqliteConnector_.query_with_text_params(
+            "INSERT INTO omnisci_foreign_tables (table_id, server_id, options) VALUES "
+            "(?, ?, ?)",
+            std::vector<std::string>{std::to_string(foreignTable.tableId),
+                                     std::to_string(foreignTable.foreign_server->id),
+                                     foreignTable.getOptionsAsJsonString()});
+      }
     } catch (std::exception& e) {
       sqliteConnector_.query("ROLLBACK TRANSACTION");
       throw;
     }
-
   } else {  // Temporary table
     td.tableId = nextTempTableId_++;
     int colId = 1;
@@ -2086,39 +2236,246 @@ void Catalog::createTable(
       }
 
       if (cd.columnType.get_compression() == kENCODING_DICT) {
-        // TODO(vraj) : create shared dictionary for temp table if needed
-        std::string fileName("");
-        std::string folderPath("");
-        DictRef dict_ref(currentDB_.dbId, nextTempDictId_);
-        nextTempDictId_++;
-        DictDescriptor dd(dict_ref,
-                          fileName,
-                          cd.columnType.get_comp_param(),
-                          false,
-                          1,
-                          folderPath,
-                          true);  // Is dictName (2nd argument) used?
-        dds.push_back(dd);
-        if (!cd.columnType.is_array()) {
-          cd.columnType.set_size(cd.columnType.get_comp_param() / 8);
+        const bool is_foreign_col =
+            setColumnSharedDictionary(cd, cds, dds, td, shared_dict_defs);
+
+        if (!is_foreign_col) {
+          // Create a new temporary dictionary
+          std::string fileName("");
+          std::string folderPath("");
+          DictRef dict_ref(currentDB_.dbId, nextTempDictId_);
+          nextTempDictId_++;
+          DictDescriptor dd(dict_ref,
+                            fileName,
+                            cd.columnType.get_comp_param(),
+                            false,
+                            1,
+                            folderPath,
+                            true);  // Is dictName (2nd argument) used?
+          dds.push_back(dd);
+          if (!cd.columnType.is_array()) {
+            cd.columnType.set_size(cd.columnType.get_comp_param() / 8);
+          }
+          cd.columnType.set_comp_param(dict_ref.dictId);
         }
-        cd.columnType.set_comp_param(dict_ref.dictId);
       }
       cd.tableId = td.tableId;
       cd.columnId = colId++;
+      td.columnIdBySpi_.push_back(cd.columnId);
       cds.push_back(cd);
     }
+
+    if (g_serialize_temp_tables) {
+      serializeTableJsonUnlocked(&td, cds);
+    }
   }
+
   try {
-    addTableToMap(td, cds, dds);
+    addTableToMap(&td, cds, dds);
     calciteMgr_->updateMetadata(currentDB_.dbName, td.tableName);
+    if (!td.storageType.empty() && td.storageType != StorageType::FOREIGN_TABLE) {
+      ForeignStorageInterface::registerTable(this, td, cds);
+    }
   } catch (std::exception& e) {
     sqliteConnector_.query("ROLLBACK TRANSACTION");
     removeTableFromMap(td.tableName, td.tableId, true);
     throw;
   }
-
   sqliteConnector_.query("END TRANSACTION");
+}
+
+void Catalog::serializeTableJsonUnlocked(const TableDescriptor* td,
+                                         const std::list<ColumnDescriptor>& cds) const {
+  // relies on the catalog write lock
+  using namespace rapidjson;
+
+  VLOG(1) << "Serializing temporary table " << td->tableName << " to JSON for Calcite.";
+
+  const auto db_name = currentDB_.dbName;
+  const auto file_path = table_json_filepath(basePath_, db_name);
+
+  Document d;
+  if (boost::filesystem::exists(file_path)) {
+    // look for an existing file for this database
+    std::ifstream reader(file_path.string());
+    CHECK(reader.is_open());
+    IStreamWrapper json_read_wrapper(reader);
+    d.ParseStream(json_read_wrapper);
+  } else {
+    d.SetObject();
+  }
+  CHECK(d.IsObject());
+  CHECK(!d.HasMember(StringRef(td->tableName.c_str())));
+
+  Value table(kObjectType);
+  table.AddMember(
+      "name", Value().SetString(StringRef(td->tableName.c_str())), d.GetAllocator());
+  table.AddMember("id", Value().SetInt(td->tableId), d.GetAllocator());
+  table.AddMember("columns", Value(kArrayType), d.GetAllocator());
+
+  for (const auto& cd : cds) {
+    Value column(kObjectType);
+    column.AddMember(
+        "name", Value().SetString(StringRef(cd.columnName)), d.GetAllocator());
+    column.AddMember("coltype",
+                     Value().SetInt(static_cast<int>(cd.columnType.get_type())),
+                     d.GetAllocator());
+    column.AddMember("colsubtype",
+                     Value().SetInt(static_cast<int>(cd.columnType.get_subtype())),
+                     d.GetAllocator());
+    column.AddMember(
+        "coldim", Value().SetInt(cd.columnType.get_dimension()), d.GetAllocator());
+    column.AddMember(
+        "colscale", Value().SetInt(cd.columnType.get_scale()), d.GetAllocator());
+    column.AddMember(
+        "is_notnull", Value().SetBool(cd.columnType.get_notnull()), d.GetAllocator());
+    column.AddMember("is_systemcol", Value().SetBool(cd.isSystemCol), d.GetAllocator());
+    column.AddMember("is_virtualcol", Value().SetBool(cd.isVirtualCol), d.GetAllocator());
+    column.AddMember("is_deletedcol", Value().SetBool(cd.isDeletedCol), d.GetAllocator());
+    table["columns"].PushBack(column, d.GetAllocator());
+  }
+  d.AddMember(StringRef(td->tableName.c_str()), table, d.GetAllocator());
+
+  // Overwrite the existing file
+  std::ofstream writer(file_path.string(), writer.trunc | writer.out);
+  CHECK(writer.is_open());
+  OStreamWrapper json_wrapper(writer);
+
+  Writer<OStreamWrapper> json_writer(json_wrapper);
+  d.Accept(json_writer);
+  writer.close();
+}
+
+void Catalog::dropTableFromJsonUnlocked(const std::string& table_name) const {
+  // relies on the catalog write lock
+  using namespace rapidjson;
+
+  VLOG(1) << "Dropping temporary table " << table_name << " to JSON for Calcite.";
+
+  const auto db_name = currentDB_.dbName;
+  const auto file_path = table_json_filepath(basePath_, db_name);
+
+  CHECK(boost::filesystem::exists(file_path));
+  Document d;
+
+  std::ifstream reader(file_path.string());
+  CHECK(reader.is_open());
+  IStreamWrapper json_read_wrapper(reader);
+  d.ParseStream(json_read_wrapper);
+
+  CHECK(d.IsObject());
+  auto table_name_ref = StringRef(table_name.c_str());
+  CHECK(d.HasMember(table_name_ref));
+  CHECK(d.RemoveMember(table_name_ref));
+
+  // Overwrite the existing file
+  std::ofstream writer(file_path.string(), writer.trunc | writer.out);
+  CHECK(writer.is_open());
+  OStreamWrapper json_wrapper(writer);
+
+  Writer<OStreamWrapper> json_writer(json_wrapper);
+  d.Accept(json_writer);
+  writer.close();
+}
+
+void Catalog::createForeignServer(
+    std::unique_ptr<foreign_storage::ForeignServer> foreign_server,
+    bool if_not_exists) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+  createForeignServerNoLocks(std::move(foreign_server), if_not_exists);
+}
+
+void Catalog::createForeignServerNoLocks(
+    std::unique_ptr<foreign_storage::ForeignServer> foreign_server,
+    bool if_not_exists) {
+  sqliteConnector_.query_with_text_params(
+      "SELECT name from omnisci_foreign_servers where name = ?",
+      std::vector<std::string>{foreign_server->name});
+
+  if (sqliteConnector_.getNumRows() == 0) {
+    sqliteConnector_.query_with_text_params(
+        "INSERT INTO omnisci_foreign_servers (name, data_wrapper_type, owner_user_id, "
+        "options) "
+        "VALUES (?, ?, ?, ?)",
+        std::vector<std::string>{foreign_server->name,
+                                 foreign_server->data_wrapper.name,
+                                 std::to_string(foreign_server->user_id),
+                                 foreign_server->getOptionsAsJsonString()});
+    sqliteConnector_.query_with_text_params(
+        "SELECT id from omnisci_foreign_servers where name = ?",
+        std::vector<std::string>{foreign_server->name});
+    CHECK_EQ(sqliteConnector_.getNumRows(), size_t(1));
+    foreign_server->id = sqliteConnector_.getData<int>(0, 0);
+  } else if (!if_not_exists) {
+    throw std::runtime_error{"A foreign server with name \"" + foreign_server->name +
+                             "\" already exists."};
+  }
+
+  std::shared_ptr<foreign_storage::ForeignServer> foreign_server_shared =
+      std::move(foreign_server);
+  foreignServerMap_[foreign_server_shared->name] = foreign_server_shared;
+  foreignServerMapById_[foreign_server_shared->id] = foreign_server_shared;
+}
+
+foreign_storage::ForeignServer* Catalog::getForeignServer(
+    const std::string& server_name) const {
+  foreign_storage::ForeignServer* foreign_server = nullptr;
+  cat_read_lock read_lock(this);
+  if (foreignServerMap_.find(server_name) != foreignServerMap_.end()) {
+    foreign_server = foreignServerMap_.find(server_name)->second.get();
+  }
+  return foreign_server;
+}
+
+foreign_storage::ForeignServer* Catalog::getForeignServerSkipCache(
+    const std::string& server_name) {
+  foreign_storage::ForeignServer* foreign_server = nullptr;
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+  sqliteConnector_.query_with_text_params(
+      "SELECT id, name, data_wrapper_type, options, owner_user_id "
+      "FROM omnisci_foreign_servers WHERE name = ?",
+      std::vector<std::string>{server_name});
+  if (sqliteConnector_.getNumRows() > 0) {
+    auto server = std::make_shared<foreign_storage::ForeignServer>(
+        foreign_storage::DataWrapper{sqliteConnector_.getData<std::string>(0, 2)});
+    server->id = sqliteConnector_.getData<int>(0, 0);
+    server->name = sqliteConnector_.getData<std::string>(0, 1);
+    server->user_id = sqliteConnector_.getData<std::int32_t>(0, 4);
+    server->populateOptionsMap(sqliteConnector_.getData<std::string>(0, 3));
+    foreign_server = server.get();
+    foreignServerMap_[server->name] = server;
+    foreignServerMapById_[server->id] = server;
+  }
+  return foreign_server;
+}
+
+void Catalog::dropForeignServer(const std::string& server_name) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+
+  sqliteConnector_.query_with_text_params(
+      "SELECT id from omnisci_foreign_servers where name = ?",
+      std::vector<std::string>{server_name});
+  auto num_rows = sqliteConnector_.getNumRows();
+  if (num_rows > 0) {
+    CHECK_EQ(size_t(1), num_rows);
+    auto server_id = sqliteConnector_.getData<int>(0, 0);
+    sqliteConnector_.query_with_text_param(
+        "SELECT table_id from omnisci_foreign_tables where server_id = ?",
+        std::to_string(server_id));
+    if (sqliteConnector_.getNumRows() > 0) {
+      throw std::runtime_error{"Foreign server \"" + server_name +
+                               "\" is referenced "
+                               "by existing foreign tables and cannot be dropped."};
+    }
+    sqliteConnector_.query_with_text_params(
+        "DELETE FROM omnisci_foreign_servers WHERE name = ?",
+        std::vector<std::string>{server_name});
+    foreignServerMap_.erase(server_name);
+    foreignServerMapById_.erase(server_id);
+  }
 }
 
 // returns the table epoch or -1 if there is something wrong with the shared epoch
@@ -2182,23 +2539,30 @@ const ColumnDescriptor* Catalog::getDeletedColumn(const TableDescriptor* td) con
   return it != deletedColumnPerTable_.end() ? it->second : nullptr;
 }
 
-const bool Catalog::checkMetadataForDeletedRecs(int dbId,
-                                                int tableId,
-                                                int columnId) const {
-  // check if there are rows deleted by examining metadata for the deletedColumn metadata
-  ChunkKey chunkKeyPrefix = {dbId, tableId, columnId};
-  std::vector<std::pair<ChunkKey, ChunkMetadata>> chunkMetadataVec;
-  dataMgr_->getChunkMetadataVecForKeyPrefix(chunkMetadataVec, chunkKeyPrefix);
-  int64_t chunk_max{0};
+const bool Catalog::checkMetadataForDeletedRecs(const TableDescriptor* td,
+                                                int delete_column_id) const {
+  // check if there are rows deleted by examining the deletedColumn metadata
+  CHECK(td);
 
-  for (auto cm : chunkMetadataVec) {
-    chunk_max = cm.second.chunkStats.max.tinyintval;
-    // delete has occured
-    if (chunk_max == 1) {
-      return true;
+  if (table_is_temporary(td)) {
+    auto fragmenter = td->fragmenter;
+    CHECK(fragmenter);
+    return fragmenter->hasDeletedRows(delete_column_id);
+  } else {
+    ChunkKey chunk_key_prefix = {currentDB_.dbId, td->tableId, delete_column_id};
+    std::vector<std::pair<ChunkKey, ChunkMetadata>> chunk_metadata_vec;
+    dataMgr_->getChunkMetadataVecForKeyPrefix(chunk_metadata_vec, chunk_key_prefix);
+    int64_t chunk_max{0};
+
+    for (auto chunk_metadata : chunk_metadata_vec) {
+      chunk_max = chunk_metadata.second.chunkStats.max.tinyintval;
+      // delete has occured
+      if (chunk_max == 1) {
+        return true;
+      }
     }
+    return false;
   }
-  return false;
 }
 
 const ColumnDescriptor* Catalog::getDeletedColumnIfRowsDeleted(
@@ -2222,12 +2586,12 @@ const ColumnDescriptor* Catalog::getDeletedColumnIfRowsDeleted(
       int32_t physical_tb_id = physicalTables[i];
       const TableDescriptor* phys_td = getMetadataForTable(physical_tb_id);
       CHECK(phys_td);
-      if (checkMetadataForDeletedRecs(currentDB_.dbId, phys_td->tableId, cd->columnId)) {
+      if (checkMetadataForDeletedRecs(phys_td, cd->columnId)) {
         return cd;
       }
     }
   } else {
-    if (checkMetadataForDeletedRecs(currentDB_.dbId, td->tableId, cd->columnId)) {
+    if (checkMetadataForDeletedRecs(td, cd->columnId)) {
       return cd;
     }
   }
@@ -2262,7 +2626,8 @@ const ColumnDescriptor* get_foreign_col(
 }  // namespace
 
 void Catalog::addReferenceToForeignDict(ColumnDescriptor& referencing_column,
-                                        Parser::SharedDictionaryDef shared_dict_def) {
+                                        Parser::SharedDictionaryDef shared_dict_def,
+                                        const bool persist_reference) {
   cat_write_lock write_lock(this);
   const auto foreign_ref_col = get_foreign_col(*this, shared_dict_def);
   CHECK(foreign_ref_col);
@@ -2274,10 +2639,12 @@ void Catalog::addReferenceToForeignDict(ColumnDescriptor& referencing_column,
   const auto& dd = dictIt->second;
   CHECK_GE(dd->refcount, 1);
   ++dd->refcount;
-  cat_sqlite_lock sqlite_lock(this);
-  sqliteConnector_.query_with_text_params(
-      "UPDATE mapd_dictionaries SET refcount = refcount + 1 WHERE dictid = ?",
-      {std::to_string(dict_id)});
+  if (persist_reference) {
+    cat_sqlite_lock sqlite_lock(this);
+    sqliteConnector_.query_with_text_params(
+        "UPDATE mapd_dictionaries SET refcount = refcount + 1 WHERE dictid = ?",
+        {std::to_string(dict_id)});
+  }
 }
 
 bool Catalog::setColumnSharedDictionary(
@@ -2306,15 +2673,8 @@ bool Catalog::setColumnSharedDictionary(
         CHECK(colIt != cdd.end());
         cd.columnType = colIt->columnType;
 
-        sqliteConnector_.query_with_text_params(
-            "SELECT dictid FROM mapd_dictionaries WHERE dictid in (select comp_param "
-            "from "
-            "mapd_columns "
-            "where compression = ? and tableid = ? and columnid = ?)",
-            std::vector<std::string>{std::to_string(kENCODING_DICT),
-                                     std::to_string(td.tableId),
-                                     std::to_string(colIt->columnId)});
-        const auto dict_id = sqliteConnector_.getData<int>(0, 0);
+        const int dict_id = colIt->columnType.get_comp_param();
+        CHECK_GE(dict_id, 1);
         auto dictIt = std::find_if(
             dds.begin(), dds.end(), [this, dict_id](const DictDescriptor it) {
               return it.dictRef.dbId == this->currentDB_.dbId &&
@@ -2324,17 +2684,31 @@ bool Catalog::setColumnSharedDictionary(
           // There exists dictionary definition of a dictionary column
           CHECK_GE(dictIt->refcount, 1);
           ++dictIt->refcount;
-          sqliteConnector_.query_with_text_params(
-              "UPDATE mapd_dictionaries SET refcount = refcount + 1 WHERE dictid = ?",
-              {std::to_string(dict_id)});
+          if (!table_is_temporary(&td)) {
+            // Persist reference count
+            sqliteConnector_.query_with_text_params(
+                "UPDATE mapd_dictionaries SET refcount = refcount + 1 WHERE dictid = ?",
+                {std::to_string(dict_id)});
+          }
         } else {
           // The dictionary is referencing a column which is referencing a column in
           // diffrent table
           auto root_dict_def = compress_reference_path(shared_dict_def, shared_dict_defs);
-          addReferenceToForeignDict(cd, root_dict_def);
+          addReferenceToForeignDict(cd, root_dict_def, !table_is_temporary(&td));
         }
       } else {
-        addReferenceToForeignDict(cd, shared_dict_def);
+        const auto& foreign_table_name = shared_dict_def.get_foreign_table();
+        const auto foreign_td = getMetadataForTable(foreign_table_name, false);
+        if (table_is_temporary(foreign_td)) {
+          if (!table_is_temporary(&td)) {
+            throw std::runtime_error(
+                "Only temporary tables can share dictionaries with other temporary "
+                "tables.");
+          }
+          addReferenceToForeignDict(cd, shared_dict_def, false);
+        } else {
+          addReferenceToForeignDict(cd, shared_dict_def, !table_is_temporary(&td));
+        }
       }
       return true;
     }
@@ -2413,7 +2787,9 @@ void Catalog::createShardedTable(
         logicalToPhysicalTableMapById_.emplace(logical_tb_id, physicalTables);
     CHECK(it_ok.second);
     /* update sqlite mapd_logical_to_physical in sqlite database */
-    updateLogicalToPhysicalTableMap(logical_tb_id);
+    if (!table_is_temporary(&td)) {
+      updateLogicalToPhysicalTableMap(logical_tb_id);
+    }
   }
 }
 
@@ -2442,8 +2818,9 @@ void Catalog::doTruncateTable(const TableDescriptor* td) {
   // must destroy fragmenter before deleteChunks is called.
   if (td->fragmenter != nullptr) {
     auto tableDescIt = tableDescriptorMapById_.find(tableId);
-    delete td->fragmenter;
-    tableDescIt->second->fragmenter = nullptr;  // get around const-ness
+    CHECK(tableDescIt != tableDescriptorMapById_.end());
+    tableDescIt->second->fragmenter = nullptr;
+    CHECK(td->fragmenter == nullptr);
   }
   ChunkKey chunkKeyPrefix = {currentDB_.dbId, tableId};
   // assuming deleteChunksWithPrefix is atomic
@@ -2512,8 +2889,9 @@ void Catalog::removeChunks(const int table_id) {
     cat_sqlite_lock sqlite_lock(this);
     if (td->fragmenter != nullptr) {
       auto tableDescIt = tableDescriptorMapById_.find(table_id);
-      delete td->fragmenter;
-      tableDescIt->second->fragmenter = nullptr;  // get around const-ness
+      CHECK(tableDescIt != tableDescriptorMapById_.end());
+      tableDescIt->second->fragmenter = nullptr;
+      CHECK(td->fragmenter == nullptr);
     }
   }
 
@@ -2558,6 +2936,14 @@ void Catalog::dropTable(const TableDescriptor* td) {
 }
 
 void Catalog::doDropTable(const TableDescriptor* td) {
+  executeDropTableSqliteQueries(td);
+  if (g_serialize_temp_tables && table_is_temporary(td)) {
+    dropTableFromJsonUnlocked(td->tableName);
+  }
+  eraseTablePhysicalData(td);
+}
+
+void Catalog::executeDropTableSqliteQueries(const TableDescriptor* td) {
   const int tableId = td->tableId;
   sqliteConnector_.query_with_text_param("DELETE FROM mapd_tables WHERE tableid = ?",
                                          std::to_string(tableId));
@@ -2585,7 +2971,10 @@ void Catalog::doDropTable(const TableDescriptor* td) {
     sqliteConnector_.query_with_text_param("DELETE FROM mapd_views WHERE tableid = ?",
                                            std::to_string(tableId));
   }
-  eraseTablePhysicalData(td);
+  if (td->storageType == StorageType::FOREIGN_TABLE) {
+    sqliteConnector_.query_with_text_param(
+        "DELETE FROM omnisci_foreign_tables WHERE table_id = ?", std::to_string(tableId));
+  }
 }
 
 void Catalog::renamePhysicalTable(const TableDescriptor* td, const string& newTableName) {
@@ -2913,7 +3302,45 @@ std::vector<const TableDescriptor*> Catalog::getPhysicalTablesDescriptors(
   return physicalTables;
 }
 
+std::vector<std::string> Catalog::getTableNamesForUser(
+    const UserMetadata& user_metadata,
+    const GetTablesType get_tables_type) const {
+  std::vector<std::string> table_names;
+  const auto tables = getAllTableMetadata();
+  for (const auto td : tables) {
+    if (td->shard >= 0) {
+      // skip shards, they're not standalone tables
+      continue;
+    }
+    switch (get_tables_type) {
+      case GET_PHYSICAL_TABLES: {
+        if (td->isView) {
+          continue;
+        }
+        break;
+      }
+      case GET_VIEWS: {
+        if (!td->isView) {
+          continue;
+        }
+      }
+      default:
+        break;
+    }
+    DBObject dbObject(td->tableName, td->isView ? ViewDBObjectType : TableDBObjectType);
+    dbObject.loadKey(*this);
+    std::vector<DBObject> privObjects = {dbObject};
+    if (!SysCatalog::instance().hasAnyPrivileges(user_metadata, privObjects)) {
+      // skip table, as there are no privileges to access it
+      continue;
+    }
+    table_names.push_back(td->tableName);
+  }
+  return table_names;
+}
+
 int Catalog::getLogicalTableId(const int physicalTableId) const {
+  cat_read_lock read_lock(this);
   for (const auto& l : logicalToPhysicalTableMapById_) {
     if (l.second.end() != std::find_if(l.second.begin(),
                                        l.second.end(),
@@ -2952,11 +3379,11 @@ void Catalog::eraseTablePhysicalData(const TableDescriptor* td) {
   // must destroy fragmenter before deleteChunks is called.
   if (td->fragmenter != nullptr) {
     auto tableDescIt = tableDescriptorMapById_.find(tableId);
+    CHECK(tableDescIt != tableDescriptorMapById_.end());
     {
       INJECT_TIMER(deleting_fragmenter);
-      delete td->fragmenter;
+      tableDescIt->second->fragmenter = nullptr;
     }
-    tableDescIt->second->fragmenter = nullptr;  // get around const-ness
   }
   ChunkKey chunkKeyPrefix = {currentDB_.dbId, tableId};
   {
@@ -3019,7 +3446,6 @@ void Catalog::remove(const std::string& dbName) {
 
 void Catalog::vacuumDeletedRows(const int logicalTableId) const {
   // shard here to serve request from TableOptimizer and elsewhere
-  cat_read_lock read_lock(this);
   const auto td = getMetadataForTable(logicalTableId);
   const auto shards = getPhysicalTablesDescriptors(td);
   for (const auto shard : shards) {
@@ -3028,7 +3454,6 @@ void Catalog::vacuumDeletedRows(const int logicalTableId) const {
 }
 
 void Catalog::vacuumDeletedRows(const TableDescriptor* td) const {
-  cat_read_lock read_lock(this);
   // "if not a table that supports delete return nullptr,  nothing more to do"
   const ColumnDescriptor* cd = getDeletedColumn(td);
   if (nullptr == cd) {
@@ -3062,6 +3487,208 @@ void Catalog::vacuumDeletedRows(const TableDescriptor* td) const {
       updel_roll.commitUpdate();
     }
   }
+}
+
+void Catalog::buildForeignServerMap() {
+  sqliteConnector_.query(
+      "SELECT id, name, data_wrapper_type, options, owner_user_id FROM "
+      "omnisci_foreign_servers");
+  auto num_rows = sqliteConnector_.getNumRows();
+  for (size_t row = 0; row < num_rows; row++) {
+    auto foreign_server = std::make_shared<foreign_storage::ForeignServer>(
+        foreign_storage::DataWrapper{sqliteConnector_.getData<std::string>(row, 2)});
+    foreign_server->id = sqliteConnector_.getData<int>(row, 0);
+    foreign_server->name = sqliteConnector_.getData<std::string>(row, 1);
+    foreign_server->populateOptionsMap(sqliteConnector_.getData<std::string>(row, 3));
+    foreign_server->user_id = sqliteConnector_.getData<std::int32_t>(row, 4);
+    foreignServerMap_[foreign_server->name] = foreign_server;
+    foreignServerMapById_[foreign_server->id] = foreign_server;
+  }
+}
+
+void Catalog::addForeignTableDetails() {
+  sqliteConnector_.query(
+      "SELECT table_id, server_id, options from omnisci_foreign_tables");
+  auto num_rows = sqliteConnector_.getNumRows();
+  for (size_t r = 0; r < num_rows; r++) {
+    const auto table_id = sqliteConnector_.getData<int>(r, 0);
+    const auto server_id = sqliteConnector_.getData<int>(r, 1);
+    const auto& options = sqliteConnector_.getData<std::string>(r, 2);
+
+    CHECK(tableDescriptorMapById_.find(table_id) != tableDescriptorMapById_.end());
+    auto foreign_table =
+        dynamic_cast<foreign_storage::ForeignTable*>(tableDescriptorMapById_[table_id]);
+    CHECK(foreign_table);
+    foreign_table->foreign_server = foreignServerMapById_[server_id].get();
+    CHECK(foreign_table->foreign_server);
+    foreign_table->populateOptionsMap(options);
+  }
+}
+
+void Catalog::createDefaultServersIfNotExists() {
+  auto local_csv_server = std::make_unique<foreign_storage::ForeignServer>(
+      foreign_storage::DataWrapper{foreign_storage::DataWrapper::CSV_WRAPPER_NAME});
+  local_csv_server->name = "omnisci_local_csv";
+  local_csv_server
+      ->options[std::string{foreign_storage::ForeignServer::STORAGE_TYPE_KEY}] =
+      foreign_storage::ForeignServer::LOCAL_FILE_STORAGE_TYPE;
+  local_csv_server->user_id = OMNISCI_ROOT_USER_ID;
+  local_csv_server->options[std::string{foreign_storage::ForeignServer::BASE_PATH_KEY}] =
+      "/";
+  local_csv_server->validate();
+  createForeignServerNoLocks(std::move(local_csv_server), true);
+
+  auto local_parquet_server = std::make_unique<foreign_storage::ForeignServer>(
+      foreign_storage::DataWrapper{foreign_storage::DataWrapper::PARQUET_WRAPPER_NAME});
+  local_parquet_server->name = "omnisci_local_parquet";
+  local_parquet_server
+      ->options[std::string{foreign_storage::ForeignServer::STORAGE_TYPE_KEY}] =
+      foreign_storage::ForeignServer::LOCAL_FILE_STORAGE_TYPE;
+  local_parquet_server->user_id = OMNISCI_ROOT_USER_ID;
+  local_parquet_server
+      ->options[std::string{foreign_storage::ForeignServer::BASE_PATH_KEY}] = "/";
+  local_parquet_server->validate();
+  createForeignServerNoLocks(std::move(local_parquet_server), true);
+}
+
+// prepare a fresh file reload on next table access
+void Catalog::setForReload(const int32_t tableId) {
+  cat_read_lock read_lock(this);
+  const auto td = getMetadataForTable(tableId);
+  for (const auto shard : getPhysicalTablesDescriptors(td)) {
+    const auto tableEpoch = getTableEpoch(currentDB_.dbId, shard->tableId);
+    setTableEpoch(currentDB_.dbId, shard->tableId, tableEpoch);
+  }
+}
+
+// get a table's data dirs
+std::vector<std::string> Catalog::getTableDataDirectories(
+    const TableDescriptor* td) const {
+  const auto global_file_mgr = getDataMgr().getGlobalFileMgr();
+  std::vector<std::string> file_paths;
+  for (auto shard : getPhysicalTablesDescriptors(td)) {
+    const auto file_mgr = dynamic_cast<File_Namespace::FileMgr*>(
+        global_file_mgr->getFileMgr(currentDB_.dbId, shard->tableId));
+    boost::filesystem::path file_path(file_mgr->getFileMgrBasePath());
+    file_paths.push_back(file_path.filename().string());
+  }
+  return file_paths;
+}
+
+// get a column's dict dir basename
+std::string Catalog::getColumnDictDirectory(const ColumnDescriptor* cd) const {
+  if ((cd->columnType.is_string() || cd->columnType.is_string_array()) &&
+      cd->columnType.get_compression() == kENCODING_DICT &&
+      cd->columnType.get_comp_param() > 0) {
+    const auto dictId = cd->columnType.get_comp_param();
+    const DictRef dictRef(currentDB_.dbId, dictId);
+    const auto dit = dictDescriptorMapByRef_.find(dictRef);
+    CHECK(dit != dictDescriptorMapByRef_.end());
+    CHECK(dit->second);
+    boost::filesystem::path file_path(dit->second->dictFolderPath);
+    return file_path.filename().string();
+  }
+  return std::string();
+}
+
+// get a table's dict dirs
+std::vector<std::string> Catalog::getTableDictDirectories(
+    const TableDescriptor* td) const {
+  std::vector<std::string> file_paths;
+  for (auto cd : getAllColumnMetadataForTable(td->tableId, false, false, true)) {
+    auto file_base = getColumnDictDirectory(cd);
+    if (!file_base.empty() &&
+        file_paths.end() == std::find(file_paths.begin(), file_paths.end(), file_base)) {
+      file_paths.push_back(file_base);
+    }
+  }
+  return file_paths;
+}
+
+// returns table schema in a string
+std::string Catalog::dumpSchema(const TableDescriptor* td) const {
+  cat_read_lock read_lock(this);
+
+  std::ostringstream os;
+  os << "CREATE TABLE @T (";
+  // gather column defines
+  const auto cds = getAllColumnMetadataForTable(td->tableId, false, false, false);
+  std::string comma;
+  std::vector<std::string> shared_dicts;
+  std::map<const std::string, const ColumnDescriptor*> dict_root_cds;
+  for (const auto cd : cds) {
+    if (!(cd->isSystemCol || cd->isVirtualCol)) {
+      const auto& ti = cd->columnType;
+      os << comma << cd->columnName;
+      // CHAR is perculiar... better dump it as TEXT(32) like \d does
+      if (ti.get_type() == SQLTypes::kCHAR) {
+        os << " "
+           << "TEXT";
+      } else if (ti.get_subtype() == SQLTypes::kCHAR) {
+        os << " "
+           << "TEXT[]";
+      } else {
+        os << " " << ti.get_type_name();
+      }
+      os << (ti.get_notnull() ? " NOT NULL" : "");
+      if (ti.is_string()) {
+        if (ti.get_compression() == kENCODING_DICT) {
+          // if foreign reference, get referenced tab.col
+          const auto dict_id = ti.get_comp_param();
+          const DictRef dict_ref(currentDB_.dbId, dict_id);
+          const auto dict_it = dictDescriptorMapByRef_.find(dict_ref);
+          CHECK(dict_it != dictDescriptorMapByRef_.end());
+          const auto dict_name = dict_it->second->dictName;
+          // when migrating a table, any foreign dict ref will be dropped
+          // and the first cd of a dict will become root of the dict
+          if (dict_root_cds.end() == dict_root_cds.find(dict_name)) {
+            dict_root_cds[dict_name] = cd;
+            os << " ENCODING " << ti.get_compression_name() << "(" << (ti.get_size() * 8)
+               << ")";
+          } else {
+            const auto dict_root_cd = dict_root_cds[dict_name];
+            shared_dicts.push_back("SHARED DICTIONARY (" + cd->columnName +
+                                   ") REFERENCES @T(" + dict_root_cd->columnName + ")");
+            // "... shouldn't specify an encoding, it borrows from the referenced column"
+          }
+        } else {
+          os << " ENCODING NONE";
+        }
+      } else if (ti.get_size() > 0 && ti.get_size() != ti.get_logical_size()) {
+        const auto comp_param = ti.get_comp_param() ? ti.get_comp_param() : 32;
+        os << " ENCODING " << ti.get_compression_name() << "(" << comp_param << ")";
+      }
+      comma = ", ";
+    }
+  }
+  // gather SHARED DICTIONARYs
+  if (shared_dicts.size()) {
+    os << ", " << boost::algorithm::join(shared_dicts, ", ");
+  }
+  // gather WITH options ...
+  std::vector<std::string> with_options;
+  with_options.push_back("FRAGMENT_SIZE=" + std::to_string(td->maxFragRows));
+  with_options.push_back("MAX_CHUNK_SIZE=" + std::to_string(td->maxChunkSize));
+  with_options.push_back("PAGE_SIZE=" + std::to_string(td->fragPageSize));
+  with_options.push_back("MAX_ROWS=" + std::to_string(td->maxRows));
+  with_options.emplace_back(td->hasDeletedCol ? "VACUUM='DELAYED'"
+                                              : "VACUUM='IMMEDIATE'");
+  if (!td->partitions.empty()) {
+    with_options.push_back("PARTITIONS='" + td->partitions + "'");
+  }
+  if (td->nShards > 0) {
+    const auto shard_cd = getMetadataForColumn(td->tableId, td->shardedColumnId);
+    CHECK(shard_cd);
+    os << ", SHARD KEY(" << shard_cd->columnName << ")";
+    with_options.push_back("SHARD_COUNT=" + std::to_string(td->nShards));
+  }
+  if (td->sortedColumnId > 0) {
+    const auto sort_cd = getMetadataForColumn(td->tableId, td->sortedColumnId);
+    CHECK(sort_cd);
+    with_options.push_back("SORT_COLUMN='" + sort_cd->columnName + "'");
+  }
+  os << ") WITH (" + boost::algorithm::join(with_options, ", ") + ");";
+  return os.str();
 }
 
 }  // namespace Catalog_Namespace

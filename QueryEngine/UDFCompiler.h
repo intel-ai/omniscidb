@@ -33,13 +33,10 @@
 
 class UdfClangDriver {
  public:
-  UdfClangDriver();
-
-  std::string getClangPath() { return clang_path; }
+  UdfClangDriver(const std::string&);
   clang::driver::Driver* getClangDriver() { return &the_driver; }
 
  private:
-  std::string clang_path;
   llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> diag_options;
   clang::DiagnosticConsumer* diag_client;
   llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_id;
@@ -50,11 +47,15 @@ class UdfClangDriver {
 
 class UdfCompiler {
  public:
-  UdfCompiler(const std::string&);
+  UdfCompiler(const std::string& udf_file_name, const std::string& clang_path = "");
+  UdfCompiler(const std::string& udf_file_name,
+              const std::string& clang_path,
+              const std::vector<std::string> clang_options);
   int compileUdf();
   const std::string& getAstFileName() const;
 
  private:
+  void init(const std::string& clang_path);
   std::string removeFileExtension(const std::string& path);
   std::string getFileExt(std::string& s);
   int parseToAst(const char* file_name);
@@ -72,5 +73,7 @@ class UdfCompiler {
  private:
   std::string udf_file_name_;
   std::string udf_ast_file_name_;
+  std::string clang_path_;
+  std::vector<std::string> clang_options_;
 };
 #endif

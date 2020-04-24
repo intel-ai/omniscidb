@@ -25,6 +25,14 @@
 
 namespace CudaMgr_Namespace {
 
+std::string errorMessage(CUresult const status) {
+  const char* errorString{nullptr};
+  cuGetErrorString(status, &errorString);
+  return errorString
+             ? "CUDA Error (" + std::to_string(status) + "): " + std::string(errorString)
+             : "CUDA Driver API error code " + std::to_string(status);
+}
+
 CudaMgr::CudaMgr(const int num_gpus, const int start_gpu)
     : start_gpu_(start_gpu), max_shared_memory_for_all_(0) {
   checkError(cuInit(0));
@@ -141,6 +149,12 @@ void CudaMgr::unloadGpuModuleData(CUmodule* module, const int device_id) const {
   } catch (const std::runtime_error& e) {
     LOG(ERROR) << "CUDA Error: " << e.what();
   }
+}
+
+CudaMgr::CudaMemoryUsage CudaMgr::getCudaMemoryUsage() {
+  CudaMemoryUsage usage;
+  cuMemGetInfo(&usage.free, &usage.total);
+  return usage;
 }
 
 void CudaMgr::fillDeviceProperties() {
@@ -298,8 +312,12 @@ void CudaMgr::createDeviceContexts() {
         try {
           checkError(cuCtxDestroy(device_contexts_[destroy_id]));
         } catch (const CudaErrorException& e) {
-          LOG(ERROR) << "Error destroying context after failed creation for device "
-                     << destroy_id;
+          LOG(ERROR) << "Failed to destroy CUDA context for device ID " << destroy_id
+                     << " with " << e.what()
+                     << ". CUDA contexts were being destroyed due to an error creating "
+                        "CUDA context for device ID "
+                     << d << " out of " << device_count_ << " (" << errorMessage(status)
+                     << ").";
         }
       }
       // checkError will translate the message and throw
@@ -324,8 +342,8 @@ void CudaMgr::printDeviceProperties() const {
     VLOG(1) << "Compute Minor: " << device_properties_[d].computeMinor;
     VLOG(1) << "PCI bus id: " << device_properties_[d].pciBusId;
     VLOG(1) << "PCI deviceId id: " << device_properties_[d].pciDeviceId;
-    VLOG(1) << "Total Global memory: " << device_properties_[d].globalMem / 1073741824.0
-            << " GB";
+    VLOG(1) << "Per device global memory: "
+            << device_properties_[d].globalMem / 1073741824.0 << " GB";
     VLOG(1) << "Memory clock (khz): " << device_properties_[d].memoryClockKhz;
     VLOG(1) << "Memory bandwidth: " << device_properties_[d].memoryBandwidthGBs
             << " GB/sec";

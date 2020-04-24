@@ -35,13 +35,15 @@
 #include "Shared/checked_alloc.h"
 #include "Shared/likely.h"
 #include "Shared/thread_count.h"
+#include "Shared/threadpool.h"
 
 #include <algorithm>
 #include <bitset>
 #include <future>
 #include <numeric>
-
 #include "Utils/Threading.h"
+
+extern bool g_use_tbb_pool;
 
 ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
                                    const QueryMemoryDescriptor& query_mem_desc,
@@ -196,6 +198,7 @@ ResultSet::ResultSet(int64_t queue_time_ms,
     : device_type_(ExecutorDeviceType::CPU)
     , device_id_(-1)
     , fetched_so_far_(0)
+    , row_set_mem_owner_(row_set_mem_owner)
     , queue_time_ms_(queue_time_ms)
     , render_time_ms_(render_time_ms)
     , estimator_buffer_(nullptr)
@@ -262,6 +265,7 @@ size_t ResultSet::getCurrentRowBufferIndex() const {
   return crt_row_buff_idx_ - 1;
 }
 
+// Note: that.appended_storage_ does not get appended to this.
 void ResultSet::append(ResultSet& that) {
   CHECK_EQ(-1, cached_row_count_);
   if (!that.storage_) {
@@ -323,6 +327,10 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
   if (!storage_) {
     return 0;
   }
+  if (permutation_.empty() &&
+      query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
+    return binSearchRowCount();
+  }
   if (force_parallel || entryCount() > 20000) {
     return parallelRowCount();
   }
@@ -345,35 +353,56 @@ void ResultSet::setCachedRowCount(const size_t row_count) const {
   cached_row_count_ = row_count;
 }
 
+
+size_t ResultSet::binSearchRowCount() const {
+  if (!storage_) {
+    return 0;
+  }
+
+  size_t row_count = storage_->binSearchRowCount();
+  for (auto& s : appended_storage_) {
+    row_count += s->binSearchRowCount();
+  }
+
+  if (keep_first_ + drop_first_) {
+    const auto limited_row_count = std::min(keep_first_ + drop_first_, row_count);
+    return limited_row_count < drop_first_ ? 0 : limited_row_count - drop_first_;
+  }
+
+  return row_count;
+}
+
 size_t ResultSet::parallelRowCount() const {
-  size_t row_count{0};
-  const size_t worker_count = cpu_threads();
-  std::vector<std::future<size_t>> counter_threads;
-  for (size_t i = 0,
-              start_entry = 0,
-              stride = (entryCount() + worker_count - 1) / worker_count;
-       i < worker_count && start_entry < entryCount();
-       ++i, start_entry += stride) {
-    const auto end_entry = std::min(start_entry + stride, entryCount());
-    counter_threads.push_back(utils::async(
-        [this](const size_t start, const size_t end) {
-          size_t row_count{0};
-          for (size_t i = start; i < end; ++i) {
-            if (!isRowAtEmpty(i)) {
-              ++row_count;
+  auto execute_parallel_row_count = [this](auto counter_threads) -> size_t {
+    const size_t worker_count = cpu_threads();
+    for (size_t i = 0,
+                start_entry = 0,
+                stride = (entryCount() + worker_count - 1) / worker_count;
+         i < worker_count && start_entry < entryCount();
+         ++i, start_entry += stride) {
+      const auto end_entry = std::min(start_entry + stride, entryCount());
+      counter_threads.append(
+          [this](const size_t start, const size_t end) {
+            size_t row_count{0};
+            for (size_t i = start; i < end; ++i) {
+              if (!isRowAtEmpty(i)) {
+                ++row_count;
+              }
             }
-          }
-          return row_count;
-        },
-        start_entry,
-        end_entry));
-  }
-  for (auto& child : counter_threads) {
-    child.wait();
-  }
-  for (auto& child : counter_threads) {
-    row_count += child.get();
-  }
+            return row_count;
+          },
+          start_entry,
+          end_entry);
+    }
+    const auto row_counts = counter_threads.join();
+    const size_t row_count = std::accumulate(row_counts.begin(), row_counts.end(), 0);
+    return row_count;
+  };
+  // will fall back to futures threadpool if TBB is not enabled
+  const auto row_count =
+      g_use_tbb_pool
+          ? execute_parallel_row_count(threadpool::ThreadPool<size_t>())
+          : execute_parallel_row_count(threadpool::FuturesThreadPool<size_t>());
   if (keep_first_ + drop_first_) {
     const auto limited_row_count = std::min(keep_first_ + drop_first_, row_count);
     return limited_row_count < drop_first_ ? 0 : limited_row_count - drop_first_;
@@ -464,6 +493,7 @@ QueryMemoryDescriptor ResultSet::fixupQueryMemoryDescriptor(
 
 void ResultSet::sort(const std::list<Analyzer::OrderEntry>& order_entries,
                      const size_t top_n) {
+  auto timer = DEBUG_TIMER(__func__);
   CHECK_EQ(-1, cached_row_count_);
   CHECK(!targets_.empty());
 #ifdef HAVE_CUDA
@@ -613,9 +643,7 @@ std::pair<size_t, size_t> ResultSet::getStorageIndex(const size_t entry_idx) con
 }
 
 ResultSet::StorageLookupResult ResultSet::findStorage(const size_t entry_idx) const {
-  size_t stg_idx;
-  size_t fixedup_entry_idx;
-  std::tie(stg_idx, fixedup_entry_idx) = getStorageIndex(entry_idx);
+  auto [stg_idx, fixedup_entry_idx] = getStorageIndex(entry_idx);
   return {stg_idx ? appended_storage_[stg_idx - 1].get() : storage_.get(),
           fixedup_entry_idx,
           stg_idx};
@@ -853,7 +881,7 @@ int64_t ResultSetStorage::mappedPtr(const int64_t remote_ptr) const {
   return it->second;
 }
 
-size_t ResultSet::getLimit() {
+size_t ResultSet::getLimit() const {
   return keep_first_;
 }
 
@@ -896,6 +924,18 @@ bool ResultSet::isDirectColumnarConversionPossible() const {
                                     query_mem_desc_.getQueryDescriptionType() ==
                                         QueryDescriptionType::GroupByBaselineHash);
   }
+}
+
+bool ResultSet::isZeroCopyColumnarConversionPossible(size_t column_idx) const {
+  return query_mem_desc_.didOutputColumnar() &&
+         query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection &&
+         appended_storage_.empty() && storage_ &&
+         (lazy_fetch_info_.empty() || !lazy_fetch_info_[column_idx].is_lazily_fetched);
+}
+
+const int8_t* ResultSet::getColumnarBuffer(size_t column_idx) const {
+  CHECK(isZeroCopyColumnarConversionPossible(column_idx));
+  return storage_->getUnderlyingBuffer() + query_mem_desc_.getColOffInBytes(column_idx);
 }
 
 // returns a bitmap (and total number) of all single slot targets

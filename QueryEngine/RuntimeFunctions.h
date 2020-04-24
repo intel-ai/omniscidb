@@ -128,6 +128,12 @@ extern "C" int64_t* get_group_value(int64_t* groups_buffer,
                                     const uint32_t row_size_quad,
                                     const int64_t* init_val = nullptr);
 
+enum RuntimeInterruptFlags { INT_CHECK = 0, INT_ABORT = -1, INT_RESET = -2 };
+
+extern "C" bool check_interrupt();
+
+extern "C" bool check_interrupt_init(unsigned command);
+
 extern "C" int64_t* get_group_value_with_watchdog(
     int64_t* groups_buffer,
     const uint32_t groups_buffer_entry_count,
@@ -171,6 +177,11 @@ extern "C" int64_t* get_matching_group_value_perfect_hash(int64_t* groups_buffer
                                                           const int64_t* key,
                                                           const uint32_t key_qw_count,
                                                           const uint32_t row_size_quad);
+
+extern "C" int64_t* get_matching_group_value_perfect_hash_keyless(
+    int64_t* groups_buffer,
+    const uint32_t hashed_index,
+    const uint32_t row_size_quad);
 
 extern "C" int32_t* get_bucketized_hash_slot(int32_t* buff,
                                              const int64_t key,

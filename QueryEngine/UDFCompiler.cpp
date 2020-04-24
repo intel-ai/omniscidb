@@ -29,6 +29,7 @@
 #include <llvm/Support/Program.h>
 #include <llvm/Support/raw_ostream.h>
 #include <boost/process/search_path.hpp>
+#include <iterator>
 #include <memory>
 #include "Execute.h"
 #include "Shared/Logger.h"
@@ -45,8 +46,10 @@ namespace {
 
 class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
  public:
-  FunctionDeclVisitor(llvm::raw_fd_ostream& ast_file, SourceManager& s_manager)
-      : ast_file_(ast_file), source_manager_(s_manager) {
+  FunctionDeclVisitor(llvm::raw_fd_ostream& ast_file,
+                      SourceManager& s_manager,
+                      ASTContext& context)
+      : ast_file_(ast_file), source_manager_(s_manager), context_(context) {
     source_manager_.getDiagnostics().setShowColors();
   }
 
@@ -54,7 +57,13 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
     // Only function definitions (with bodies), not declarations.
     if (f->hasBody()) {
       if (getMainFileName() == getFuncDeclFileName(f)) {
-        f->dump(ast_file_);
+        auto printing_policy = context_.getPrintingPolicy();
+        printing_policy.FullyQualifiedName = 1;
+        printing_policy.UseVoidForZeroParams = 1;
+        printing_policy.PolishForDeclaration = 1;
+        printing_policy.TerseOutput = 1;
+        f->print(ast_file_, printing_policy);
+        ast_file_ << "\n";
       }
     }
 
@@ -77,14 +86,17 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
  private:
   llvm::raw_fd_ostream& ast_file_;
   SourceManager& source_manager_;
+  ASTContext& context_;
 };
 
 // Implementation of the ASTConsumer interface for reading an AST produced
 // by the Clang parser.
 class DeclASTConsumer : public ASTConsumer {
  public:
-  DeclASTConsumer(llvm::raw_fd_ostream& ast_file, SourceManager& s_manager)
-      : visitor_(ast_file, s_manager) {}
+  DeclASTConsumer(llvm::raw_fd_ostream& ast_file,
+                  SourceManager& s_manager,
+                  ASTContext& context)
+      : visitor_(ast_file, s_manager, context) {}
 
   // Override the method that gets called for each parsed top-level
   // declaration.
@@ -111,7 +123,8 @@ class HandleDeclAction : public ASTFrontendAction {
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& instance,
                                                  StringRef file) override {
-    return llvm::make_unique<DeclASTConsumer>(ast_file_, instance.getSourceManager());
+    return llvm::make_unique<DeclASTConsumer>(
+        ast_file_, instance.getSourceManager(), instance.getASTContext());
   }
 
  private:
@@ -128,15 +141,13 @@ class ToolFactory : public FrontendActionFactory {
   llvm::raw_fd_ostream& ast_file_;
 };
 
-bool on_search_path(const std::string file) {
-  boost::filesystem::path p = boost::process::search_path(file);
-  return boost::filesystem::exists(p);
+const char* convert(const std::string& s) {
+  return s.c_str();
 }
 }  // namespace
 
-UdfClangDriver::UdfClangDriver()
-    : clang_path(llvm::sys::findProgramByName("clang++").get().c_str())
-    , diag_options(new DiagnosticOptions())
+UdfClangDriver::UdfClangDriver(const std::string& clang_path)
+    : diag_options(new DiagnosticOptions())
     , diag_client(new TextDiagnosticPrinter(llvm::errs(), diag_options.get()))
     , diag_id(new clang::DiagnosticIDs())
     , diags(diag_id, diag_options.get(), diag_client)
@@ -186,8 +197,17 @@ std::string UdfCompiler::genCpuIrFilename(const char* udf_fileName) {
 }
 
 int UdfCompiler::compileFromCommandLine(std::vector<const char*>& command_line) {
-  UdfClangDriver compiler_driver;
+  UdfClangDriver compiler_driver(clang_path_);
   auto the_driver(compiler_driver.getClangDriver());
+
+  // If there were options passed on the command line, append them here
+
+  if (clang_options_.size() > 0) {
+    std::transform(std::begin(clang_options_),
+                   std::end(clang_options_),
+                   std::back_inserter(command_line),
+                   [&](const std::string& str) { return str.c_str(); });
+  }
 
   the_driver->CCPrintOptions = 0;
   std::unique_ptr<driver::Compilation> compilation(
@@ -212,12 +232,9 @@ int UdfCompiler::compileFromCommandLine(std::vector<const char*>& command_line) 
 }
 
 int UdfCompiler::compileToGpuByteCode(const char* udf_file_name, bool cpu_mode) {
-  auto a_path = llvm::sys::findProgramByName("clang++");
-  auto clang_path = a_path.get();
-
   std::string gpu_outName(genGpuIrFilename(udf_file_name));
 
-  std::vector<const char*> command_line{clang_path.c_str(),
+  std::vector<const char*> command_line{clang_path_.c_str(),
                                         "-c",
                                         "-O2",
                                         "-emit-llvm",
@@ -240,12 +257,9 @@ int UdfCompiler::compileToGpuByteCode(const char* udf_file_name, bool cpu_mode) 
 }
 
 int UdfCompiler::compileToCpuByteCode(const char* udf_file_name) {
-  auto a_path = llvm::sys::findProgramByName("clang++");
-  auto clang_path = a_path.get();
-
   std::string cpu_outName(genCpuIrFilename(udf_file_name));
 
-  std::vector<const char*> command_line{clang_path.c_str(),
+  std::vector<const char*> command_line{clang_path_.c_str(),
                                         "-c",
                                         "-O2",
                                         "-emit-llvm",
@@ -258,19 +272,28 @@ int UdfCompiler::compileToCpuByteCode(const char* udf_file_name) {
 }
 
 int UdfCompiler::parseToAst(const char* file_name) {
-  UdfClangDriver the_driver;
+  UdfClangDriver the_driver(clang_path_);
   std::string resource_path = the_driver.getClangDriver()->ResourceDir;
   std::string include_option =
       std::string("-I") + resource_path + std::string("/include");
 
-  const char arg0[] = "astparser";
-  const char* arg1 = file_name;
-  const char arg2[] = "--";
-  const char* arg3 = include_option.c_str();
-  const char* arg_vector[] = {arg0, arg1, arg2, arg3};
+  std::vector<std::string> arg_vector;
+  arg_vector.emplace_back("astparser");
+  arg_vector.emplace_back(file_name);
+  arg_vector.emplace_back("--");
+  arg_vector.emplace_back(include_option);
 
-  int num_args = sizeof(arg_vector) / sizeof(arg_vector[0]);
-  CommonOptionsParser op(num_args, arg_vector, ToolingSampleCategory);
+  if (clang_options_.size() > 0) {
+    std::copy(
+        clang_options_.begin(), clang_options_.end(), std::back_inserter(arg_vector));
+  }
+
+  std::vector<const char*> arg_vec2;
+  std::transform(
+      arg_vector.begin(), arg_vector.end(), std::back_inserter(arg_vec2), convert);
+
+  int num_args = arg_vec2.size();
+  CommonOptionsParser op(num_args, &arg_vec2[0], ToolingSampleCategory);
   ClangTool tool(op.getCompilations(), op.getSourcePathList());
 
   std::string out_name(file_name);
@@ -289,15 +312,48 @@ const std::string& UdfCompiler::getAstFileName() const {
   return udf_ast_file_name_;
 }
 
-UdfCompiler::UdfCompiler(const std::string& file_name)
-    : udf_file_name_(file_name), udf_ast_file_name_(file_name) {
+void UdfCompiler::init(const std::string& clang_path) {
   replaceExtn(udf_ast_file_name_, "ast");
+
+  if (clang_path.empty()) {
+    clang_path_.assign(llvm::sys::findProgramByName("clang++").get());
+    if (clang_path_.empty()) {
+      throw std::runtime_error(
+          "Unable to find clang++ to compile user defined functions");
+    }
+  } else {
+    clang_path_.assign(clang_path);
+
+    if (!boost::filesystem::exists(clang_path)) {
+      throw std::runtime_error("Path provided for udf compiler " + clang_path +
+                               " does not exist.");
+    }
+
+    if (boost::filesystem::is_directory(clang_path)) {
+      throw std::runtime_error("Path provided for udf compiler " + clang_path +
+                               " is not to the clang++ executable.");
+    }
+  }
+}
+
+UdfCompiler::UdfCompiler(const std::string& file_name, const std::string& clang_path)
+    : udf_file_name_(file_name), udf_ast_file_name_(file_name) {
+  init(clang_path);
+}
+
+UdfCompiler::UdfCompiler(const std::string& file_name,
+                         const std::string& clang_path,
+                         const std::vector<std::string> clang_options)
+    : udf_file_name_(file_name)
+    , udf_ast_file_name_(file_name)
+    , clang_options_(clang_options) {
+  init(clang_path);
 }
 
 void UdfCompiler::readCpuCompiledModule() {
   std::string cpu_ir_file(genCpuIrFilename(udf_file_name_.c_str()));
 
-  VLOG(1) << "UDFCompiler cpu bc file = " << cpu_ir_file << std::endl;
+  VLOG(1) << "UDFCompiler cpu bc file = " << cpu_ir_file;
 
   read_udf_cpu_module(cpu_ir_file);
 }
@@ -305,7 +361,7 @@ void UdfCompiler::readCpuCompiledModule() {
 void UdfCompiler::readGpuCompiledModule() {
   std::string gpu_ir_file(genGpuIrFilename(udf_file_name_.c_str()));
 
-  VLOG(1) << "UDFCompiler gpu bc file = " << gpu_ir_file << std::endl;
+  VLOG(1) << "UDFCompiler gpu bc file = " << gpu_ir_file;
 
   read_udf_gpu_module(gpu_ir_file);
 }
@@ -318,9 +374,7 @@ void UdfCompiler::readCompiledModules() {
 int UdfCompiler::compileForGpu() {
   int gpu_compile_result = 1;
 
-  if (on_search_path("nvcc")) {
-    gpu_compile_result = compileToGpuByteCode(udf_file_name_.c_str(), false);
-  }
+  gpu_compile_result = compileToGpuByteCode(udf_file_name_.c_str(), false);
 
   // If gpu compilation fails but cpu compilation has succeeded, try compiling
   // for the cpu with the assumption the user does not have the CUDA toolkit
@@ -333,45 +387,40 @@ int UdfCompiler::compileForGpu() {
 }
 
 int UdfCompiler::compileUdf() {
-  if (on_search_path("clang++")) {
-    LOG(INFO) << "UDFCompiler filename to compiler: " << udf_file_name_ << std::endl;
-    if (!boost::filesystem::exists(udf_file_name_)) {
-      LOG(FATAL) << "User defined function file " << udf_file_name_ << " does not exist.";
-      return 1;
-    }
+  LOG(INFO) << "UDFCompiler filename to compile: " << udf_file_name_;
+  if (!boost::filesystem::exists(udf_file_name_)) {
+    LOG(FATAL) << "User defined function file " << udf_file_name_ << " does not exist.";
+    return 1;
+  }
 
-    auto ast_result = parseToAst(udf_file_name_.c_str());
+  auto ast_result = parseToAst(udf_file_name_.c_str());
 
-    if (ast_result == 0) {
-      // Compile udf file to generate cpu and gpu bytecode files
+  if (ast_result == 0) {
+    // Compile udf file to generate cpu and gpu bytecode files
 
-      int cpu_compile_result = compileToCpuByteCode(udf_file_name_.c_str());
+    int cpu_compile_result = compileToCpuByteCode(udf_file_name_.c_str());
 #ifdef HAVE_CUDA
-      int gpu_compile_result = 1;
+    int gpu_compile_result = 1;
 #endif
 
-      if (cpu_compile_result == 0) {
-        readCpuCompiledModule();
+    if (cpu_compile_result == 0) {
+      readCpuCompiledModule();
 #ifdef HAVE_CUDA
-        gpu_compile_result = compileForGpu();
+      gpu_compile_result = compileForGpu();
 
-        if (gpu_compile_result == 0) {
-          readGpuCompiledModule();
-        } else {
-          LOG(FATAL) << "Unable to compile UDF file for gpu" << std::endl;
-          return 1;
-        }
-#endif
+      if (gpu_compile_result == 0) {
+        readGpuCompiledModule();
       } else {
-        LOG(FATAL) << "Unable to compile UDF file for cpu" << std::endl;
+        LOG(FATAL) << "Unable to compile UDF file for gpu";
         return 1;
       }
+#endif
     } else {
-      LOG(FATAL) << "Unable to create AST file for udf compilation" << std::endl;
+      LOG(FATAL) << "Unable to compile UDF file for cpu";
       return 1;
     }
   } else {
-    LOG(FATAL) << "Unable to compile udfs due to absence of clang++" << std::endl;
+    LOG(FATAL) << "Unable to create AST file for udf compilation";
     return 1;
   }
 

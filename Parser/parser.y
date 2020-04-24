@@ -22,11 +22,15 @@
     lexer.switch_streams(&ss,0);                                                                                        \
     yyparse(parseTrees);                                                                                                \
     lastParsed = lexer.YYText();                                                                                        \
+    if (!errors_.empty()) {                                                                                             \
+      throw std::runtime_error(errors_[0]);                                                                             \
+    }                                                                                                                   \
     return yynerrs;                                                                                                     \
   }                                                                                                                     \
  private:                                                                                                               \
   SQLLexer lexer;                                                                                                       \
-  std::mutex mutex_;
+  std::mutex mutex_;                                                                                                    \
+  std::vector<std::string> errors_;
 %define LEX_BODY {return lexer.yylex();}
 %define ERROR_BODY {} /*{ std::cerr << "Syntax error on line " << lexer.lineno() << ". Last word parsed: " << lexer.YYText() << std::endl; } */
 
@@ -45,6 +49,7 @@
 #include <boost/regex.hpp>
 #include <FlexLexer.h>
 #include "ParserNode.h"
+#include "ReservedKeywords.h"
 
 using namespace Parser;
 #define YY_Parser_PARSE_PARAM std::list<std::unique_ptr<Stmt>>& parseTrees
@@ -93,12 +98,12 @@ using namespace Parser;
 
 %token ADD ALL ALTER AMMSC ANY ARCHIVE ARRAY AS ASC AUTHORIZATION BETWEEN BIGINT BOOLEAN BY
 %token CASE CAST CHAR_LENGTH CHARACTER CHECK CLOSE CLUSTER COLUMN COMMIT CONTINUE COPY CREATE CURRENT
-%token CURSOR DATABASE DATE DATETIME DATE_TRUNC DECIMAL DECLARE DEFAULT DELETE DESC DICTIONARY DISTINCT DOUBLE DROP
+%token CURSOR DATABASE DATAFRAME DATE DATETIME DATE_TRUNC DECIMAL DECLARE DEFAULT DELETE DESC DICTIONARY DISTINCT DOUBLE DROP
 %token DUMP ELSE END EXISTS EXTRACT FETCH FIRST FLOAT FOR FOREIGN FOUND FROM
 %token GEOGRAPHY GEOMETRY GRANT GROUP HAVING IF ILIKE IN INSERT INTEGER INTO
 %token IS LANGUAGE LAST LENGTH LIKE LIMIT LINESTRING MOD MULTIPOLYGON NOW NULLX NUMERIC OF OFFSET ON OPEN OPTIMIZE
 %token OPTIMIZED OPTION ORDER PARAMETER POINT POLYGON PRECISION PRIMARY PRIVILEGES PROCEDURE
-%token SMALLINT SOME TABLE TEMPORARY TEXT THEN TIME TIMESTAMP TINYINT TO TRUNCATE UNION
+%token SERVER SMALLINT SOME TABLE TEMPORARY TEXT THEN TIME TIMESTAMP TINYINT TO TRUNCATE UNION
 %token PUBLIC REAL REFERENCES RENAME RESTORE REVOKE ROLE ROLLBACK SCHEMA SELECT SET SHARD SHARED SHOW
 %token UNIQUE UPDATE USER VALIDATE VALUES VIEW WHEN WHENEVER WHERE WITH WORK EDIT ACCESS DASHBOARD SQL EDITOR
 
@@ -119,6 +124,7 @@ sql_list:
 sql:		/* schema {	$<nodeval>$ = $<nodeval>1; } */
   create_table_as_statement { $<nodeval>$ = $<nodeval>1; }
 	| create_table_statement { $<nodeval>$ = $<nodeval>1; }
+	| create_dataframe_statement { $<nodeval>$ = $<nodeval>1; }
 	| show_table_schema { $<nodeval>$ = $<nodeval>1; }
 	/* | prvililege_def { $<nodeval>$ = $<nodeval>1; } */
 	| drop_view_statement { $<nodeval>$ = $<nodeval>1; }
@@ -127,6 +133,7 @@ sql:		/* schema {	$<nodeval>$ = $<nodeval>1; } */
 	| rename_table_statement { $<nodeval>$ = $<nodeval>1; }
 	| rename_column_statement { $<nodeval>$ = $<nodeval>1; }
 	| add_column_statement { $<nodeval>$ = $<nodeval>1; }
+	| drop_column_statement { $<nodeval>$ = $<nodeval>1; }
 	| copy_table_statement { $<nodeval>$ = $<nodeval>1; }
 	| create_database_statement { $<nodeval>$ = $<nodeval>1; }
 	| drop_database_statement { $<nodeval>$ = $<nodeval>1; }
@@ -250,7 +257,18 @@ create_table_as_statement:
 create_table_statement:
 		CREATE opt_temporary TABLE opt_if_not_exists table '(' base_table_element_commalist ')' opt_with_option_list
 		{
-		  $<nodeval>$ = new CreateTableStmt($<stringval>5, reinterpret_cast<std::list<TableElement*>*>($<listval>7), $<boolval>2,  $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>($<listval>9));
+		  $<nodeval>$ = new CreateTableStmt($<stringval>5, nullptr, reinterpret_cast<std::list<TableElement*>*>($<listval>7), $<boolval>2,  $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>($<listval>9));
+		}
+		| CREATE NAME TABLE opt_if_not_exists table '(' base_table_element_commalist ')' opt_with_option_list
+		{
+		  $<nodeval>$ = new CreateTableStmt($<stringval>5, $<stringval>2, reinterpret_cast<std::list<TableElement*>*>($<listval>7), false,  $<boolval>4, reinterpret_cast<std::list<NameValueAssign*>*>($<listval>9));
+		}
+	;
+
+create_dataframe_statement:
+		CREATE DATAFRAME table '(' base_table_element_commalist ')' FROM STRING opt_with_option_list
+		{
+		  $<nodeval>$ = new CreateDataframeStmt($<stringval>3, reinterpret_cast<std::list<TableElement*>*>($<listval>5), $<stringval>8, reinterpret_cast<std::list<NameValueAssign*>*>($<listval>9));
 		}
 	;
 
@@ -313,6 +331,18 @@ add_column_statement:
 		   $<nodeval>$ = new AddColumnStmt($<stringval>3, reinterpret_cast<std::list<ColumnDef*>*>($<nodeval>6));
 		}
 		;
+
+drop_column_statement:
+		ALTER TABLE table drop_columns { $<nodeval>$ = new DropColumnStmt($<stringval>3, $<slistval>4); }
+		;
+
+drop_columns:
+		 drop_column { $<listval>$ = new std::list<Node*>(1, $<nodeval>1); }
+		|drop_columns ',' drop_column { ($<listval>1)->push_back($<nodeval>3); }
+		;
+		
+drop_column:
+		DROP opt_column column { $<stringval>$ = $<stringval>3; }
 
 copy_table_statement:
 	COPY table FROM STRING opt_with_option_list
@@ -1090,8 +1120,16 @@ opt_literal_commalist:
 	/* miscellaneous */
 
 table:
-		NAME { $<stringval>$ = $<stringval>1; }
+	NAME
+	{
+		const auto uc_col_name = boost::to_upper_copy<std::string>(*$<stringval>1);
+		if (reserved_keywords.find(uc_col_name) != reserved_keywords.end()) {
+			errors_.push_back("Cannot use a reserved keyword as table name: " + *$<stringval>1);
+		}
+		$<stringval>$ = $<stringval>1; 
+	}
 	/* |	NAME '.' NAME { $$ = new TableRef($<stringval>1, $<stringval>3); } */
+    | 	QUOTED_IDENTIFIER { $<stringval>$ = $<stringval>1; }
 	;
 
 opt_table:
@@ -1150,10 +1188,12 @@ privilege:
 	|	VIEW { $<stringval>$ = new std::string("VIEW"); }
 	|	EDIT { $<stringval>$ = new std::string("EDIT"); }
 	|	ACCESS { $<stringval>$ = new std::string("ACCESS"); }
+	|	CREATE SERVER { $<stringval>$ = new std::string("CREATE SERVER"); }
 	|	CREATE TABLE { $<stringval>$ = new std::string("CREATE TABLE"); }
 	|	CREATE VIEW { $<stringval>$ = new std::string("CREATE VIEW"); }
 	|	SELECT VIEW { $<stringval>$ = new std::string("SELECT VIEW"); }
 	|	DROP VIEW { $<stringval>$ = new std::string("DROP VIEW"); }
+	|	DROP SERVER { $<stringval>$ = new std::string("DROP SERVER"); }
 	|	CREATE DASHBOARD { $<stringval>$ = new std::string("CREATE DASHBOARD"); }
 	|	EDIT DASHBOARD { $<stringval>$ = new std::string("EDIT DASHBOARD"); }
 	|	VIEW DASHBOARD { $<stringval>$ = new std::string("VIEW DASHBOARD"); }
@@ -1166,6 +1206,7 @@ privileges_target_type:
 	|	TABLE { $<stringval>$ = new std::string("TABLE"); }
 	|	DASHBOARD { $<stringval>$ = new std::string("DASHBOARD"); }
 	|	VIEW { $<stringval>$ = new std::string("VIEW"); }
+	|	SERVER { $<stringval>$ = new std::string("SERVER"); }
 	;
 
 privileges_target:
@@ -1253,7 +1294,16 @@ geometry_type:	GEOMETRY '(' geo_type ')'
 
 	/* the various things you can name */
 
-column:		NAME { $<stringval>$ = $<stringval>1; }
+column:
+	NAME
+	{
+		const auto uc_col_name = boost::to_upper_copy<std::string>(*$<stringval>1);
+		if (reserved_keywords.find(uc_col_name) != reserved_keywords.end()) {
+			errors_.push_back("Cannot use a reserved keyword as column name: " + *$<stringval>1);
+		}
+		$<stringval>$ = $<stringval>1; 
+	}
+    | 	QUOTED_IDENTIFIER { $<stringval>$ = $<stringval>1; }
 	;
 
 /*

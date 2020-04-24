@@ -53,10 +53,11 @@ size_t RelAlgExecutor::getNDVEstimation(const WorkUnit& work_unit,
                                    nullptr,
                                    false,
                                    column_cache);
-    if (!estimator_result) {
+    if (estimator_result.empty()) {
       return 1;
     }
-    return std::max(estimator_result->getNDVEstimator(), size_t(1));
+    CHECK_EQ(estimator_result.getFragCount(), 1);
+    return std::max(estimator_result[0]->getNDVEstimator(), size_t(1));
   } catch (const QueryExecutionError& e) {
     if (e.getErrorCode() == Executor::ERR_OUT_OF_TIME) {
       throw std::runtime_error("Cardinality estimation query ran out of time");
@@ -81,7 +82,11 @@ RelAlgExecutionUnit create_ndv_execution_unit(const RelAlgExecutionUnit& ra_exe_
           {},
           makeExpr<Analyzer::NDVEstimator>(ra_exe_unit.groupby_exprs),
           SortInfo{{}, SortAlgorithm::Default, 0, 0},
-          0};
+          0,
+          {},
+          {},
+          ra_exe_unit.union_all,
+          ra_exe_unit.query_state};
 }
 
 RelAlgExecutionUnit create_count_all_execution_unit(
@@ -96,7 +101,11 @@ RelAlgExecutionUnit create_count_all_execution_unit(
           {replacement_target.get()},
           nullptr,
           SortInfo{{}, SortAlgorithm::Default, 0, 0},
-          0};
+          0,
+          {},
+          {},
+          ra_exe_unit.union_all,
+          ra_exe_unit.query_state};
 }
 
 ResultSetPtr reduce_estimator_results(

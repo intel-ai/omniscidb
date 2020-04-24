@@ -19,6 +19,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <iostream>
 
+#include "QueryEngine/ExtensionFunctionsBinding.h"
 #include "QueryEngine/JsonAccessors.h"
 #include "QueryEngine/TableFunctions/TableFunctionsFactory.h"
 #include "Shared/StringTransform.h"
@@ -117,7 +118,7 @@ namespace {
 std::string serialize_type(const ExtArgumentType type) {
   switch (type) {
     case ExtArgumentType::Bool:
-      return "i1";
+      return "i8";  // clang converts bool to i8
     case ExtArgumentType::Int8:
       return "i8";
     case ExtArgumentType::Int16:
@@ -144,24 +145,30 @@ std::string serialize_type(const ExtArgumentType type) {
       return "float*";
     case ExtArgumentType::PDouble:
       return "double*";
+    case ExtArgumentType::PBool:
+      return "i1*";
     case ExtArgumentType::ArrayInt8:
-      return "array_i8";
+      return "{i8*, i64, i8}*";
     case ExtArgumentType::ArrayInt16:
-      return "array_i16";
+      return "{i16*, i64, i8}*";
     case ExtArgumentType::ArrayInt32:
-      return "array_i32";
+      return "{i32*, i64, i8}*";
     case ExtArgumentType::ArrayInt64:
-      return "array_i64";
+      return "{i64*, i64, i8}*";
     case ExtArgumentType::ArrayFloat:
-      return "array_float";
+      return "{float*, i64, i8}*";
     case ExtArgumentType::ArrayDouble:
-      return "array_double";
+      return "{double*, i64, i8}*";
+    case ExtArgumentType::ArrayBool:
+      return "{i1*, i64, i8}*";
     case ExtArgumentType::GeoPoint:
       return "geo_point";
     case ExtArgumentType::GeoLineString:
       return "geo_linestring";
     case ExtArgumentType::GeoPolygon:
       return "geo_polygon";
+    case ExtArgumentType::GeoMultiPolygon:
+      return "geo_multi_polygon";
     case ExtArgumentType::Cursor:
       return "cursor";
     default:
@@ -177,6 +184,13 @@ SQLTypeInfo ext_arg_type_to_type_info(const ExtArgumentType ext_arg_type) {
   /* This function is mostly used for scalar types.
      For non-scalar types, NULL is returned as a placeholder.
    */
+
+  auto generate_array_type = [](const auto subtype) {
+    auto ti = SQLTypeInfo(kARRAY, false);
+    ti.set_subtype(subtype);
+    return ti;
+  };
+
   switch (ext_arg_type) {
     case ExtArgumentType::Bool:
       return SQLTypeInfo(kBOOLEAN, false);
@@ -192,6 +206,20 @@ SQLTypeInfo ext_arg_type_to_type_info(const ExtArgumentType ext_arg_type) {
       return SQLTypeInfo(kFLOAT, false);
     case ExtArgumentType::Double:
       return SQLTypeInfo(kDOUBLE, false);
+    case ExtArgumentType::ArrayInt8:
+      return generate_array_type(kTINYINT);
+    case ExtArgumentType::ArrayInt16:
+      return generate_array_type(kSMALLINT);
+    case ExtArgumentType::ArrayInt32:
+      return generate_array_type(kINT);
+    case ExtArgumentType::ArrayInt64:
+      return generate_array_type(kBIGINT);
+    case ExtArgumentType::ArrayFloat:
+      return generate_array_type(kFLOAT);
+    case ExtArgumentType::ArrayDouble:
+      return generate_array_type(kDOUBLE);
+    case ExtArgumentType::ArrayBool:
+      return generate_array_type(kBOOLEAN);
     default:
       LOG(WARNING) << "ExtArgumentType `" << serialize_type(ext_arg_type)
                    << "` cannot be converted to SQLTypeInfo. Returning nulltype.";
@@ -235,6 +263,10 @@ std::string ExtensionFunctionsWhitelist::toString(
   return r;
 }
 
+std::string ExtensionFunctionsWhitelist::toString(const ExtArgumentType& sig_type) {
+  return serialize_type(sig_type);
+}
+
 std::string ExtensionFunction::toString() const {
   return getName() + "(" + ExtensionFunctionsWhitelist::toString(getArgs()) + ") -> " +
          serialize_type(getRet());
@@ -254,9 +286,16 @@ std::vector<std::string> ExtensionFunctionsWhitelist::getLLVMDeclarations(
         continue;
       }
 
-      std::string decl_prefix{"declare " + serialize_type(signature.getRet()) + " @" +
-                              signature.getName()};
+      std::string decl_prefix;
       std::vector<std::string> arg_strs;
+
+      if (is_ext_arg_type_array(signature.getRet())) {
+        decl_prefix = "declare void @" + signature.getName();
+        arg_strs.emplace_back(serialize_type(signature.getRet()));
+      } else {
+        decl_prefix =
+            "declare " + serialize_type(signature.getRet()) + " @" + signature.getName();
+      }
       for (const auto arg : signature.getArgs()) {
         arg_strs.push_back(serialize_type(arg));
       }
@@ -286,7 +325,7 @@ namespace {
 
 ExtArgumentType deserialize_type(const std::string& type_name) {
   if (type_name == "bool" || type_name == "i1") {
-    return ExtArgumentType::Int8;  // need to handle the possibility of nulls
+    return ExtArgumentType::Bool;
   }
   if (type_name == "i8") {
     return ExtArgumentType::Int8;
@@ -327,23 +366,29 @@ ExtArgumentType deserialize_type(const std::string& type_name) {
   if (type_name == "double*") {
     return ExtArgumentType::PDouble;
   }
-  if (type_name == "array_i8") {
+  if (type_name == "i1*" || type_name == "bool*") {
+    return ExtArgumentType::PBool;
+  }
+  if (type_name == "{i8*, i64, i8}*") {
     return ExtArgumentType::ArrayInt8;
   }
-  if (type_name == "array_i16") {
+  if (type_name == "{i16*, i64, i8}*") {
     return ExtArgumentType::ArrayInt16;
   }
-  if (type_name == "array_i32") {
+  if (type_name == "{i32*, i64, i8}*") {
     return ExtArgumentType::ArrayInt32;
   }
-  if (type_name == "array_i64") {
+  if (type_name == "{i64*, i64, i8}*") {
     return ExtArgumentType::ArrayInt64;
   }
-  if (type_name == "array_float") {
+  if (type_name == "{float*, i64, i8}*") {
     return ExtArgumentType::ArrayFloat;
   }
-  if (type_name == "array_double") {
+  if (type_name == "{double*, i64, i8}*") {
     return ExtArgumentType::ArrayDouble;
+  }
+  if (type_name == "{i1*, i64, i8}*" || type_name == "{bool*, i64, i8}*") {
+    return ExtArgumentType::ArrayBool;
   }
   if (type_name == "geo_point") {
     return ExtArgumentType::GeoPoint;
@@ -353,6 +398,9 @@ ExtArgumentType deserialize_type(const std::string& type_name) {
   }
   if (type_name == "geo_polygon") {
     return ExtArgumentType::GeoPolygon;
+  }
+  if (type_name == "geo_multi_polygon") {
+    return ExtArgumentType::GeoMultiPolygon;
   }
   if (type_name == "cursor") {
     return ExtArgumentType::Cursor;

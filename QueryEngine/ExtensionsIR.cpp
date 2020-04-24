@@ -21,10 +21,56 @@
 #include "ExtensionFunctionsWhitelist.h"
 #include "TableFunctions/TableFunctions.hpp"
 
+#include <tuple>
+
 extern std::unique_ptr<llvm::Module> udf_gpu_module;
 extern std::unique_ptr<llvm::Module> udf_cpu_module;
 
 namespace {
+
+llvm::StructType* get_arr_struct_type(CgenState* cgen_state,
+                                      const std::string& ext_func_name,
+                                      llvm::Type* array_type,
+                                      size_t param_num) {
+  llvm::Function* udf_func = cgen_state->module_->getFunction(ext_func_name);
+  CHECK(array_type);
+  CHECK(array_type->isPointerTy());
+
+  llvm::StructType* generated_struct_type =
+      llvm::StructType::get(cgen_state->context_,
+                            {array_type,
+                             llvm::Type::getInt64Ty(cgen_state->context_),
+                             llvm::Type::getInt8Ty(cgen_state->context_)},
+                            false);
+  if (udf_func) {
+    // Compare expected array struct type with type from the function definition from the
+    // UDF module, but use the type from the module
+    llvm::FunctionType* udf_func_type = udf_func->getFunctionType();
+    CHECK_LE(param_num, udf_func_type->getNumParams());
+    llvm::Type* param_pointer_type = udf_func_type->getParamType(param_num);
+    CHECK(param_pointer_type->isPointerTy());
+    llvm::Type* param_type = param_pointer_type->getPointerElementType();
+    CHECK(param_type->isStructTy());
+    llvm::StructType* struct_type = llvm::cast<llvm::StructType>(param_type);
+    CHECK_GE(struct_type->getStructNumElements(), size_t(3))
+        << serialize_llvm_object(struct_type);
+
+    const auto expected_elems = generated_struct_type->elements();
+    const auto current_elems = struct_type->elements();
+    for (size_t i = 0; i < expected_elems.size(); i++) {
+      CHECK_EQ(expected_elems[i], current_elems[i]);
+    }
+
+    if (struct_type->isLiteral()) {
+      return struct_type;
+    }
+
+    llvm::StringRef struct_name = struct_type->getStructName();
+    return cgen_state->module_->getTypeByName(struct_name);
+  }
+
+  return generated_struct_type;
+}
 
 llvm::Type* ext_arg_type_to_llvm_type(const ExtArgumentType ext_arg_type,
                                       llvm::LLVMContext& ctx) {
@@ -42,6 +88,18 @@ llvm::Type* ext_arg_type_to_llvm_type(const ExtArgumentType ext_arg_type,
       return llvm::Type::getFloatTy(ctx);
     case ExtArgumentType::Double:
       return llvm::Type::getDoubleTy(ctx);
+    case ExtArgumentType::ArrayInt64:
+      return llvm::Type::getVoidTy(ctx);
+    case ExtArgumentType::ArrayInt32:
+      return llvm::Type::getVoidTy(ctx);
+    case ExtArgumentType::ArrayInt16:
+      return llvm::Type::getVoidTy(ctx);
+    case ExtArgumentType::ArrayInt8:
+      return llvm::Type::getVoidTy(ctx);
+    case ExtArgumentType::ArrayDouble:
+      return llvm::Type::getVoidTy(ctx);
+    case ExtArgumentType::ArrayFloat:
+      return llvm::Type::getVoidTy(ctx);
     default:
       CHECK(false);
   }
@@ -84,12 +142,50 @@ inline SQLTypeInfo get_sql_type_from_llvm_type(const llvm::Type* ll_type) {
   return SQLTypeInfo();
 }
 
+inline llvm::Type* get_llvm_type_from_sql_array_type(const SQLTypeInfo ti,
+                                                     llvm::LLVMContext& ctx) {
+  CHECK(ti.is_array());
+  const auto& elem_ti = ti.get_elem_type();
+  if (elem_ti.is_fp()) {
+    switch (elem_ti.get_size()) {
+      case 4:
+        return llvm::Type::getFloatPtrTy(ctx);
+      case 8:
+        return llvm::Type::getDoublePtrTy(ctx);
+    }
+  }
+  CHECK(elem_ti.is_integer());
+  switch (elem_ti.get_size()) {
+    case 1:
+      return llvm::Type::getInt8PtrTy(ctx);
+    case 2:
+      return llvm::Type::getInt16PtrTy(ctx);
+    case 4:
+      return llvm::Type::getInt32PtrTy(ctx);
+    case 8:
+      return llvm::Type::getInt64PtrTy(ctx);
+  }
+
+  UNREACHABLE();
+  return nullptr;
+}
+
 bool ext_func_call_requires_nullcheck(const Analyzer::FunctionOper* function_oper) {
+  const auto& func_ti = function_oper->get_type_info();
   for (size_t i = 0; i < function_oper->getArity(); ++i) {
     const auto arg = function_oper->getArg(i);
     const auto& arg_ti = arg->get_type_info();
-    if (!arg_ti.get_notnull() && !arg_ti.is_array() && !arg_ti.is_geometry()) {
+    if (func_ti.is_array() && arg_ti.is_array()) {
+      // If the function returns an array and any of the arguments are arrays, allow NULL
+      // scalars.
+      // TODO: Make this a property of the FunctionOper following `RETURN NULL ON NULL`
+      // semantics.
+      return false;
+    } else if (!arg_ti.get_notnull() && !arg_ti.is_array()) {
+      // Nullable geometry args will trigger a null check
       return true;
+    } else {
+      continue;
     }
   }
   return false;
@@ -112,9 +208,12 @@ llvm::Value* CodeGenerator::codegenFunctionOper(
   auto ext_func_sig = bind_function(function_oper);
 
   const auto& ret_ti = function_oper->get_type_info();
-  CHECK(ret_ti.is_integer() || ret_ti.is_fp() || ret_ti.is_boolean());
-  const auto ret_ty =
-      ext_arg_type_to_llvm_type(ext_func_sig.getRet(), cgen_state_->context_);
+  CHECK(ret_ti.is_integer() || ret_ti.is_fp() || ret_ti.is_boolean() ||
+        ret_ti.is_array());
+  if (ret_ti.is_array() && co.device_type == ExecutorDeviceType::GPU) {
+    throw QueryMustRunOnCpu();
+  }
+  auto ret_ty = ext_arg_type_to_llvm_type(ext_func_sig.getRet(), cgen_state_->context_);
   const auto current_bb = cgen_state_->ir_builder_.GetInsertBlock();
   for (auto it : cgen_state_->ext_call_cache_) {
     if (*it.foper == *function_oper) {
@@ -132,7 +231,8 @@ llvm::Value* CodeGenerator::codegenFunctionOper(
     const auto arg0 =
         (arg_cast && arg_cast->get_optype() == kCAST) ? arg_cast->get_operand() : arg;
     const auto array_expr_arg = dynamic_cast<const Analyzer::ArrayExpr*>(arg0);
-    auto is_local_alloc = (array_expr_arg && array_expr_arg->isLocalAlloc());
+    auto is_local_alloc =
+        ret_ti.is_array() || (array_expr_arg && array_expr_arg->isLocalAlloc());
     const auto& arg_ti = arg->get_type_info();
     const auto arg_lvs = codegen(arg, true, co);
     // TODO(adb / d): Assuming no const array cols for geo (for now)
@@ -159,21 +259,46 @@ llvm::Value* CodeGenerator::codegenFunctionOper(
   // the assumption that the inputs are validated before calling them. Generate
   // code to do the check at the call site: if any argument is NULL, return NULL
   // without calling the function at all.
-  const auto bbs = beginArgsNullcheck(function_oper, orig_arg_lvs);
+  const auto [bbs, null_array_ptr] = beginArgsNullcheck(function_oper, orig_arg_lvs);
   CHECK_GE(orig_arg_lvs.size(), function_oper->getArity());
   // Arguments must be converted to the types the extension function can handle.
-  const auto args = codegenFunctionOperCastArgs(
+  auto args = codegenFunctionOperCastArgs(
       function_oper, &ext_func_sig, orig_arg_lvs, const_arr_size, co);
-  const auto ext_call =
-      cgen_state_->emitExternalCall(ext_func_sig.getName(), ret_ty, args);
-  auto ext_call_nullcheck = endArgsNullcheck(bbs, ext_call, function_oper);
+
+  llvm::Value* array_ret{nullptr};
+  if (ret_ti.is_array()) {
+    // codegen array return as first arg
+    ret_ty = llvm::Type::getVoidTy(cgen_state_->context_);
+    const auto arr_struct_ty = get_arr_struct_type(
+        cgen_state_,
+        function_oper->getName(),
+        get_llvm_type_from_sql_array_type(ret_ti, cgen_state_->context_),
+        0);
+    array_ret = cgen_state_->ir_builder_.CreateAlloca(arr_struct_ty);
+    args.insert(args.begin(), array_ret);
+  }
+  const auto ext_call = cgen_state_->emitExternalCall(
+      ext_func_sig.getName(), ret_ty, args, {}, ret_ti.is_array());
+  auto ext_call_nullcheck = endArgsNullcheck(
+      bbs, ret_ti.is_array() ? array_ret : ext_call, null_array_ptr, function_oper);
 
   // Cast the return of the extension function to match the FunctionOper
-  const auto extension_ret_ti = get_sql_type_from_llvm_type(ret_ty);
-  if (bbs.args_null_bb &&
-      extension_ret_ti.get_type() != function_oper->get_type_info().get_type()) {
-    ext_call_nullcheck = codegenCast(
-        ext_call_nullcheck, extension_ret_ti, function_oper->get_type_info(), false, co);
+  if (!ret_ti.is_array()) {
+    const auto extension_ret_ti = get_sql_type_from_llvm_type(ret_ty);
+    if (bbs.args_null_bb &&
+        extension_ret_ti.get_type() != function_oper->get_type_info().get_type() &&
+        // Skip i1-->i8 casts for ST_ functions.
+        // function_oper ret type is i1, extension ret type is 'upgraded' to i8
+        // during type deserialization to 'handle' NULL returns, hence i1-->i8.
+        // ST_ functions can't return NULLs, we just need to check arg nullness
+        // and if any args are NULL then ST_ function is not called
+        function_oper->getName().substr(0, 3) != std::string("ST_")) {
+      ext_call_nullcheck = codegenCast(ext_call_nullcheck,
+                                       extension_ret_ti,
+                                       function_oper->get_type_info(),
+                                       false,
+                                       co);
+    }
   }
 
   cgen_state_->ext_call_cache_.push_back({function_oper, ext_call_nullcheck});
@@ -182,14 +307,24 @@ llvm::Value* CodeGenerator::codegenFunctionOper(
 }
 
 // Start the control flow needed for a call site check of NULL arguments.
-CodeGenerator::ArgNullcheckBBs CodeGenerator::beginArgsNullcheck(
-    const Analyzer::FunctionOper* function_oper,
-    const std::vector<llvm::Value*>& orig_arg_lvs) {
+std::tuple<CodeGenerator::ArgNullcheckBBs, llvm::Value*>
+CodeGenerator::beginArgsNullcheck(const Analyzer::FunctionOper* function_oper,
+                                  const std::vector<llvm::Value*>& orig_arg_lvs) {
   llvm::BasicBlock* args_null_bb{nullptr};
   llvm::BasicBlock* args_notnull_bb{nullptr};
   llvm::BasicBlock* orig_bb = cgen_state_->ir_builder_.GetInsertBlock();
+  llvm::Value* null_array_alloca{nullptr};
   // Only generate the check if required (at least one argument must be nullable).
   if (ext_func_call_requires_nullcheck(function_oper)) {
+    if (function_oper->get_type_info().is_array()) {
+      const auto arr_struct_ty =
+          get_arr_struct_type(cgen_state_,
+                              function_oper->getName(),
+                              get_llvm_type_from_sql_array_type(
+                                  function_oper->get_type_info(), cgen_state_->context_),
+                              0);
+      null_array_alloca = cgen_state_->ir_builder_.CreateAlloca(arr_struct_ty);
+    }
     const auto args_notnull_lv = cgen_state_->ir_builder_.CreateNot(
         codegenFunctionOperNullArg(function_oper, orig_arg_lvs));
     args_notnull_bb = llvm::BasicBlock::Create(
@@ -199,35 +334,66 @@ CodeGenerator::ArgNullcheckBBs CodeGenerator::beginArgsNullcheck(
     cgen_state_->ir_builder_.CreateCondBr(args_notnull_lv, args_notnull_bb, args_null_bb);
     cgen_state_->ir_builder_.SetInsertPoint(args_notnull_bb);
   }
-  return {args_null_bb, args_notnull_bb, orig_bb};
+  return std::make_tuple(
+      CodeGenerator::ArgNullcheckBBs{args_null_bb, args_notnull_bb, orig_bb},
+      null_array_alloca);
 }
 
 // Wrap up the control flow needed for NULL argument handling.
 llvm::Value* CodeGenerator::endArgsNullcheck(
     const ArgNullcheckBBs& bbs,
     llvm::Value* fn_ret_lv,
+    llvm::Value* null_array_ptr,
     const Analyzer::FunctionOper* function_oper) {
   if (bbs.args_null_bb) {
     CHECK(bbs.args_notnull_bb);
     cgen_state_->ir_builder_.CreateBr(bbs.args_null_bb);
     cgen_state_->ir_builder_.SetInsertPoint(bbs.args_null_bb);
 
-    // The pre-cast SQL equivalent of the type returned by the extension function.
-    const auto extension_ret_ti = get_sql_type_from_llvm_type(fn_ret_lv->getType());
+    llvm::PHINode* ext_call_phi{nullptr};
+    llvm::Value* null_lv{nullptr};
+    if (!function_oper->get_type_info().is_array()) {
+      // The pre-cast SQL equivalent of the type returned by the extension function.
+      const auto extension_ret_ti = get_sql_type_from_llvm_type(fn_ret_lv->getType());
 
-    auto ext_call_phi = cgen_state_->ir_builder_.CreatePHI(
-        extension_ret_ti.is_fp()
-            ? get_fp_type(extension_ret_ti.get_size() * 8, cgen_state_->context_)
-            : get_int_type(extension_ret_ti.get_size() * 8, cgen_state_->context_),
-        2);
+      ext_call_phi = cgen_state_->ir_builder_.CreatePHI(
+          extension_ret_ti.is_fp()
+              ? get_fp_type(extension_ret_ti.get_size() * 8, cgen_state_->context_)
+              : get_int_type(extension_ret_ti.get_size() * 8, cgen_state_->context_),
+          2);
 
+      null_lv =
+          extension_ret_ti.is_fp()
+              ? static_cast<llvm::Value*>(cgen_state_->inlineFpNull(extension_ret_ti))
+              : static_cast<llvm::Value*>(cgen_state_->inlineIntNull(extension_ret_ti));
+    } else {
+      const auto arr_struct_ty =
+          get_arr_struct_type(cgen_state_,
+                              function_oper->getName(),
+                              get_llvm_type_from_sql_array_type(
+                                  function_oper->get_type_info(), cgen_state_->context_),
+                              0);
+      ext_call_phi =
+          cgen_state_->ir_builder_.CreatePHI(llvm::PointerType::get(arr_struct_ty, 0), 2);
+
+      CHECK(null_array_ptr);
+      const auto arr_null_bool =
+          cgen_state_->ir_builder_.CreateStructGEP(arr_struct_ty, null_array_ptr, 2);
+      cgen_state_->ir_builder_.CreateStore(
+          llvm::ConstantInt::get(get_int_type(1, cgen_state_->context_), 1),
+          arr_null_bool);
+
+      const auto arr_null_size =
+          cgen_state_->ir_builder_.CreateStructGEP(arr_struct_ty, null_array_ptr, 1);
+      cgen_state_->ir_builder_.CreateStore(
+          llvm::ConstantInt::get(get_int_type(64, cgen_state_->context_), 0),
+          arr_null_size);
+    }
     ext_call_phi->addIncoming(fn_ret_lv, bbs.args_notnull_bb);
+    ext_call_phi->addIncoming(
+        function_oper->get_type_info().is_array() ? null_array_ptr : null_lv,
+        bbs.orig_bb);
 
-    const auto null_lv =
-        extension_ret_ti.is_fp()
-            ? static_cast<llvm::Value*>(cgen_state_->inlineFpNull(extension_ret_ti))
-            : static_cast<llvm::Value*>(cgen_state_->inlineIntNull(extension_ret_ti));
-    ext_call_phi->addIncoming(null_lv, bbs.orig_bb);
     return ext_call_phi;
   }
   return fn_ret_lv;
@@ -266,7 +432,8 @@ llvm::Value* CodeGenerator::codegenFunctionOperWithCustomTypeHandling(
       CHECK_EQ(size_t(1), arg_lvs.size());
       const auto arg_lv = arg_lvs.front();
       CHECK(arg_lv->getType()->isIntegerTy(64));
-      const auto bbs = beginArgsNullcheck(function_oper, {arg_lvs});
+      CodeGenerator::ArgNullcheckBBs bbs;
+      std::tie(bbs, std::ignore) = beginArgsNullcheck(function_oper, {arg_lvs});
       const std::string func_name =
           (function_oper->getName() == "FLOOR") ? "decimal_floor" : "decimal_ceil";
       const auto covar_result_lv = cgen_state_->emitCall(
@@ -276,7 +443,7 @@ llvm::Value* CodeGenerator::codegenFunctionOperWithCustomTypeHandling(
       CHECK_EQ(0, ret_ti.get_scale());
       const auto result_lv = cgen_state_->ir_builder_.CreateSDiv(
           covar_result_lv, cgen_state_->llInt(exp_to_scale(arg_ti.get_scale())));
-      return endArgsNullcheck(bbs, result_lv, function_oper);
+      return endArgsNullcheck(bbs, result_lv, nullptr, function_oper);
     } else if (function_oper->getName() == "ROUND" &&
                function_oper->getArg(0)->get_type_info().is_decimal()) {
       CHECK_EQ(size_t(2), function_oper->getArity());
@@ -297,7 +464,9 @@ llvm::Value* CodeGenerator::codegenFunctionOperWithCustomTypeHandling(
         arg1_lv = codegenCast(arg1_lv, arg1_ti, SQLTypeInfo(kINT, true), false, co);
       }
 
-      const auto bbs0 = beginArgsNullcheck(function_oper, {arg0_lv, arg1_lvs.front()});
+      CodeGenerator::ArgNullcheckBBs bbs0;
+      std::tie(bbs0, std::ignore) =
+          beginArgsNullcheck(function_oper, {arg0_lv, arg1_lvs.front()});
 
       const std::string func_name = "Round__4";
       const auto ret_ti = function_oper->get_type_info();
@@ -307,7 +476,7 @@ llvm::Value* CodeGenerator::codegenFunctionOperWithCustomTypeHandling(
           get_int_type(64, cgen_state_->context_),
           {arg0_lv, arg1_lv, cgen_state_->llInt(arg0_ti.get_scale())});
 
-      return endArgsNullcheck(bbs0, result_lv, function_oper);
+      return endArgsNullcheck(bbs0, result_lv, nullptr, function_oper);
     }
     throw std::runtime_error("Type combination not supported for function " +
                              function_oper->getName());
@@ -324,7 +493,17 @@ llvm::Value* CodeGenerator::codegenFunctionOperNullArg(
   for (size_t i = 0; i < function_oper->getArity(); ++i) {
     const auto arg = function_oper->getArg(i);
     const auto& arg_ti = arg->get_type_info();
-    if (arg_ti.get_notnull() || arg_ti.is_array() || arg_ti.is_geometry()) {
+    if (arg_ti.get_notnull()) {
+      continue;
+    }
+    if (arg_ti.is_array() || arg_ti.is_geometry()) {
+      // POINT [un]compressed coord check requires custom checker and chunk iterator
+      // Non-POINT NULL geographies will have a normally encoded null coord array
+      auto fname =
+          (arg_ti.get_type() == kPOINT) ? "point_coord_array_is_null" : "array_is_null";
+      auto is_null_lv = cgen_state_->emitExternalCall(
+          fname, get_int_type(1, cgen_state_->context_), {orig_arg_lvs[i], posArg(arg)});
+      one_arg_null = cgen_state_->ir_builder_.CreateOr(one_arg_null, is_null_lv);
       continue;
     }
     CHECK(arg_ti.is_number());
@@ -334,34 +513,43 @@ llvm::Value* CodeGenerator::codegenFunctionOperNullArg(
   return one_arg_null;
 }
 
-llvm::StructType* CodeGenerator::createArrayStructType(const std::string& udf_func_name,
-                                                       size_t param_num) {
-  llvm::Function* udf_func = cgen_state_->module_->getFunction(udf_func_name);
-  llvm::Module* module_for_lookup = cgen_state_->module_;
+llvm::Value* CodeGenerator::codegenCompression(const SQLTypeInfo& type_info) {
+  int32_t compression = (type_info.get_compression() == kENCODING_GEOINT &&
+                         type_info.get_comp_param() == 32)
+                            ? 1
+                            : 0;
 
-  CHECK(udf_func);
-
-  llvm::FunctionType* udf_func_type = udf_func->getFunctionType();
-  CHECK(param_num < udf_func_type->getNumParams());
-  llvm::Type* param_type = udf_func_type->getParamType(param_num);
-  CHECK(param_type->isPointerTy());
-  llvm::Type* struct_type = param_type->getPointerElementType();
-  CHECK(struct_type->isStructTy());
-  CHECK(struct_type->getStructNumElements() == 3);
-
-  if (llvm::cast<llvm::StructType>(struct_type)->isLiteral()) {
-    return llvm::cast<llvm::StructType>(struct_type);
-  }
-
-  llvm::StringRef struct_name = struct_type->getStructName();
-
-  llvm::StructType* array_type = module_for_lookup->getTypeByName(struct_name);
-  CHECK(array_type);
-
-  return (array_type);
+  return cgen_state_->llInt(compression);
 }
 
-void CodeGenerator::codegenArrayArgs(const std::string& udf_func_name,
+std::pair<llvm::Value*, llvm::Value*> CodeGenerator::codegenArrayBuff(
+    llvm::Value* chunk,
+    llvm::Value* row_pos,
+    SQLTypes array_type,
+    bool cast_and_extend) {
+  const auto elem_ti =
+      SQLTypeInfo(
+          SQLTypes::kARRAY, 0, 0, false, EncodingType::kENCODING_NONE, 0, array_type)
+          .get_elem_type();
+
+  auto buff = cgen_state_->emitExternalCall(
+      "array_buff", llvm::Type::getInt32PtrTy(cgen_state_->context_), {chunk, row_pos});
+
+  auto len = cgen_state_->emitExternalCall(
+      "array_size",
+      get_int_type(32, cgen_state_->context_),
+      {chunk, row_pos, cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))});
+
+  if (cast_and_extend) {
+    buff = castArrayPointer(buff, elem_ti);
+    len =
+        cgen_state_->ir_builder_.CreateZExt(len, get_int_type(64, cgen_state_->context_));
+  }
+
+  return std::make_pair(buff, len);
+}
+
+void CodeGenerator::codegenArrayArgs(const std::string& ext_func_name,
                                      size_t param_num,
                                      llvm::Value* array_buf,
                                      llvm::Value* array_size,
@@ -371,8 +559,9 @@ void CodeGenerator::codegenArrayArgs(const std::string& udf_func_name,
   CHECK(array_size);
   CHECK(array_null);
 
-  auto array_abstraction = createArrayStructType(udf_func_name, param_num);
-  auto alloc_mem = cgen_state_->ir_builder_.CreateAlloca(array_abstraction, nullptr);
+  auto array_abstraction =
+      get_arr_struct_type(cgen_state_, ext_func_name, array_buf->getType(), param_num);
+  auto alloc_mem = cgen_state_->ir_builder_.CreateAlloca(array_abstraction);
 
   auto array_buf_ptr =
       cgen_state_->ir_builder_.CreateStructGEP(array_abstraction, alloc_mem, 0);
@@ -594,6 +783,95 @@ void CodeGenerator::codegenGeoPolygonArgs(const std::string& udf_func_name,
   output_args.push_back(alloc_mem);
 }
 
+llvm::StructType* CodeGenerator::createMultiPolygonStructType(
+    const std::string& udf_func_name,
+    size_t param_num) {
+  llvm::Function* udf_func = cgen_state_->module_->getFunction(udf_func_name);
+  llvm::Module* module_for_lookup = cgen_state_->module_;
+
+  CHECK(udf_func);
+
+  llvm::FunctionType* udf_func_type = udf_func->getFunctionType();
+  CHECK(param_num < udf_func_type->getNumParams());
+  llvm::Type* param_type = udf_func_type->getParamType(param_num);
+  CHECK(param_type->isPointerTy());
+  llvm::Type* struct_type = param_type->getPointerElementType();
+  CHECK(struct_type->isStructTy());
+  CHECK(struct_type->getStructNumElements() == 9);
+
+  llvm::StringRef struct_name = struct_type->getStructName();
+
+  llvm::StructType* polygon_type = module_for_lookup->getTypeByName(struct_name);
+  CHECK(polygon_type);
+
+  return (polygon_type);
+}
+
+void CodeGenerator::codegenGeoMultiPolygonArgs(const std::string& udf_func_name,
+                                               size_t param_num,
+                                               llvm::Value* polygon_coords,
+                                               llvm::Value* polygon_coords_size,
+                                               llvm::Value* ring_sizes_buf,
+                                               llvm::Value* ring_sizes,
+                                               llvm::Value* polygon_bounds,
+                                               llvm::Value* polygon_bounds_sizes,
+                                               llvm::Value* compression,
+                                               llvm::Value* input_srid,
+                                               llvm::Value* output_srid,
+                                               std::vector<llvm::Value*>& output_args) {
+  CHECK(polygon_coords);
+  CHECK(polygon_coords_size);
+  CHECK(ring_sizes_buf);
+  CHECK(ring_sizes);
+  CHECK(polygon_bounds);
+  CHECK(polygon_bounds_sizes);
+  CHECK(compression);
+  CHECK(input_srid);
+  CHECK(output_srid);
+
+  auto multi_polygon_abstraction = createMultiPolygonStructType(udf_func_name, param_num);
+  auto alloc_mem =
+      cgen_state_->ir_builder_.CreateAlloca(multi_polygon_abstraction, nullptr);
+
+  auto polygon_coords_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 0);
+  cgen_state_->ir_builder_.CreateStore(polygon_coords, polygon_coords_ptr);
+
+  auto polygon_coords_size_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 1);
+  cgen_state_->ir_builder_.CreateStore(polygon_coords_size, polygon_coords_size_ptr);
+
+  auto ring_sizes_buf_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 2);
+  cgen_state_->ir_builder_.CreateStore(ring_sizes_buf, ring_sizes_buf_ptr);
+
+  auto ring_sizes_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 3);
+  cgen_state_->ir_builder_.CreateStore(ring_sizes, ring_sizes_ptr);
+
+  auto polygon_bounds_buf_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 4);
+  cgen_state_->ir_builder_.CreateStore(polygon_bounds, polygon_bounds_buf_ptr);
+
+  auto polygon_bounds_sizes_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 5);
+  cgen_state_->ir_builder_.CreateStore(polygon_bounds_sizes, polygon_bounds_sizes_ptr);
+
+  auto polygon_compression_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 6);
+  cgen_state_->ir_builder_.CreateStore(compression, polygon_compression_ptr);
+
+  auto input_srid_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 7);
+  cgen_state_->ir_builder_.CreateStore(input_srid, input_srid_ptr);
+
+  auto output_srid_ptr =
+      cgen_state_->ir_builder_.CreateStructGEP(multi_polygon_abstraction, alloc_mem, 8);
+  cgen_state_->ir_builder_.CreateStore(output_srid, output_srid_ptr);
+
+  output_args.push_back(alloc_mem);
+}
+
 // Generate CAST operations for arguments in `orig_arg_lvs` to the types required by
 // `ext_func_sig`.
 std::vector<llvm::Value*> CodeGenerator::codegenFunctionOperCastArgs(
@@ -647,7 +925,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenFunctionOperCastArgs(
                                           get_int_type(1, cgen_state_->context_),
                                           {orig_arg_lvs[k], posArg(arg)});
         codegenArrayArgs(ext_func_sig->getName(),
-                         k,
+                         function_oper->get_type_info().is_array() ? k + 1 : k,
                          array_buf_arg,
                          array_size_arg,
                          array_null_arg,
@@ -708,11 +986,7 @@ std::vector<llvm::Value*> CodeGenerator::codegenFunctionOperCastArgs(
           auto builder = cgen_state_->ir_builder_;
           auto array_size_arg =
               builder.CreateZExt(len_lv, get_int_type(64, cgen_state_->context_));
-          int32_t compression = (arg_ti.get_compression() == kENCODING_GEOINT &&
-                                 arg_ti.get_comp_param() == 32)
-                                    ? 1
-                                    : 0;
-          auto compression_val = cgen_state_->llInt(compression);
+          auto compression_val = codegenCompression(arg_ti);
           auto input_srid_val = cgen_state_->llInt(arg_ti.get_input_srid());
           auto output_srid_val = cgen_state_->llInt(arg_ti.get_output_srid());
 
@@ -753,130 +1027,89 @@ std::vector<llvm::Value*> CodeGenerator::codegenFunctionOperCastArgs(
             auto builder = cgen_state_->ir_builder_;
             auto array_size_arg =
                 builder.CreateZExt(len_lv, get_int_type(64, cgen_state_->context_));
-            int32_t compression = (arg_ti.get_compression() == kENCODING_GEOINT &&
-                                   arg_ti.get_comp_param() == 32)
-                                      ? 1
-                                      : 0;
-            auto compression_val = cgen_state_->llInt(compression);
+            auto compression_val = codegenCompression(arg_ti);
             auto input_srid_val = cgen_state_->llInt(arg_ti.get_input_srid());
             auto output_srid_val = cgen_state_->llInt(arg_ti.get_output_srid());
-            k++;
-            // Ring Sizes
-            const auto elem_ti = SQLTypeInfo(SQLTypes::kARRAY,
-                                             0,
-                                             0,
-                                             false,
-                                             EncodingType::kENCODING_NONE,
-                                             0,
-                                             SQLTypes::kINT)
-                                     .get_elem_type();
-            const auto ptr_lv = cgen_state_->emitExternalCall(
-                "array_buff",
-                llvm::Type::getInt32PtrTy(cgen_state_->context_),
-                {orig_arg_lvs[k], posArg(arg)});
-            const auto len_lv = cgen_state_->emitExternalCall(
-                "array_size",
-                get_int_type(32, cgen_state_->context_),
-                {orig_arg_lvs[k],
-                 posArg(arg),
-                 cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))});
-            auto ring_size_buf_arg = castArrayPointer(ptr_lv, elem_ti);
-            auto ring_size_arg =
-                builder.CreateZExt(len_lv, get_int_type(64, cgen_state_->context_));
+
+            auto [ring_size_buff, ring_size] =
+                codegenArrayBuff(orig_arg_lvs[k + 1], posArg(arg), SQLTypes::kINT, true);
 
             codegenGeoPolygonArgs(ext_func_sig->getName(),
-                                  k - 1,
+                                  k,
                                   array_buf_arg,
                                   array_size_arg,
-                                  ring_size_buf_arg,
-                                  ring_size_arg,
+                                  ring_size_buff,
+                                  ring_size,
                                   compression_val,
                                   input_srid_val,
                                   output_srid_val,
                                   args);
-
-          } else {
             k++;
+          } else {
             // Ring Sizes
-            const auto elem_ti = SQLTypeInfo(SQLTypes::kARRAY,
-                                             0,
-                                             0,
-                                             false,
-                                             EncodingType::kENCODING_NONE,
-                                             0,
-                                             SQLTypes::kINT)
-                                     .get_elem_type();
-            const auto ptr_lv = cgen_state_->emitExternalCall(
-                "array_buff",
-                llvm::Type::getInt32PtrTy(cgen_state_->context_),
-                {orig_arg_lvs[k], posArg(arg)});
-            const auto len_lv = cgen_state_->emitExternalCall(
-                "array_size",
-                get_int_type(32, cgen_state_->context_),
-                {orig_arg_lvs[k],
-                 posArg(arg),
-                 cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))});
 
-            args.push_back(castArrayPointer(ptr_lv, elem_ti));
-            args.push_back(cgen_state_->ir_builder_.CreateZExt(
-                len_lv, get_int_type(64, cgen_state_->context_)));
+            auto [ring_size_buff, ring_size] =
+                codegenArrayBuff(orig_arg_lvs[k + 1], posArg(arg), SQLTypes::kINT, true);
+
+            args.push_back(ring_size_buff);
+            args.push_back(ring_size);
+            k++;
             j++;
           }
           break;
         }
         case kMULTIPOLYGON: {
-          k++;
-          // Ring Sizes
-          {
-            const auto elem_ti = SQLTypeInfo(SQLTypes::kARRAY,
-                                             0,
-                                             0,
-                                             false,
-                                             EncodingType::kENCODING_NONE,
-                                             0,
-                                             SQLTypes::kINT)
-                                     .get_elem_type();
-            const auto ptr_lv = cgen_state_->emitExternalCall(
-                "array_buff",
-                llvm::Type::getInt32PtrTy(cgen_state_->context_),
-                {orig_arg_lvs[k], posArg(arg)});
-            const auto len_lv = cgen_state_->emitExternalCall(
-                "array_size",
-                get_int_type(32, cgen_state_->context_),
-                {orig_arg_lvs[k],
-                 posArg(arg),
-                 cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))});
-            args.push_back(castArrayPointer(ptr_lv, elem_ti));
-            args.push_back(cgen_state_->ir_builder_.CreateZExt(
-                len_lv, get_int_type(64, cgen_state_->context_)));
-          }
-          j++, k++;
+          if (ext_func_args[i] == ExtArgumentType::GeoMultiPolygon) {
+            auto array_buf_arg = castArrayPointer(ptr_lv, elem_ti);
+            auto builder = cgen_state_->ir_builder_;
+            auto array_size_arg =
+                builder.CreateZExt(len_lv, get_int_type(64, cgen_state_->context_));
+            auto compression_val = codegenCompression(arg_ti);
+            auto input_srid_val = cgen_state_->llInt(arg_ti.get_input_srid());
+            auto output_srid_val = cgen_state_->llInt(arg_ti.get_output_srid());
 
-          // Poly Rings
-          {
-            const auto elem_ti = SQLTypeInfo(SQLTypes::kARRAY,
-                                             0,
-                                             0,
-                                             false,
-                                             EncodingType::kENCODING_NONE,
-                                             0,
-                                             SQLTypes::kINT)
-                                     .get_elem_type();
-            const auto ptr_lv = cgen_state_->emitExternalCall(
-                "array_buff",
-                llvm::Type::getInt32PtrTy(cgen_state_->context_),
-                {orig_arg_lvs[k], posArg(arg)});
-            const auto len_lv = cgen_state_->emitExternalCall(
-                "array_size",
-                get_int_type(32, cgen_state_->context_),
-                {orig_arg_lvs[k],
-                 posArg(arg),
-                 cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))});
-            args.push_back(castArrayPointer(ptr_lv, elem_ti));
-            args.push_back(cgen_state_->ir_builder_.CreateZExt(
-                len_lv, get_int_type(64, cgen_state_->context_)));
+            auto [ring_size_buff, ring_size] =
+                codegenArrayBuff(orig_arg_lvs[k + 1], posArg(arg), SQLTypes::kINT, true);
+
+            auto [poly_bounds_buff, poly_bounds_size] =
+                codegenArrayBuff(orig_arg_lvs[k + 2], posArg(arg), SQLTypes::kINT, true);
+
+            codegenGeoMultiPolygonArgs(ext_func_sig->getName(),
+                                       k,
+                                       array_buf_arg,
+                                       array_size_arg,
+                                       ring_size_buff,
+                                       ring_size,
+                                       poly_bounds_buff,
+                                       poly_bounds_size,
+                                       compression_val,
+                                       input_srid_val,
+                                       output_srid_val,
+                                       args);
+
+            k += 2;
+          } else {
+            k++;
+            // Ring Sizes
+            {
+              auto [ring_size_buff, ring_size] =
+                  codegenArrayBuff(orig_arg_lvs[k], posArg(arg), SQLTypes::kINT, true);
+
+              args.push_back(ring_size_buff);
+              args.push_back(ring_size);
+            }
+            j++, k++;
+
+            // Poly Rings
+            {
+              auto [poly_bounds_buff, poly_bounds_size] =
+                  codegenArrayBuff(orig_arg_lvs[k], posArg(arg), SQLTypes::kINT, true);
+
+              args.push_back(poly_bounds_buff);
+              args.push_back(poly_bounds_size);
+            }
+            j++;
           }
-          j++;
           break;
         }
         default:

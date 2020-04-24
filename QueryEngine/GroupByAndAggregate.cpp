@@ -376,12 +376,10 @@ std::unique_ptr<QueryMemoryDescriptor> GroupByAndAggregate::initQueryMemoryDescr
 
   // Non-grouped aggregates do not support accessing aggregated ranges
   // Keyless hash is currently only supported with single-column perfect hash
-  const auto keyless_info =
-      !(is_group_by &&
-        col_range_info.hash_type_ == QueryDescriptionType::GroupByPerfectHash &&
-        ra_exe_unit_.groupby_exprs.size() == 1)
-          ? KeylessInfo{false, -1, false}
-          : getKeylessInfo(ra_exe_unit_.target_exprs, is_group_by);
+  const auto keyless_info = !(is_group_by && col_range_info.hash_type_ ==
+                                                 QueryDescriptionType::GroupByPerfectHash)
+                                ? KeylessInfo{false, -1, false}
+                                : getKeylessInfo(ra_exe_unit_.target_exprs, is_group_by);
 
   if (g_enable_watchdog &&
       ((col_range_info.hash_type_ == QueryDescriptionType::GroupByBaselineHash &&
@@ -393,21 +391,42 @@ std::unique_ptr<QueryMemoryDescriptor> GroupByAndAggregate::initQueryMemoryDescr
             130000000))) {
     throw WatchdogException("Query would use too much memory");
   }
-  return QueryMemoryDescriptor::init(executor_,
-                                     ra_exe_unit_,
-                                     query_infos_,
-                                     col_range_info,
-                                     keyless_info,
-                                     allow_multifrag,
-                                     device_type_,
-                                     crt_min_byte_width,
-                                     sort_on_gpu_hint,
-                                     shard_count,
-                                     max_groups_buffer_entry_count,
-                                     render_info,
-                                     count_distinct_descriptors,
-                                     must_use_baseline_sort,
-                                     output_columnar_hint);
+  try {
+    return QueryMemoryDescriptor::init(executor_,
+                                       ra_exe_unit_,
+                                       query_infos_,
+                                       col_range_info,
+                                       keyless_info,
+                                       allow_multifrag,
+                                       device_type_,
+                                       crt_min_byte_width,
+                                       sort_on_gpu_hint,
+                                       shard_count,
+                                       max_groups_buffer_entry_count,
+                                       render_info,
+                                       count_distinct_descriptors,
+                                       must_use_baseline_sort,
+                                       output_columnar_hint,
+                                       /*streaming_top_n_hint=*/true);
+  } catch (const StreamingTopNOOM& e) {
+    LOG(WARNING) << e.what() << " Disabling Streaming Top N.";
+    return QueryMemoryDescriptor::init(executor_,
+                                       ra_exe_unit_,
+                                       query_infos_,
+                                       col_range_info,
+                                       keyless_info,
+                                       allow_multifrag,
+                                       device_type_,
+                                       crt_min_byte_width,
+                                       sort_on_gpu_hint,
+                                       shard_count,
+                                       max_groups_buffer_entry_count,
+                                       render_info,
+                                       count_distinct_descriptors,
+                                       must_use_baseline_sort,
+                                       output_columnar_hint,
+                                       /*streaming_top_n_hint=*/false);
+  }
 }
 
 void GroupByAndAggregate::addTransientStringLiterals() {
@@ -491,7 +510,8 @@ void GroupByAndAggregate::addTransientStringLiterals(
     }
     const auto agg_expr = dynamic_cast<const Analyzer::AggExpr*>(target_expr);
     if (agg_expr) {
-      if (agg_expr->get_aggtype() == kSAMPLE) {
+      if (agg_expr->get_aggtype() == kSINGLE_VALUE ||
+          agg_expr->get_aggtype() == kSAMPLE) {
         add_transient_string_literals_for_expression(
             agg_expr->get_arg(), executor, row_set_mem_owner);
       }
@@ -916,7 +936,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
   {
     const bool is_group_by = !ra_exe_unit_.groupby_exprs.empty();
 
-    if (executor_->isArchMaxwell(co.device_type_)) {
+    if (executor_->isArchMaxwell(co.device_type)) {
       prependForceSync();
     }
     DiamondCodegen filter_cfg(filter_result,
@@ -929,12 +949,12 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
 
     if (is_group_by) {
       if (query_mem_desc.getQueryDescriptionType() == QueryDescriptionType::Projection &&
-          !use_streaming_top_n(ra_exe_unit_, query_mem_desc.didOutputColumnar())) {
+          !query_mem_desc.useStreamingTopN()) {
         const auto crt_matched = get_arg_by_name(ROW_FUNC, "crt_matched");
         LL_BUILDER.CreateStore(LL_INT(int32_t(1)), crt_matched);
         auto total_matched_ptr = get_arg_by_name(ROW_FUNC, "total_matched");
         llvm::Value* old_total_matched_val{nullptr};
-        if (co.device_type_ == ExecutorDeviceType::GPU) {
+        if (co.device_type == ExecutorDeviceType::GPU) {
           old_total_matched_val =
               LL_BUILDER.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
                                          total_matched_ptr,
@@ -980,7 +1000,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
         can_return_error = true;
         if (query_mem_desc.getQueryDescriptionType() ==
                 QueryDescriptionType::Projection &&
-            use_streaming_top_n(ra_exe_unit_, query_mem_desc.didOutputColumnar())) {
+            query_mem_desc.useStreamingTopN()) {
           // Ignore rejection on pushing current row to top-K heap.
           LL_BUILDER.CreateRet(LL_INT(int32_t(0)));
         } else {
@@ -1038,7 +1058,7 @@ llvm::Value* GroupByAndAggregate::codegenOutputSlot(
                                     ? 0
                                     : query_mem_desc.getRowSize() / sizeof(int64_t);
   CodeGenerator code_generator(executor_);
-  if (use_streaming_top_n(ra_exe_unit_, query_mem_desc.didOutputColumnar())) {
+  if (query_mem_desc.useStreamingTopN()) {
     const auto& only_order_entry = ra_exe_unit_.sort_info.order_entries.front();
     CHECK_GE(only_order_entry.tle_no, int(1));
     const size_t target_idx = only_order_entry.tle_no - 1;
@@ -1245,7 +1265,7 @@ GroupByAndAggregate::codegenSingleColumnPerfectHash(
   if (!query_mem_desc.didOutputColumnar() && query_mem_desc.hasKeylessHash()) {
     get_group_fn_name += "_keyless";
   }
-  if (query_mem_desc.interleavedBins(co.device_type_)) {
+  if (query_mem_desc.interleavedBins(co.device_type)) {
     CHECK(!query_mem_desc.didOutputColumnar());
     CHECK(query_mem_desc.hasKeylessHash());
     get_group_fn_name += "_semiprivate";
@@ -1267,7 +1287,7 @@ GroupByAndAggregate::codegenSingleColumnPerfectHash(
     if (!query_mem_desc.didOutputColumnar()) {
       get_group_fn_args.push_back(LL_INT(row_size_quad));
     }
-    if (query_mem_desc.interleavedBins(co.device_type_)) {
+    if (query_mem_desc.interleavedBins(co.device_type)) {
       auto warp_idx = emitCall("thread_warp_idx", {LL_INT(executor_->warpSize())});
       get_group_fn_args.push_back(warp_idx);
       get_group_fn_args.push_back(LL_INT(executor_->warpSize()));
@@ -1294,22 +1314,31 @@ std::tuple<llvm::Value*, llvm::Value*> GroupByAndAggregate::codegenMultiColumnPe
       LL_BUILDER.CreateCall(perfect_hash_func, std::vector<llvm::Value*>{group_key});
 
   if (query_mem_desc.didOutputColumnar()) {
-    const std::string set_matching_func_name{
-        "set_matching_group_value_perfect_hash_columnar"};
-    const std::vector<llvm::Value*> set_matching_func_arg{
-        groups_buffer,
-        hash_lv,
-        group_key,
-        key_size_lv,
-        llvm::ConstantInt::get(get_int_type(32, LL_CONTEXT),
-                               query_mem_desc.getEntryCount())};
-    emitCall(set_matching_func_name, set_matching_func_arg);
+    if (!query_mem_desc.hasKeylessHash()) {
+      const std::string set_matching_func_name{
+          "set_matching_group_value_perfect_hash_columnar"};
+      const std::vector<llvm::Value*> set_matching_func_arg{
+          groups_buffer,
+          hash_lv,
+          group_key,
+          key_size_lv,
+          llvm::ConstantInt::get(get_int_type(32, LL_CONTEXT),
+                                 query_mem_desc.getEntryCount())};
+      emitCall(set_matching_func_name, set_matching_func_arg);
+    }
     return std::make_tuple(groups_buffer, hash_lv);
   } else {
-    return std::make_tuple(
-        emitCall("get_matching_group_value_perfect_hash",
-                 {groups_buffer, hash_lv, group_key, key_size_lv, LL_INT(row_size_quad)}),
-        nullptr);
+    if (query_mem_desc.hasKeylessHash()) {
+      return std::make_tuple(emitCall("get_matching_group_value_perfect_hash_keyless",
+                                      {groups_buffer, hash_lv, LL_INT(row_size_quad)}),
+                             nullptr);
+    } else {
+      return std::make_tuple(
+          emitCall(
+              "get_matching_group_value_perfect_hash",
+              {groups_buffer, hash_lv, group_key, key_size_lv, LL_INT(row_size_quad)}),
+          nullptr);
+    }
   }
 }
 
@@ -1347,7 +1376,7 @@ GroupByAndAggregate::codegenMultiColumnBaselineHash(
     func_args.push_back(LL_INT(row_size_quad));
     func_args.push_back(&*arg_it);
   }
-  if (co.with_dynamic_watchdog_) {
+  if (co.with_dynamic_watchdog) {
     func_name += "_with_watchdog";
   }
   if (query_mem_desc.didOutputColumnar()) {
@@ -1742,6 +1771,9 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
     const Analyzer::Expr* target_expr,
     const CompilationOptions& co) {
   const auto agg_expr = dynamic_cast<const Analyzer::AggExpr*>(target_expr);
+  const auto func_expr = dynamic_cast<const Analyzer::FunctionOper*>(target_expr);
+  const auto arr_expr = dynamic_cast<const Analyzer::ArrayExpr*>(target_expr);
+
   // TODO(alex): handle arrays uniformly?
   CodeGenerator code_generator(executor_);
   if (target_expr) {
@@ -1751,7 +1783,7 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
           agg_expr ? code_generator.codegen(agg_expr->get_arg(), true, co)
                    : code_generator.codegen(
                          target_expr, !executor_->plan_state_->allow_lazy_fetch_, co);
-      if (target_ti.isChunkIteratorPackaging()) {
+      if (!func_expr && !arr_expr) {
         // Something with the chunk transport is code that was generated from a source
         // other than an ARRAY[] expression
         CHECK_EQ(size_t(1), target_lvs.size());
@@ -1771,12 +1803,63 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
                 {target_lvs.front(),
                  code_generator.posArg(target_expr),
                  executor_->cgen_state_->llInt(log2_bytes(elem_ti.get_logical_size()))})};
-      } else if (target_ti.isStandardBufferPackaging()) {
+      } else {
         if (agg_expr) {
           throw std::runtime_error(
               "Using array[] operator as argument to an aggregate operator is not "
               "supported");
         }
+        CHECK(func_expr || arr_expr);
+        if (dynamic_cast<const Analyzer::FunctionOper*>(target_expr)) {
+          CHECK_EQ(size_t(1), target_lvs.size());
+
+          const auto target_lv = LL_BUILDER.CreateLoad(target_lvs[0]);
+
+          // const auto target_lv_type = target_lvs[0]->getType();
+          // CHECK(target_lv_type->isStructTy());
+          // CHECK_EQ(target_lv_type->getNumContainedTypes(), 3u);
+          const auto i8p_ty = llvm::PointerType::get(
+              get_int_type(8, executor_->cgen_state_->context_), 0);
+          const auto ptr = LL_BUILDER.CreatePointerCast(
+              LL_BUILDER.CreateExtractValue(target_lv, 0), i8p_ty);
+          const auto size = LL_BUILDER.CreateExtractValue(target_lv, 1);
+          const auto null_flag = LL_BUILDER.CreateExtractValue(target_lv, 2);
+
+          const auto nullcheck_ok_bb = llvm::BasicBlock::Create(
+              LL_CONTEXT, "arr_nullcheck_ok_bb", executor_->cgen_state_->row_func_);
+          const auto nullcheck_fail_bb = llvm::BasicBlock::Create(
+              LL_CONTEXT, "arr_nullcheck_fail_bb", executor_->cgen_state_->row_func_);
+
+          // TODO(adb): probably better to zext the bool
+          const auto nullcheck = LL_BUILDER.CreateICmpEQ(
+              null_flag, executor_->cgen_state_->llInt(static_cast<int8_t>(1)));
+          LL_BUILDER.CreateCondBr(nullcheck, nullcheck_fail_bb, nullcheck_ok_bb);
+
+          const auto ret_bb = llvm::BasicBlock::Create(
+              LL_CONTEXT, "arr_return", executor_->cgen_state_->row_func_);
+          LL_BUILDER.SetInsertPoint(ret_bb);
+          auto result_phi = LL_BUILDER.CreatePHI(i8p_ty, 2, "array_ptr_return");
+          result_phi->addIncoming(ptr, nullcheck_ok_bb);
+
+          const auto null_arr_sentinel = LL_BUILDER.CreateIntToPtr(
+              executor_->cgen_state_->llInt(static_cast<int8_t>(0)), i8p_ty);
+          result_phi->addIncoming(null_arr_sentinel, nullcheck_fail_bb);
+
+          LL_BUILDER.SetInsertPoint(nullcheck_ok_bb);
+          executor_->cgen_state_->emitExternalCall(
+              "register_buffer_with_executor_rsm",
+              llvm::Type::getVoidTy(executor_->cgen_state_->context_),
+              {executor_->cgen_state_->llInt(reinterpret_cast<int64_t>(executor_)), ptr});
+          LL_BUILDER.CreateBr(ret_bb);
+
+          LL_BUILDER.SetInsertPoint(nullcheck_fail_bb);
+          LL_BUILDER.CreateBr(ret_bb);
+
+          LL_BUILDER.SetInsertPoint(ret_bb);
+
+          return {result_phi, size};
+        }
+        CHECK_EQ(size_t(2), target_lvs.size());
         return {target_lvs[0], target_lvs[1]};
       }
     }
@@ -1857,6 +1940,14 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
 llvm::Value* GroupByAndAggregate::emitCall(const std::string& fname,
                                            const std::vector<llvm::Value*>& args) {
   return executor_->cgen_state_->emitCall(fname, args);
+}
+
+void GroupByAndAggregate::checkErrorCode(llvm::Value* retCode) {
+  auto zero_const = llvm::ConstantInt::get(retCode->getType(), 0, true);
+  auto rc_check_condition = executor_->cgen_state_->ir_builder_.CreateICmp(
+      llvm::ICmpInst::ICMP_EQ, retCode, zero_const);
+
+  executor_->cgen_state_->emitErrorCheck(rc_check_condition, retCode, "rc");
 }
 
 #undef ROW_FUNC

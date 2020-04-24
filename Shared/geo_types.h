@@ -161,6 +161,13 @@ class GeoTypesFactory {
                             std::vector<std::vector<int>>& poly_rings_column,
                             const bool promote_poly_to_mpoly = false);
 
+  static void getNullGeoColumns(SQLTypeInfo& ti,
+                                std::vector<double>& coords,
+                                std::vector<double>& bounds,
+                                std::vector<int>& ring_sizes,
+                                std::vector<int>& poly_rings,
+                                const bool promote_poly_to_mpoly = false);
+
  private:
   static std::unique_ptr<Geo_namespace::GeoBase> createGeoTypeImpl(
       OGRGeometry* geom,

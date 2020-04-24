@@ -19,16 +19,24 @@
 #include <boost/graph/topological_sort.hpp>
 
 #include "QueryEngine/GroupByAndAggregate.h"
-#include "QueryEngine/RelAlgAbstractInterpreter.h"
+#include "QueryEngine/RelAlgDagBuilder.h"
 
-ExecutionResult::ExecutionResult(const std::shared_ptr<ResultSet>& rows,
+ExecutionResult::ExecutionResult(const ResultSetPtr& rows,
                                  const std::vector<TargetMetaInfo>& targets_meta)
-    : result_(rows), targets_meta_(targets_meta), filter_push_down_enabled_(false) {}
+    : results_(rows), targets_meta_(targets_meta), filter_push_down_enabled_(false) {}
 
 ExecutionResult::ExecutionResult(ResultSetPtr&& result,
                                  const std::vector<TargetMetaInfo>& targets_meta)
-    : targets_meta_(targets_meta), filter_push_down_enabled_(false) {
-  result_ = std::move(result);
+    : results_(result), targets_meta_(targets_meta), filter_push_down_enabled_(false) {
+}
+
+ExecutionResult::ExecutionResult(const TemporaryTable& results,
+                                 const std::vector<TargetMetaInfo>& targets_meta)
+    : results_(results), targets_meta_(targets_meta), filter_push_down_enabled_(false) {}
+
+ExecutionResult::ExecutionResult(TemporaryTable&& results,
+                                 const std::vector<TargetMetaInfo>& targets_meta)
+    : results_(results), targets_meta_(targets_meta), filter_push_down_enabled_(false) {
 }
 
 ExecutionResult::ExecutionResult(const ExecutionResult& that)
@@ -39,7 +47,7 @@ ExecutionResult::ExecutionResult(const ExecutionResult& that)
       (filter_push_down_enabled_ && pushed_down_filter_info_.empty())) {
     return;
   }
-  result_ = that.result_;
+  results_ = that.results_;
 }
 
 ExecutionResult::ExecutionResult(ExecutionResult&& that)
@@ -50,7 +58,7 @@ ExecutionResult::ExecutionResult(ExecutionResult&& that)
       (filter_push_down_enabled_ && pushed_down_filter_info_.empty())) {
     return;
   }
-  result_ = std::move(that.result_);
+  results_ = std::move(that.results_);
 }
 
 ExecutionResult::ExecutionResult(
@@ -66,7 +74,7 @@ ExecutionResult& ExecutionResult::operator=(const ExecutionResult& that) {
     filter_push_down_enabled_ = that.filter_push_down_enabled_;
     return *this;
   }
-  result_ = that.result_;
+  results_ = that.results_;
   targets_meta_ = that.targets_meta_;
   return *this;
 }
@@ -131,12 +139,20 @@ DAG build_dag(const RelAlgNode* sink) {
     }
 
     const auto input_num = node->inputCount();
-    CHECK(input_num == 1 ||
-          (dynamic_cast<const RelLogicalValues*>(node) && input_num == 0) ||
-          (dynamic_cast<const RelModify*>(node) && input_num == 1) ||
-          (input_num == 2 && (dynamic_cast<const RelJoin*>(node) ||
-                              dynamic_cast<const RelLeftDeepInnerJoin*>(node))) ||
-          (input_num > 2 && (dynamic_cast<const RelLeftDeepInnerJoin*>(node))));
+    switch (input_num) {
+      case 0:
+        CHECK(dynamic_cast<const RelLogicalValues*>(node));
+      case 1:
+        break;
+      case 2:
+        CHECK(dynamic_cast<const RelJoin*>(node) ||
+              dynamic_cast<const RelLeftDeepInnerJoin*>(node) ||
+              dynamic_cast<const RelLogicalUnion*>(node));
+        break;
+      default:
+        CHECK(dynamic_cast<const RelLeftDeepInnerJoin*>(node) ||
+              dynamic_cast<const RelLogicalUnion*>(node));
+    }
     for (size_t i = 0; i < input_num; ++i) {
       const auto input = node->getInput(i);
       CHECK(input);
@@ -218,19 +234,22 @@ RaExecutionDesc* RaExecutionSequence::next() {
       scan_count_++;
       continue;
     }
+    if (dynamic_cast<const RelTableFunction*>(node)) {
+      table_functions_++;
+    }
     descs_.emplace_back(std::make_unique<RaExecutionDesc>(node));
     return descs_.back().get();
   }
   return nullptr;
 }
 
-ssize_t RaExecutionSequence::nextStepId(const bool after_reduction) const {
-  if (after_reduction) {
+ssize_t RaExecutionSequence::nextStepId(const bool after_broadcast) const {
+  if (after_broadcast) {
     if (current_vertex_ == ordering_.size()) {
       return -1;
     }
-    const auto steps_to_next_reduction = static_cast<ssize_t>(stepsToNextReduction());
-    return static_cast<ssize_t>(descs_.size()) + steps_to_next_reduction;
+    const auto steps_to_next_broadcast = static_cast<ssize_t>(stepsToNextBroadcast());
+    return static_cast<ssize_t>(descs_.size()) + steps_to_next_broadcast;
   } else {
     return current_vertex_ == ordering_.size() ? -1 : descs_.size();
   }
@@ -245,7 +264,7 @@ bool RaExecutionSequence::executionFinished() const {
     if (next_step_id < 0 ||
         (static_cast<size_t>(next_step_id) == totalDescriptorsCount())) {
       // One step remains (the current vertex), or all remaining steps can be executed
-      // without another reduction
+      // without another broadcast (i.e. on the aggregator)
       return true;
     }
   }
@@ -270,8 +289,8 @@ size_t RaExecutionSequence::totalDescriptorsCount() const {
   return num_descriptors;
 }
 
-size_t RaExecutionSequence::stepsToNextReduction() const {
-  size_t steps_to_next_reduction = 0;
+size_t RaExecutionSequence::stepsToNextBroadcast() const {
+  size_t steps_to_next_broadcast = 0;
   auto crt_vertex = current_vertex_;
   while (crt_vertex < ordering_.size()) {
     auto vert = ordering_[crt_vertex++];
@@ -284,14 +303,14 @@ size_t RaExecutionSequence::stepsToNextReduction() const {
         // Force the parent node of the RelLeftDeepInnerJoin to run on the aggregator.
         // Note that crt_vertex has already been incremented once above for the join node
         // -- increment it again to account for the parent node of the join
-        ++steps_to_next_reduction;
+        ++steps_to_next_broadcast;
         ++crt_vertex;
         continue;
       } else {
         CHECK_EQ(crt_vertex, ordering_.size() - 1);
         // If the join node parent is the last node in the tree, run all remaining steps
         // on the aggregator
-        return ++steps_to_next_reduction;
+        return ++steps_to_next_broadcast;
       }
     }
     if (auto sort = dynamic_cast<const RelSort*>(node)) {
@@ -299,20 +318,26 @@ size_t RaExecutionSequence::stepsToNextReduction() const {
       node = sort->getInput(0);
     }
     if (dynamic_cast<const RelScan*>(node)) {
-      return steps_to_next_reduction;
+      return steps_to_next_broadcast;
     }
     if (dynamic_cast<const RelModify*>(node)) {
       // Modify runs on the leaf automatically, run the same node as a noop on the
       // aggregator
-      ++steps_to_next_reduction;
+      ++steps_to_next_broadcast;
       continue;
+    }
+    if (auto project = dynamic_cast<const RelProject*>(node)) {
+      if (project->hasWindowFunctionExpr()) {
+        ++steps_to_next_broadcast;
+        continue;
+      }
     }
     for (size_t input_idx = 0; input_idx < node->inputCount(); input_idx++) {
       if (dynamic_cast<const RelScan*>(node->getInput(input_idx))) {
-        return steps_to_next_reduction;
+        return steps_to_next_broadcast;
       }
     }
-    ++steps_to_next_reduction;
+    ++steps_to_next_broadcast;
   }
-  return steps_to_next_reduction;
+  return steps_to_next_broadcast;
 }

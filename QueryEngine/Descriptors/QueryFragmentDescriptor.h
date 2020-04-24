@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -66,7 +67,8 @@ class QueryFragmentDescriptor {
   QueryFragmentDescriptor(const RelAlgExecutionUnit& ra_exe_unit,
                           const std::vector<InputTableInfo>& query_infos,
                           const std::vector<Data_Namespace::MemoryInfo>& gpu_mem_infos,
-                          const double gpu_input_mem_limit_percent);
+                          const double gpu_input_mem_limit_percent,
+                          const std::vector<size_t> allowed_outer_fragment_indices);
 
   static void computeAllTablesFragments(
       std::map<int, const TableFragments*>& all_tables_fragments,
@@ -126,7 +128,6 @@ class QueryFragmentDescriptor {
           dispatch_finished = false;
           const auto& execution_kernel = device_itr.second[kernel_idx++];
           f(device_itr.first, execution_kernel.fragments, rowid_lookup_key_);
-
           if (terminateDispatchMaybe(tuple_count, ra_exe_unit, execution_kernel)) {
             return;
           }
@@ -140,6 +141,7 @@ class QueryFragmentDescriptor {
   }
 
  protected:
+  std::vector<size_t> allowed_outer_fragment_indices_;
   size_t outer_fragments_size_ = 0;
   int64_t rowid_lookup_key_ = -1;
 
@@ -150,6 +152,12 @@ class QueryFragmentDescriptor {
   double gpu_input_mem_limit_percent_;
   std::map<size_t, size_t> tuple_count_per_device_;
   std::map<size_t, size_t> available_gpu_mem_bytes_;
+
+  void buildFragmentPerKernelMapForUnion(const RelAlgExecutionUnit& ra_exe_unit,
+                                         const std::vector<uint64_t>& frag_offsets,
+                                         const int device_count,
+                                         const ExecutorDeviceType& device_type,
+                                         Executor* executor);
 
   void buildFragmentPerKernelMap(const RelAlgExecutionUnit& ra_exe_unit,
                                  const std::vector<uint64_t>& frag_offsets,
@@ -172,5 +180,7 @@ class QueryFragmentDescriptor {
                               const int device_id,
                               const size_t num_cols);
 };
+
+std::ostream& operator<<(std::ostream&, FragmentsPerTable const&);
 
 #endif  // QUERYENGINE_QUERYFRAGMENTDESCRIPTOR_H

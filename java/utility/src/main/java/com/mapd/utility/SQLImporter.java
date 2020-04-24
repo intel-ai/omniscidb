@@ -19,14 +19,8 @@ import static java.lang.Math.pow;
 import static java.lang.System.exit;
 
 import com.mapd.common.SockTransportProperties;
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumn;
-import com.mapd.thrift.server.TColumnData;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TQueryResult;
-import com.mapd.thrift.server.TTableDetails;
 import com.mapd.utility.db_vendors.Db_vendor_types;
+import com.omnisci.thrift.server.*;
 
 import org.apache.commons.cli.*;
 import org.apache.thrift.TException;
@@ -305,7 +299,7 @@ class SQLImporter_args {
 
 public class SQLImporter {
   protected String session = null;
-  protected MapD.Client client = null;
+  protected OmniSci.Client client = null;
   private CommandLine cmd = null;
   final static Logger LOGGER = LoggerFactory.getLogger(SQLImporter.class);
   private DateTimeUtils dateTimeUtils = (milliseconds) -> {
@@ -436,8 +430,8 @@ public class SQLImporter {
     } catch (SQLException se) {
       LOGGER.error("SQLException - " + se.toString());
       se.printStackTrace();
-    } catch (TMapDException ex) {
-      LOGGER.error("TMapDException - " + ex.toString());
+    } catch (TOmniSciException ex) {
+      LOGGER.error("TOmniSciException - " + ex.toString());
       ex.printStackTrace();
     } catch (TException ex) {
       LOGGER.error("TException failed - " + ex.toString());
@@ -507,30 +501,124 @@ public class SQLImporter {
         createMapDTable(otherdb_conn, md);
       } else {
         List<TColumnType> columnInfo = getColumnInfo(tName);
-        // table exists lets check it has same number of columns
-
-        if (md.getColumnCount() != columnInfo.size()) {
-          LOGGER.error("Table sizes do not match - OmniSci " + columnInfo.size()
-                  + " versus Select " + md.getColumnCount());
-          exit(1);
-        }
-        // table exists lets check it is same layout - check names will do for now
-        // Note weird start from 1 and reduce index by one is due to sql metatdata
-        // beinging with 1 not 0
-        for (int colNum = 1; colNum <= columnInfo.size(); colNum++) {
-          if (!columnInfo.get(colNum - 1)
-                          .col_name.equalsIgnoreCase(md.getColumnName(colNum))) {
-            LOGGER.error(
-                    "OmniSci Table does not have matching column in same order for column number"
-                    + colNum + " OmniSci column name is "
-                    + columnInfo.get(colNum - 1).col_name + " versus Select "
-                    + md.getColumnName(colNum));
-            exit(1);
-          }
-        }
+        verifyColumnSignaturesMatch(otherdb_conn, columnInfo, md);
       }
     } else {
       createMapDTable(otherdb_conn, md);
+    }
+  }
+
+  private void verifyColumnSignaturesMatch(Connection otherdb_conn,
+          List<TColumnType> dstColumns,
+          ResultSetMetaData srcColumns) throws SQLException {
+    if (srcColumns.getColumnCount() != dstColumns.size()) {
+      LOGGER.error("Table sizes do not match: Destination " + dstColumns.size()
+              + " versus Source " + srcColumns.getColumnCount());
+      exit(1);
+    }
+    for (int i = 1; i <= dstColumns.size(); ++i) {
+      if (!dstColumns.get(i - 1).getCol_name().equalsIgnoreCase(
+                  srcColumns.getColumnName(i))) {
+        LOGGER.error(
+                "Destination table does not have matching column in same order for column number"
+                + i + " destination column name is " + dstColumns.get(i - 1).col_name
+                + " versus Select " + srcColumns.getColumnName(i));
+        exit(1);
+      }
+      TDatumType dstType = dstColumns.get(i - 1).getCol_type().getType();
+      int dstPrecision = dstColumns.get(i - 1).getCol_type().getPrecision();
+      int dstScale = dstColumns.get(i - 1).getCol_type().getScale();
+      int srcType = srcColumns.getColumnType(i);
+      int srcPrecision = srcColumns.getPrecision(i);
+      int srcScale = srcColumns.getScale(i);
+
+      boolean match = false;
+      switch (srcType) {
+        case java.sql.Types.TINYINT:
+          match |= dstType == TDatumType.TINYINT;
+          // NOTE: it's okay to import smaller type to a bigger one,
+          // so we just fall through and try to match the next type.
+          // But the order of case statements is important here!
+        case java.sql.Types.SMALLINT:
+          match |= dstType == TDatumType.SMALLINT;
+        case java.sql.Types.INTEGER:
+          match |= dstType == TDatumType.INT;
+        case java.sql.Types.BIGINT:
+          match |= dstType == TDatumType.BIGINT;
+          break;
+        case java.sql.Types.DECIMAL:
+        case java.sql.Types.NUMERIC:
+          match = dstType == TDatumType.DECIMAL && dstPrecision == srcPrecision
+                  && dstScale == srcScale;
+          break;
+        case java.sql.Types.FLOAT:
+        case java.sql.Types.REAL:
+          match |= dstType == TDatumType.FLOAT;
+          // Fall through and try double
+        case java.sql.Types.DOUBLE:
+          match |= dstType == TDatumType.DOUBLE;
+          break;
+        case java.sql.Types.TIME:
+          match = dstType == TDatumType.TIME;
+          break;
+        case java.sql.Types.TIMESTAMP:
+          match = dstType == TDatumType.TIMESTAMP;
+          break;
+        case java.sql.Types.DATE:
+          match = dstType == TDatumType.DATE;
+          break;
+        case java.sql.Types.BOOLEAN:
+        case java.sql.Types
+                .BIT: // deal with postgres treating boolean as bit... this will bite me
+          match = dstType == TDatumType.BOOL;
+          break;
+        case java.sql.Types.NVARCHAR:
+        case java.sql.Types.VARCHAR:
+        case java.sql.Types.NCHAR:
+        case java.sql.Types.CHAR:
+        case java.sql.Types.LONGVARCHAR:
+        case java.sql.Types.LONGNVARCHAR:
+          match = dstType == TDatumType.STR;
+          break;
+        case java.sql.Types.OTHER:
+          // NOTE: I ignore subtypes (geography vs geopetry vs none) here just because it
+          // makes no difference for OmniSciDB at the moment
+          Db_vendor_types.GisType gisType =
+                  vendor_types.find_gis_type(otherdb_conn, srcColumns, i);
+          if (gisType.srid != dstScale) {
+            match = false;
+            break;
+          }
+          switch (dstType) {
+            case POINT:
+              match = gisType.type.equalsIgnoreCase("POINT");
+              break;
+            case LINESTRING:
+              match = gisType.type.equalsIgnoreCase("LINESTRING");
+              break;
+            case POLYGON:
+              match = gisType.type.equalsIgnoreCase("POLYGON");
+              break;
+            case MULTIPOLYGON:
+              match = gisType.type.equalsIgnoreCase("MULTIPOLYGON");
+              break;
+            default:
+              LOGGER.error("Column type " + JDBCType.valueOf(srcType).getName()
+                      + " not Supported");
+              exit(1);
+          }
+          break;
+        default:
+          LOGGER.error("Column type " + JDBCType.valueOf(srcType).getName()
+                  + " not Supported");
+          exit(1);
+      }
+      if (!match) {
+        LOGGER.error("Source and destination types for column "
+                + srcColumns.getColumnName(i)
+                + " do not match. Please make sure that type, precision and scale are exactly the same");
+        exit(1);
+      }
     }
   }
 
@@ -551,7 +639,9 @@ public class SQLImporter {
         sb.append(metaData.getColumnName(i)).append(" ");
         int col_type = metaData.getColumnType(i);
         if (col_type == java.sql.Types.OTHER) {
-          sb.append(vendor_types.find_gis_type(otherdb_conn, metaData, i));
+          Db_vendor_types.GisType type =
+                  vendor_types.find_gis_type(otherdb_conn, metaData, i);
+          sb.append(Db_vendor_types.gis_type_to_str(type));
         } else {
           sb.append(getColType(metaData.getColumnType(i),
                   metaData.getPrecision(i),
@@ -600,7 +690,7 @@ public class SQLImporter {
         protocol = new TBinaryProtocol(transport);
       }
 
-      client = new MapD.Client(protocol);
+      client = new OmniSci.Client(protocol);
       // This if will be useless until PKI signon
       if (cmd.hasOption("user")) {
         session = client.connect(cmd.getOptionValue("user", "admin"),
@@ -612,7 +702,7 @@ public class SQLImporter {
     } catch (TTransportException ex) {
       LOGGER.error("Connection failed - " + ex.toString());
       exit(1);
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       LOGGER.error("Connection failed - " + ex.toString());
       exit(2);
     } catch (TException ex) {
@@ -630,7 +720,7 @@ public class SQLImporter {
     try {
       TTableDetails table_details = client.get_table_details(session, tName);
       row_descriptor = table_details.row_desc;
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       LOGGER.error("column check failed - " + ex.toString());
       exit(3);
     } catch (TException ex) {
@@ -649,7 +739,7 @@ public class SQLImporter {
           return true;
         }
       }
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       LOGGER.error("Table check failed - " + ex.toString());
       exit(3);
     } catch (TException ex) {
@@ -664,7 +754,7 @@ public class SQLImporter {
 
     try {
       TQueryResult sqlResult = client.sql_execute(session, sql + ";", true, null, -1, -1);
-    } catch (TMapDException ex) {
+    } catch (TOmniSciException ex) {
       LOGGER.error("SQL Execute failed - " + ex.toString());
       exit(1);
     } catch (TException ex) {
@@ -926,14 +1016,9 @@ public class SQLImporter {
       case java.sql.Types.CHAR:
       case java.sql.Types.LONGVARCHAR:
       case java.sql.Types.LONGNVARCHAR:
-        col.data.str_col.clear();
-        break;
-
-      // Handle WKT for geo columns
       case java.sql.Types.OTHER:
         col.data.str_col.clear();
         break;
-
       default:
         throw new AssertionError("Column type " + md.getColumnType(i) + " not Supported");
     }

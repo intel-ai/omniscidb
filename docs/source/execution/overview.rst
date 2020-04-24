@@ -7,13 +7,13 @@ The OmniSciDB *Query Engine* refers to the system components which manage query 
     :align: center
 
     @startuml
-    Client -> MapDHandler: Send SQL String
+    Client -> DBHandler: Send SQL String
 
-    MapDHandler -> Calcite: Parse SQL String
+    DBHandler -> Calcite: Parse SQL String
 
-    Calcite -> MapDHandler: Return Optimized RA
+    Calcite -> DBHandler: Return Optimized RA
 
-    MapDHandler -> RelAlgExecutor: Execute RA Query
+    DBHandler -> RelAlgExecutor: Execute RA Query
 
     group RelAlgExecutor
         loop until all query steps are processed
@@ -21,16 +21,16 @@ The OmniSciDB *Query Engine* refers to the system components which manage query 
             Executor -> RelAlgExecutor: Return Result Set
     end
 
-    RelAlgExecutor -> MapDHandler: Return Result Set
+    RelAlgExecutor -> DBHandler: Return Result Set
 
-    MapDHandler -> Client: Return Serialized Results
+    DBHandler -> Client: Return Serialized Results
     
     @enduml
 
-Request Handler (MapDHandler)
+Request Handler (DBHandler)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``MapDHandler`` class manages client interactions with the server. Clients initiate a SQL query by passing the query string and various parameters to the ``sql_execute`` endpoint. The handler manages the ``RelAlgExecutor`` for the duration of the query, passes the SQL string to Calcite for parsing and optimization, and handles serializing and returning results to the client.
+The ``DBHandler`` class manages client interactions with the server. Clients initiate a SQL query by passing the query string and various parameters to the ``sql_execute`` endpoint. The handler manages the ``RelAlgExecutor`` for the duration of the query, passes the SQL string to Calcite for parsing and optimization, and handles serializing and returning results to the client.
 
 Apache Calcite 
 ~~~~~~~~~~~~~~~
@@ -44,19 +44,19 @@ OmniSciDB uses Apache Calcite for frontline query parsing and cost-based optimiz
 Relational Algebra Executor
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``RelAlgExecutor`` manages the execution of a relational algebra query. The input to the ``RelAlgExecutor`` is a relational algebra tree serialized in a JSON string. The ``RelAlgExecutor`` manages the deserialization of the tree and its converison into a query plan, OmniSciDB specific query plan optimizations, translating each node in the query plan into an abstract syntax tree (AST) for code generation, and finally creating a work unit for each AST and passing the work unit to the ``Executor`` for kernel compilation and execution. While OmniSciDB attempts to consolidate queries to minimize the number of query steps (see doc:`./optimization`), some queries may have multiple intermediate steps. The ``RelAlgExecutor`` manages execution for each query step and stores the state of previous steps for use in later steps. 
+The ``RelAlgExecutor`` manages the execution of a relational algebra query. The input to the ``RelAlgExecutor`` is a relational algebra tree serialized in a JSON string, or an already deserialized tree via :cpp:class:`RelAlgDagBuilder`. The ``RelAlgExecutor`` converts the RA DAG into a query plan, optimizes OmniSciDB specific query plans, translates each node in the query plan into an abstract syntax tree (AST) for code generation, and finally creates a work unit for each AST and passing the work unit to the ``Executor`` for kernel compilation and execution. While OmniSciDB attempts to consolidate queries to minimize the number of query steps (see doc:`./optimization`), some queries may have multiple intermediate steps. The ``RelAlgExecutor`` manages execution for each query step and stores the state of previous steps for use in later steps. 
 
 .. uml::
     :align: center
 
     @startuml
-    RelAlgExecutor -> RelAlgAbstractInterpreter: Deserialize RA 
+    RelAlgExecutor -> RelAlgDagBuilder: Deserialize RA 
 
-    RelAlgAbstractInterpreter -> RelAlgOptimizer: OmniSciDB Specific RA Tree Optimization
+    RelAlgDagBuilder -> RelAlgOptimizer: OmniSciDB Specific RA Tree Optimization
 
-    RelAlgOptimizer -> RelAlgAbstractInterpreter: Return Optimized RA Tree
+    RelAlgOptimizer -> RelAlgDagBuilder: Return Optimized RA Tree
 
-    RelAlgAbstractInterpreter -> RelAlgExecutor: Return Optimized RA Tree
+    RelAlgDagBuilder -> RelAlgExecutor: Return Optimized RA Tree
 
     group Per Query Step
 
@@ -72,15 +72,15 @@ The ``RelAlgExecutor`` manages the execution of a relational algebra query. The 
     
     @enduml
 
-Relational Algebra Abstract Interpreter and Optimizer
+Relational Algebra Dag Builder and Optimizer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The ``RelAlgAbstractInterpreter`` deserializes the JSON string containing the optimized relational algebra tree from Calcite. The interpreter creates a ``RelAlgNode`` object for each top-level relational algebra node. Each ``RelAlgNode`` is made up of ``Rex`` (relational algebra :term:`expression`) nodes. The interpreter also manages OmniSciDB specific query optimization (see :doc:`./optimizer`). After optimization, each RA node in the tree is a discrete unit of execution, typically referred to as a **query step**.
+The :cpp:class:`RelAlgDagBuilder` deserializes the JSON string containing the optimized relational algebra tree from Calcite. The builder creates a ``RelAlgNode`` object for each top-level relational algebra node. Each ``RelAlgNode`` is made up of ``Rex`` (relational algebra :term:`expression`) nodes. The builder also manages OmniSciDB specific query optimizations (see :doc:`./optimizer`). After optimization, each RA node in the DAG is a discrete unit of execution, typically referred to as a **query step**.
 
 Relational Algebra Translator
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Once an optimized relational algebra tree has been assembled, each top-level ``RelAlgNode`` is executed. The ``RelAlgTranslator`` is the first step in node execution. To execute a query step, the RA node must be converted into an abstract syntax tree (AST). The AST drives code generation, building an execution kernel specified by the type of the RA node and its expressions. The input to the ``RelAlgTranslator`` is a ``RelAlgNode``, and the output of the ``RelAlgTranslator`` is a set of ``Analyzer`` nodes specifying the inputs, outputs, filters, and expressions required for the query step. 
+Once an optimized relational algebra DAG has been assembled, each top-level ``RelAlgNode`` is executed. The ``RelAlgTranslator`` is the first step in node execution. To execute a query step, the RA node must be converted into an abstract syntax tree (AST). The AST drives code generation, building an execution kernel specified by the type of the RA node and its expressions. The input to the ``RelAlgTranslator`` is a ``RelAlgNode``, and the output of the ``RelAlgTranslator`` is a set of ``Analyzer`` nodes specifying the inputs, outputs, filters, and expressions required for the query step. 
 
 Executor
 ~~~~~~~~

@@ -15,12 +15,12 @@
  */
 package com.omnisci.jdbc;
 
-import com.mapd.thrift.server.MapD;
-import com.mapd.thrift.server.TColumnType;
-import com.mapd.thrift.server.TMapDException;
-import com.mapd.thrift.server.TStringRow;
-import com.mapd.thrift.server.TStringValue;
-import com.mapd.thrift.server.TTableDetails;
+import com.omnisci.thrift.server.OmniSci;
+import com.omnisci.thrift.server.TColumnType;
+import com.omnisci.thrift.server.TOmniSciException;
+import com.omnisci.thrift.server.TStringRow;
+import com.omnisci.thrift.server.TStringValue;
+import com.omnisci.thrift.server.TTableDetails;
 
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
@@ -47,6 +47,7 @@ import java.sql.SQLWarning;
 import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -72,7 +73,7 @@ class OmniSciPreparedStatement implements PreparedStatement {
   private int fieldsOrder[];
   private int repCount;
   private String session;
-  private MapD.Client client;
+  private OmniSci.Client client;
   private OmniSciStatement stmt = null;
   private boolean isInsert = false;
   private boolean isNewBatch = true;
@@ -81,8 +82,13 @@ class OmniSciPreparedStatement implements PreparedStatement {
   private static final Pattern REGEX_PATTERN = Pattern.compile("(?i)\\s+INTO\\s+(\\w+)");
   private static final Pattern REGEX_LOF_PATTERN = Pattern.compile(
           "(?i)\\s*insert\\s+into\\s+[\\w:\\.]+\\s*\\(([\\w:\\s:\\,:\\']+)\\)[\\w:\\s]+\\(");
+  // this regex ignores all multi- and single-line comments and whitespaces at the
+  // beginning of a query and checks if the first meaningful word is SELECT
+  private static final Pattern REGEX_IS_SELECT_PATTERN =
+          Pattern.compile("^(?:\\s|--.*?\\R|/\\*[\\S\\s]*?\\*/|\\s*)*\\s*select[\\S\\s]*",
+                  Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
 
-  OmniSciPreparedStatement(String sql, String session, MapD.Client client) {
+  OmniSciPreparedStatement(String sql, String session, OmniSci.Client client) {
     MAPDLOGGER.debug("Entered");
     currentSQL = sql;
     this.client = client;
@@ -143,6 +149,11 @@ class OmniSciPreparedStatement implements PreparedStatement {
     MAPDLOGGER.debug("Query is now " + qsql);
     repCount = 0; // reset the parameters
     return qsql;
+  }
+
+  private boolean isSelect() {
+    Matcher matcher = REGEX_IS_SELECT_PATTERN.matcher(currentSQL);
+    return matcher.matches();
   }
 
   @Override
@@ -458,10 +469,30 @@ class OmniSciPreparedStatement implements PreparedStatement {
   @Override
   public ResultSetMetaData getMetaData() throws SQLException {
     MAPDLOGGER.debug("Entered");
-    throw new UnsupportedOperationException("Not supported yet,"
-            + " line:" + new Throwable().getStackTrace()[0].getLineNumber()
-            + " class:" + new Throwable().getStackTrace()[0].getClassName()
-            + " method:" + new Throwable().getStackTrace()[0].getMethodName());
+    if (!isSelect()) {
+      return null;
+    }
+    if (stmt.getResultSet() != null) {
+      return stmt.getResultSet().getMetaData();
+    }
+    PreparedStatement ps = null;
+    try {
+      ps = new OmniSciPreparedStatement(currentSQL, session, client);
+      ps.setMaxRows(0);
+      for (int i = 1; i <= this.parmCount; ++i) {
+        ps.setNull(i, Types.NULL);
+      }
+      ResultSet rs = ps.executeQuery();
+      if (rs != null) {
+        return rs.getMetaData();
+      } else {
+        return null;
+      }
+    } finally {
+      if (ps != null) {
+        ps.close();
+      }
+    }
   }
 
   @Override
@@ -920,7 +951,7 @@ class OmniSciPreparedStatement implements PreparedStatement {
       try {
         // send the batch
         client.load_table(session, insertTableName, rows);
-      } catch (TMapDException ex) {
+      } catch (TOmniSciException ex) {
         throw new SQLException("executeBatch failed: " + ex.getError_msg());
       } catch (TException ex) {
         throw new SQLException("executeBatch failed: " + ex.toString());

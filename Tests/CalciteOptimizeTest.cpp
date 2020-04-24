@@ -8,7 +8,6 @@
 #include "../DataMgr/DataMgr.h"
 #include "../Parser/parser.h"
 #include "../QueryRunner/QueryRunner.h"
-#include "Shared/MapDParameters.h"
 #include "TestHelpers.h"
 #include "ThriftHandler/QueryState.h"
 #include "gen-cpp/CalciteServer.h"
@@ -25,7 +24,16 @@ inline void run_ddl_statement(const std::string& query) {
 }  // namespace
 
 struct ViewObject : testing::Test {
-  void setup_objects() {
+ protected:
+  void SetUp() override {
+    run_ddl_statement("DROP VIEW IF EXISTS view_view_table1;");
+    run_ddl_statement("DROP VIEW IF EXISTS view_table1;");
+    run_ddl_statement("DROP TABLE IF EXISTS table1");
+    run_ddl_statement("DROP VIEW IF EXISTS attribute_view");
+    run_ddl_statement("DROP VIEW IF EXISTS shape_view");
+    run_ddl_statement("DROP TABLE IF EXISTS shape_table");
+    run_ddl_statement("DROP TABLE IF EXISTS attribute_table");
+
     run_ddl_statement("CREATE TABLE table1(i1 integer, i2 integer);");
     run_ddl_statement("CREATE VIEW view_table1 AS SELECT i1, i2 FROM table1;");
     run_ddl_statement("CREATE VIEW view_view_table1 AS SELECT i1, i2 FROM view_table1;");
@@ -40,7 +48,7 @@ struct ViewObject : testing::Test {
         "CREATE VIEW shape_view AS select rowid, block_group_id from shape_table");
   }
 
-  void remove_objects() {
+  void TearDown() override {
     run_ddl_statement("DROP VIEW view_view_table1;");
     run_ddl_statement("DROP VIEW view_table1;");
     run_ddl_statement("DROP TABLE table1");
@@ -49,9 +57,6 @@ struct ViewObject : testing::Test {
     run_ddl_statement("DROP TABLE shape_table");
     run_ddl_statement("DROP TABLE attribute_table");
   }
-
-  explicit ViewObject() { setup_objects(); }
-  ~ViewObject() override { remove_objects(); }
 };
 
 TEST_F(ViewObject, BasicTest) {
@@ -60,17 +65,17 @@ TEST_F(ViewObject, BasicTest) {
 
   auto qs1 = QR::create_query_state(session, "select i1 from table1");
   TPlanResult tresult = g_calcite->process(
-      qs1->createQueryStateProxy(), qs1->getQueryStr(), {}, true, false, false);
+      qs1->createQueryStateProxy(), qs1->getQueryStr(), {}, true, false, false, true);
 
   auto qs2 = QR::create_query_state(session, "select i1 from view_view_table1");
   TPlanResult vresult = g_calcite->process(
-      qs2->createQueryStateProxy(), qs2->getQueryStr(), {}, true, false, false);
+      qs2->createQueryStateProxy(), qs2->getQueryStr(), {}, true, false, false, true);
 
   EXPECT_EQ(vresult.plan_result, tresult.plan_result);
 
   auto qs3 = QR::create_query_state(session, "select i1 from view_view_table1");
   TPlanResult ovresult = g_calcite->process(
-      qs3->createQueryStateProxy(), qs3->getQueryStr(), {}, true, false, true);
+      qs3->createQueryStateProxy(), qs3->getQueryStr(), {}, true, false, true, true);
 
   EXPECT_EQ(ovresult.plan_result, tresult.plan_result);
 
@@ -79,14 +84,14 @@ TEST_F(ViewObject, BasicTest) {
       "SELECT shape_table.rowid FROM shape_table, attribute_table WHERE "
       "shape_table.block_group_id = attribute_table.block_group_id");
   TPlanResult tab_result = g_calcite->process(
-      qs4->createQueryStateProxy(), qs4->getQueryStr(), {}, true, false, true);
+      qs4->createQueryStateProxy(), qs4->getQueryStr(), {}, true, false, true, true);
 
   auto qs5 = QR::create_query_state(
       session,
       "SELECT shape_view.rowid FROM shape_view, attribute_view WHERE "
       "shape_view.block_group_id = attribute_view.block_group_id");
   TPlanResult view_result = g_calcite->process(
-      qs5->createQueryStateProxy(), qs5->getQueryStr(), {}, true, false, true);
+      qs5->createQueryStateProxy(), qs5->getQueryStr(), {}, true, false, true, true);
   EXPECT_EQ(tab_result.plan_result, view_result.plan_result);
 }
 

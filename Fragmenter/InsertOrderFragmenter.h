@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,29 +18,25 @@
  * @file	InsertOrderFragmenter.h
  * @author	Todd Mostak <todd@mapd.com>
  */
-#ifndef INSERT_ORDER_FRAGMENTER_H
-#define INSERT_ORDER_FRAGMENTER_H
 
-#include "../Chunk/Chunk.h"
-#include "../DataMgr/MemoryLevel.h"
-#include "../QueryEngine/TargetValue.h"
-#include "../Shared/mapd_shared_mutex.h"
-#include "../Shared/types.h"
-#include "AbstractFragmenter.h"
+#pragma once
 
 #include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
+#include "Chunk/Chunk.h"
+#include "DataMgr/MemoryLevel.h"
+#include "FragmentDefaultValues.h"
+#include "Fragmenter/AbstractFragmenter.h"
+#include "QueryEngine/TargetValue.h"
+#include "Shared/mapd_shared_mutex.h"
+#include "Shared/types.h"
+
 namespace Data_Namespace {
 class DataMgr;
 }
-
-#define DEFAULT_FRAGMENT_ROWS 32000000     // in tuples
-#define DEFAULT_PAGE_SIZE 2097152          // in bytes
-#define DEFAULT_MAX_ROWS (1L) << 62        // in rows
-#define DEFAULT_MAX_CHUNK_SIZE 1073741824  // in bytes
 
 namespace Fragmenter_Namespace {
 
@@ -66,7 +62,8 @@ class InsertOrderFragmenter : public AbstractFragmenter {
       const size_t maxChunkSize = DEFAULT_MAX_CHUNK_SIZE,
       const size_t pageSize = DEFAULT_PAGE_SIZE /*default 1MB*/,
       const size_t maxRows = DEFAULT_MAX_ROWS,
-      const Data_Namespace::MemoryLevel defaultInsertLevel = Data_Namespace::DISK_LEVEL);
+      const Data_Namespace::MemoryLevel defaultInsertLevel = Data_Namespace::DISK_LEVEL,
+      const bool uses_foreign_storage = false);
 
   ~InsertOrderFragmenter() override;
   /**
@@ -94,6 +91,8 @@ class InsertOrderFragmenter : public AbstractFragmenter {
   void updateChunkStats(
       const ColumnDescriptor* cd,
       std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) override;
+
+  FragmentInfo* getFragmentInfo(const int fragment_id) const override;
 
   /**
    * @brief get fragmenter's id
@@ -176,11 +175,15 @@ class InsertOrderFragmenter : public AbstractFragmenter {
                               const FragmentInfo& fragment,
                               const Data_Namespace::MemoryLevel memory_level);
 
+  void dropColumns(const std::vector<int>& columnIds) override;
+
+  bool hasDeletedRows(const int delete_column_id) override;
+
  protected:
   std::vector<int> chunkKeyPrefix_;
   std::map<int, Chunk_NS::Chunk>
       columnMap_; /**< stores a map of column id to metadata about that column */
-  std::deque<FragmentInfo>
+  std::deque<std::unique_ptr<FragmentInfo>>
       fragmentInfoVec_; /**< data about each fragment stored - id and number of rows */
   // int currentInsertBufferFragmentId_;
   Data_Namespace::DataMgr* dataMgr_;
@@ -201,6 +204,7 @@ class InsertOrderFragmenter : public AbstractFragmenter {
       insertMutex_;  // to prevent race conditions on insert - only one insert statement
                      // should be going to a table at a time
   Data_Namespace::MemoryLevel defaultInsertLevel_;
+  const bool uses_foreign_storage_;
   bool hasMaterializedRowId_;
   int rowIdColId_;
   std::unordered_map<int, size_t> varLenColInfo_;
@@ -240,5 +244,3 @@ class InsertOrderFragmenter : public AbstractFragmenter {
 };
 
 }  // namespace Fragmenter_Namespace
-
-#endif  // INSERT_ORDER_FRAGMENTER_H

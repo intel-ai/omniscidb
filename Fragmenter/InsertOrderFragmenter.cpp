@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,22 +14,24 @@
  * limitations under the License.
  */
 
-#include "InsertOrderFragmenter.h"
+#include "Fragmenter/InsertOrderFragmenter.h"
+
+#include <algorithm>
 #include <boost/lexical_cast.hpp>
 #include <cassert>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <type_traits>
-#include "../DataMgr/AbstractBuffer.h"
-#include "../DataMgr/DataMgr.h"
-#include "../LockMgr/LockMgr.h"
-#include "../Shared/checked_alloc.h"
-#include "../Shared/thread_count.h"
-#include "Shared/Logger.h"
 
-#include <LockMgr/TableLockMgr.h>
+#include "DataMgr/AbstractBuffer.h"
+#include "DataMgr/DataMgr.h"
+#include "LockMgr/LockMgr.h"
+#include "Shared/Logger.h"
+#include "Shared/checked_alloc.h"
+#include "Shared/thread_count.h"
 
 #define DROP_FRAGMENT_FACTOR \
   0.97  // drop to 97% of max so we don't keep adding and dropping fragments
@@ -53,7 +55,8 @@ InsertOrderFragmenter::InsertOrderFragmenter(
     const size_t maxChunkSize,
     const size_t pageSize,
     const size_t maxRows,
-    const Data_Namespace::MemoryLevel defaultInsertLevel)
+    const Data_Namespace::MemoryLevel defaultInsertLevel,
+    const bool uses_foreign_storage)
     : chunkKeyPrefix_(chunkKeyPrefix)
     , dataMgr_(dataMgr)
     , catalog_(catalog)
@@ -67,6 +70,7 @@ InsertOrderFragmenter::InsertOrderFragmenter(
     , maxRows_(maxRows)
     , fragmenterType_("insert_order")
     , defaultInsertLevel_(defaultInsertLevel)
+    , uses_foreign_storage_(uses_foreign_storage)
     , hasMaterializedRowId_(false)
     , mutex_access_inmem_states(new std::mutex) {
   // Note that Fragmenter is not passed virtual columns and so should only
@@ -86,7 +90,8 @@ InsertOrderFragmenter::InsertOrderFragmenter(
 InsertOrderFragmenter::~InsertOrderFragmenter() {}
 
 void InsertOrderFragmenter::getChunkMetadata() {
-  if (defaultInsertLevel_ == Data_Namespace::MemoryLevel::DISK_LEVEL) {
+  if (uses_foreign_storage_ ||
+      defaultInsertLevel_ == Data_Namespace::MemoryLevel::DISK_LEVEL) {
     // memory-resident tables won't have anything on disk
     std::vector<std::pair<ChunkKey, ChunkMetadata>> chunk_metadata;
     dataMgr_->getChunkMetadataVecForKeyPrefix(chunk_metadata, chunkKeyPrefix_);
@@ -108,31 +113,34 @@ void InsertOrderFragmenter::getChunkMetadata() {
       int cur_fragment_id = chunk_itr->first[fragment_subkey_index];
 
       if (fragmentInfoVec_.empty() ||
-          cur_fragment_id != fragmentInfoVec_.back().fragmentId) {
+          cur_fragment_id != fragmentInfoVec_.back()->fragmentId) {
+        auto new_fragment_info = std::make_unique<Fragmenter_Namespace::FragmentInfo>();
+        CHECK(new_fragment_info);
         maxFragmentId_ = cur_fragment_id;
-        fragmentInfoVec_.emplace_back();
-        fragmentInfoVec_.back().fragmentId = cur_fragment_id;
-        fragmentInfoVec_.back().setPhysicalNumTuples(chunk_itr->second.numElements);
-        numTuples_ += fragmentInfoVec_.back().getPhysicalNumTuples();
+        new_fragment_info->fragmentId = cur_fragment_id;
+        new_fragment_info->setPhysicalNumTuples(chunk_itr->second.numElements);
+        numTuples_ += new_fragment_info->getPhysicalNumTuples();
         for (const auto level_size : dataMgr_->levelSizes_) {
-          fragmentInfoVec_.back().deviceIds.push_back(cur_fragment_id % level_size);
+          new_fragment_info->deviceIds.push_back(cur_fragment_id % level_size);
         }
-        fragmentInfoVec_.back().shadowNumTuples =
-            fragmentInfoVec_.back().getPhysicalNumTuples();
-        fragmentInfoVec_.back().physicalTableId = physicalTableId_;
-        fragmentInfoVec_.back().shard = shard_;
+        new_fragment_info->shadowNumTuples = new_fragment_info->getPhysicalNumTuples();
+        new_fragment_info->physicalTableId = physicalTableId_;
+        new_fragment_info->shard = shard_;
+        fragmentInfoVec_.emplace_back(std::move(new_fragment_info));
       } else {
         if (chunk_itr->second.numElements !=
-            fragmentInfoVec_.back().getPhysicalNumTuples()) {
-          throw std::runtime_error(
-              "Inconsistency in num tuples within fragment for table " +
-              std::to_string(physicalTableId_) + ", Column " +
-              std::to_string(cur_column_id) + ". Fragment Tuples: " +
-              std::to_string(fragmentInfoVec_.back().getPhysicalNumTuples()) +
-              ", Chunk Tuples: " + std::to_string(chunk_itr->second.numElements));
+            fragmentInfoVec_.back()->getPhysicalNumTuples()) {
+          LOG(FATAL) << "Inconsistency in num tuples within fragment for table " +
+                            std::to_string(physicalTableId_) + ", Column " +
+                            std::to_string(cur_column_id) + ". Fragment Tuples: " +
+                            std::to_string(
+                                fragmentInfoVec_.back()->getPhysicalNumTuples()) +
+                            ", Chunk Tuples: " +
+                            std::to_string(chunk_itr->second.numElements);
         }
       }
-      fragmentInfoVec_.back().setChunkMetadata(cur_column_id, chunk_itr->second);
+      CHECK(fragmentInfoVec_.back().get());
+      fragmentInfoVec_.back().get()->setChunkMetadata(cur_column_id, chunk_itr->second);
     }
   }
 
@@ -151,12 +159,13 @@ void InsertOrderFragmenter::getChunkMetadata() {
   // this is maximum number of rows assuming everything is fixed length
   maxFragmentRows_ = std::min(maxFragmentRows_, maxChunkSize_ / maxFixedColSize);
 
-  if (fragmentInfoVec_.size() > 0) {
+  if (!uses_foreign_storage_ && fragmentInfoVec_.size() > 0) {
     // Now need to get the insert buffers for each column - should be last
     // fragment
-    int lastFragmentId = fragmentInfoVec_.back().fragmentId;
+    int lastFragmentId = fragmentInfoVec_.back()->fragmentId;
+    // TODO: add accessor here for safe indexing
     int deviceId =
-        fragmentInfoVec_.back().deviceIds[static_cast<int>(defaultInsertLevel_)];
+        fragmentInfoVec_.back()->deviceIds[static_cast<int>(defaultInsertLevel_)];
     for (auto colIt = columnMap_.begin(); colIt != columnMap_.end(); ++colIt) {
       ChunkKey insertKey = chunkKeyPrefix_;  // database_id and table_id
       insertKey.push_back(colIt->first);     // column id
@@ -175,7 +184,7 @@ void InsertOrderFragmenter::dropFragmentsToSize(const size_t maxRows) {
   // b/c depends on insertLock around numTuples_
 
   // don't ever drop the only fragment!
-  if (numTuples_ == fragmentInfoVec_.back().getPhysicalNumTuples()) {
+  if (numTuples_ == fragmentInfoVec_.back()->getPhysicalNumTuples()) {
     return;
   }
 
@@ -185,8 +194,8 @@ void InsertOrderFragmenter::dropFragmentsToSize(const size_t maxRows) {
     size_t targetRows = maxRows * DROP_FRAGMENT_FACTOR;
     while (numTuples_ > targetRows) {
       CHECK_GT(fragmentInfoVec_.size(), size_t(0));
-      size_t numFragTuples = fragmentInfoVec_[0].getPhysicalNumTuples();
-      dropFragIds.push_back(fragmentInfoVec_[0].fragmentId);
+      size_t numFragTuples = fragmentInfoVec_[0]->getPhysicalNumTuples();
+      dropFragIds.push_back(fragmentInfoVec_[0]->fragmentId);
       fragmentInfoVec_.pop_front();
       CHECK_GE(numTuples_, numFragTuples);
       numTuples_ -= numFragTuples;
@@ -202,7 +211,7 @@ void InsertOrderFragmenter::deleteFragments(const vector<int>& dropFragIds) {
   // tableId while it's its physical tables that can come here when fragments overflow
   // during COPY. Locks on a logical table and its physical tables never intersect, which
   // means potential races. It'll be an overkill to resolve a logical table to physical
-  // tables in MapDHandler, ParseNode or other higher layers where the logical table is
+  // tables in DBHandler, ParseNode or other higher layers where the logical table is
   // locked with Table Read/Write locks; it's easier to lock the logical table of its
   // physical tables. A downside of this approach may be loss of parallel execution of
   // deleteFragments across physical tables. Because deleteFragments is a short in-memory
@@ -214,8 +223,8 @@ void InsertOrderFragmenter::deleteFragments(const vector<int>& dropFragIds) {
 
   // need to keep lock seq as TableLock >> fragmentInfoMutex_ or
   // SELECT and COPY may enter a deadlock
-  using namespace Lock_Namespace;
-  WriteLock delete_lock = TableLockMgr::getWriteLockForTable(chunkKeyPrefix);
+  const auto delete_lock =
+      lockmgr::TableDataLockMgr::getWriteLockForTable(chunkKeyPrefix);
 
   mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
 
@@ -233,6 +242,8 @@ void InsertOrderFragmenter::deleteFragments(const vector<int>& dropFragIds) {
 void InsertOrderFragmenter::updateChunkStats(
     const ColumnDescriptor* cd,
     std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) {
+  // synchronize concurrent accesses to fragmentInfoVec_
+  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
   /**
    * WARNING: This method is entirely unlocked. Higher level locks are expected to prevent
    * any table read or write during a chunk metadata update, since we need to modify
@@ -247,19 +258,19 @@ void InsertOrderFragmenter::updateChunkStats(
   const auto col_itr = columnMap_.find(column_id);
   CHECK(col_itr != columnMap_.end());
 
-  for (auto& fragment : fragmentInfoVec_) {
-    auto stats_itr = stats_map.find(fragment.fragmentId);
+  for (auto const& fragment : fragmentInfoVec_) {
+    auto stats_itr = stats_map.find(fragment->fragmentId);
     if (stats_itr != stats_map.end()) {
-      auto chunk_meta_it = fragment.getChunkMetadataMapPhysical().find(column_id);
-      CHECK(chunk_meta_it != fragment.getChunkMetadataMapPhysical().end());
+      auto chunk_meta_it = fragment->getChunkMetadataMapPhysical().find(column_id);
+      CHECK(chunk_meta_it != fragment->getChunkMetadataMapPhysical().end());
       ChunkKey chunk_key{catalog_->getCurrentDB().dbId,
                          physicalTableId_,
                          column_id,
-                         fragment.fragmentId};
+                         fragment->fragmentId};
       auto chunk = Chunk_NS::Chunk::getChunk(cd,
                                              &catalog_->getDataMgr(),
                                              chunk_key,
-                                             Data_Namespace::MemoryLevel::DISK_LEVEL,
+                                             defaultInsertLevel_,
                                              0,
                                              chunk_meta_it->second.numBytes,
                                              chunk_meta_it->second.numElements);
@@ -278,7 +289,9 @@ void InsertOrderFragmenter::updateChunkStats(
 
       const bool didResetStats = encoder->resetChunkStats(chunk_stats);
       // Use the logical type to display data, since the encoding should be ignored
-      const auto logical_ti = get_logical_type_info(cd->columnType);
+      const auto logical_ti = cd->columnType.is_dict_encoded_string()
+                                  ? SQLTypeInfo(kBIGINT)
+                                  : get_logical_type_info(cd->columnType);
       if (!didResetStats) {
         VLOG(3) << "Skipping chunk stats reset for " << showChunk(chunk_key);
         VLOG(3) << "Max: " << DatumToString(old_chunk_stats.max, logical_ti) << " -> "
@@ -301,16 +314,29 @@ void InsertOrderFragmenter::updateChunkStats(
       // Run through fillChunkStats to ensure any transformations to the raw metadata
       // values get applied (e.g. for date in days)
       encoder->getMetadata(new_metadata);
-      fragment.setChunkMetadata(column_id, new_metadata);
-      fragment.shadowChunkMetadataMap =
-          fragment.getChunkMetadataMap();  // TODO(adb): needed?
-      buf->setDirty();
+
+      fragment->setChunkMetadata(column_id, new_metadata);
+      fragment->shadowChunkMetadataMap =
+          fragment->getChunkMetadataMap();  // TODO(adb): needed?
+      if (defaultInsertLevel_ == Data_Namespace::DISK_LEVEL) {
+        buf->setDirty();
+      }
     } else {
-      LOG(WARNING) << "No chunk stats update found for fragment " << fragment.fragmentId
+      LOG(WARNING) << "No chunk stats update found for fragment " << fragment->fragmentId
                    << ", table " << physicalTableId_ << ", "
                    << ", column " << column_id;
     }
   }
+}
+
+FragmentInfo* InsertOrderFragmenter::getFragmentInfo(const int fragment_id) const {
+  auto fragment_it = std::find_if(fragmentInfoVec_.begin(),
+                                  fragmentInfoVec_.end(),
+                                  [fragment_id](const auto& fragment) -> bool {
+                                    return fragment->fragmentId == fragment_id;
+                                  });
+  CHECK(fragment_it != fragmentInfoVec_.end());
+  return fragment_it->get();
 }
 
 void InsertOrderFragmenter::insertData(InsertData& insertDataStruct) {
@@ -350,22 +376,25 @@ void InsertOrderFragmenter::insertDataNoCheckpoint(InsertData& insertDataStruct)
 }
 
 void InsertOrderFragmenter::replicateData(const InsertData& insertDataStruct) {
+  // synchronize concurrent accesses to fragmentInfoVec_
+  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
   size_t numRowsLeft = insertDataStruct.numRows;
-  for (auto& fragmentInfo : fragmentInfoVec_) {
-    fragmentInfo.shadowChunkMetadataMap = fragmentInfo.getChunkMetadataMapPhysical();
-    auto numRowsToInsert = fragmentInfo.getPhysicalNumTuples();  // not getNumTuples()
+  for (auto const& fragmentInfo : fragmentInfoVec_) {
+    fragmentInfo->shadowChunkMetadataMap = fragmentInfo->getChunkMetadataMapPhysical();
+    auto numRowsToInsert = fragmentInfo->getPhysicalNumTuples();  // not getNumTuples()
     size_t numRowsCanBeInserted;
     for (size_t i = 0; i < insertDataStruct.columnIds.size(); i++) {
       if (insertDataStruct.bypass[i]) {
         continue;
       }
       auto columnId = insertDataStruct.columnIds[i];
-      auto colDesc = insertDataStruct.columnDescriptors.at(columnId);
+      auto colDesc = catalog_->getMetadataForColumn(physicalTableId_, columnId);
+      CHECK(colDesc);
       CHECK(columnMap_.find(columnId) != columnMap_.end());
 
       ChunkKey chunkKey = chunkKeyPrefix_;
       chunkKey.push_back(columnId);
-      chunkKey.push_back(fragmentInfo.fragmentId);
+      chunkKey.push_back(fragmentInfo->fragmentId);
 
       auto colMapIt = columnMap_.find(columnId);
       auto& chunk = colMapIt->second;
@@ -373,14 +402,14 @@ void InsertOrderFragmenter::replicateData(const InsertData& insertDataStruct) {
               dataMgr_,
               chunkKey,
               defaultInsertLevel_,
-              fragmentInfo.deviceIds[static_cast<int>(defaultInsertLevel_)])) {
+              fragmentInfo->deviceIds[static_cast<int>(defaultInsertLevel_)])) {
         dataMgr_->deleteChunksWithPrefix(chunkKey);
       }
       chunk.createChunkBuffer(
           dataMgr_,
           chunkKey,
           defaultInsertLevel_,
-          fragmentInfo.deviceIds[static_cast<int>(defaultInsertLevel_)]);
+          fragmentInfo->deviceIds[static_cast<int>(defaultInsertLevel_)]);
       chunk.init_encoder();
 
       try {
@@ -402,10 +431,7 @@ void InsertOrderFragmenter::replicateData(const InsertData& insertDataStruct) {
         }
 
         auto chunkMetadata = chunk.appendData(dataCopy, numRowsToInsert, 0, true);
-        {
-          std::unique_lock<std::mutex> lck(*fragmentInfo.mutex_access_inmem_states);
-          fragmentInfo.shadowChunkMetadataMap[columnId] = chunkMetadata;
-        }
+        fragmentInfo->shadowChunkMetadataMap[columnId] = chunkMetadata;
 
         // update total size of var-len column in (actually the last) fragment
         if (0 > size) {
@@ -421,10 +447,54 @@ void InsertOrderFragmenter::replicateData(const InsertData& insertDataStruct) {
   }
   CHECK(0 == numRowsLeft);
 
-  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
-  for (auto& fragmentInfo : fragmentInfoVec_) {
-    fragmentInfo.setChunkMetadataMap(fragmentInfo.shadowChunkMetadataMap);
+  for (auto const& fragmentInfo : fragmentInfoVec_) {
+    fragmentInfo->setChunkMetadataMap(fragmentInfo->shadowChunkMetadataMap);
   }
+}
+
+void InsertOrderFragmenter::dropColumns(const std::vector<int>& columnIds) {
+  // prevent concurrent insert rows and drop column
+  mapd_unique_lock<mapd_shared_mutex> insertLock(insertMutex_);
+  // synchronize concurrent accesses to fragmentInfoVec_
+  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
+  for (auto const& fragmentInfo : fragmentInfoVec_) {
+    fragmentInfo->shadowChunkMetadataMap = fragmentInfo->getChunkMetadataMapPhysical();
+  }
+
+  for (const auto columnId : columnIds) {
+    auto cit = columnMap_.find(columnId);
+    if (columnMap_.end() != cit) {
+      columnMap_.erase(cit);
+    }
+
+    vector<int> fragPrefix = chunkKeyPrefix_;
+    fragPrefix.push_back(columnId);
+    dataMgr_->deleteChunksWithPrefix(fragPrefix);
+
+    for (const auto& fragmentInfo : fragmentInfoVec_) {
+      auto cmdit = fragmentInfo->shadowChunkMetadataMap.find(columnId);
+      if (fragmentInfo->shadowChunkMetadataMap.end() != cmdit) {
+        fragmentInfo->shadowChunkMetadataMap.erase(cmdit);
+      }
+    }
+  }
+  for (const auto& fragmentInfo : fragmentInfoVec_) {
+    fragmentInfo->setChunkMetadataMap(fragmentInfo->shadowChunkMetadataMap);
+  }
+}
+
+bool InsertOrderFragmenter::hasDeletedRows(const int delete_column_id) {
+  mapd_shared_lock<mapd_shared_mutex> read_lock(fragmentInfoMutex_);
+
+  for (auto const& fragment : fragmentInfoVec_) {
+    auto chunk_meta_it = fragment->getChunkMetadataMapPhysical().find(delete_column_id);
+    CHECK(chunk_meta_it != fragment->getChunkMetadataMapPhysical().end());
+    const auto& chunk_stats = chunk_meta_it->second.chunkStats;
+    if (chunk_stats.max.tinyintval == 1) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
@@ -439,7 +509,6 @@ void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
       memset(data_for_deleted_column.get(), 0, insertDataStruct.numRows);
       insertDataStruct.data.emplace_back(DataBlockPtr{data_for_deleted_column.get()});
       insertDataStruct.columnIds.push_back(cit.second.get_column_desc()->columnId);
-      insertDataStruct.columnDescriptors[cit.first] = cit.second.get_column_desc();
       break;
     }
   }
@@ -448,9 +517,10 @@ void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
 
   // insert column to columnMap_ if not yet (ALTER ADD COLUMN)
   for (const auto columnId : insertDataStruct.columnIds) {
+    const auto columnDesc = catalog_->getMetadataForColumn(physicalTableId_, columnId);
+    CHECK(columnDesc);
     if (columnMap_.end() == columnMap_.find(columnId)) {
-      columnMap_.emplace(
-          columnId, Chunk_NS::Chunk(insertDataStruct.columnDescriptors.at(columnId)));
+      columnMap_.emplace(columnId, Chunk_NS::Chunk(columnDesc));
     }
   }
 
@@ -475,13 +545,15 @@ void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
     return;
   }
 
-  FragmentInfo* currentFragment = 0;
+  FragmentInfo* currentFragment{nullptr};
 
   if (fragmentInfoVec_.empty()) {  // if no fragments exist for table
     currentFragment = createNewFragment(defaultInsertLevel_);
   } else {
-    currentFragment = &(fragmentInfoVec_.back());
+    currentFragment = fragmentInfoVec_.back().get();
   }
+  CHECK(currentFragment);
+
   size_t startFragment = fragmentInfoVec_.size() - 1;
 
   while (numRowsLeft > 0) {  // may have to create multiple fragments for bulk insert
@@ -564,7 +636,7 @@ void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
     }
 
     currentFragment->shadowNumTuples =
-        fragmentInfoVec_.back().getPhysicalNumTuples() + numRowsToInsert;
+        fragmentInfoVec_.back()->getPhysicalNumTuples() + numRowsToInsert;
     numRowsLeft -= numRowsToInsert;
     numRowsInserted += numRowsToInsert;
   }
@@ -577,8 +649,9 @@ void InsertOrderFragmenter::insertDataImpl(InsertData& insertDataStruct) {
     for (auto partIt = fragmentInfoVec_.begin() + startFragment;
          partIt != fragmentInfoVec_.end();
          ++partIt) {
-      partIt->setPhysicalNumTuples(partIt->shadowNumTuples);
-      partIt->setChunkMetadataMap(partIt->shadowChunkMetadataMap);
+      auto fragment_ptr = partIt->get();
+      fragment_ptr->setPhysicalNumTuples(fragment_ptr->shadowNumTuples);
+      fragment_ptr->setChunkMetadataMap(fragment_ptr->shadowChunkMetadataMap);
     }
   }
   numTuples_ += insertDataStruct.numRows;
@@ -590,15 +663,15 @@ FragmentInfo* InsertOrderFragmenter::createNewFragment(
   // also sets the new fragment as the insertBuffer for each column
 
   maxFragmentId_++;
-  FragmentInfo newFragmentInfo;
-  newFragmentInfo.fragmentId = maxFragmentId_;
-  newFragmentInfo.shadowNumTuples = 0;
-  newFragmentInfo.setPhysicalNumTuples(0);
+  auto newFragmentInfo = std::make_unique<FragmentInfo>();
+  newFragmentInfo->fragmentId = maxFragmentId_;
+  newFragmentInfo->shadowNumTuples = 0;
+  newFragmentInfo->setPhysicalNumTuples(0);
   for (const auto levelSize : dataMgr_->levelSizes_) {
-    newFragmentInfo.deviceIds.push_back(newFragmentInfo.fragmentId % levelSize);
+    newFragmentInfo->deviceIds.push_back(newFragmentInfo->fragmentId % levelSize);
   }
-  newFragmentInfo.physicalTableId = physicalTableId_;
-  newFragmentInfo.shard = shard_;
+  newFragmentInfo->physicalTableId = physicalTableId_;
+  newFragmentInfo->shard = shard_;
 
   for (map<int, Chunk>::iterator colMapIt = columnMap_.begin();
        colMapIt != columnMap_.end();
@@ -611,14 +684,14 @@ FragmentInfo* InsertOrderFragmenter::createNewFragment(
         dataMgr_,
         chunkKey,
         memoryLevel,
-        newFragmentInfo.deviceIds[static_cast<int>(memoryLevel)],
+        newFragmentInfo->deviceIds[static_cast<int>(memoryLevel)],
         pageSize_);
     colMapIt->second.init_encoder();
   }
 
   mapd_lock_guard<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
-  fragmentInfoVec_.push_back(newFragmentInfo);
-  return &(fragmentInfoVec_.back());
+  fragmentInfoVec_.push_back(std::move(newFragmentInfo));
+  return fragmentInfoVec_.back().get();
 }
 
 TableInfo InsertOrderFragmenter::getFragmentsForQuery() {
@@ -641,7 +714,12 @@ TableInfo InsertOrderFragmenter::getFragmentsForQuery() {
     queryInfo.fragments.push_back(emptyFragmentInfo);
   } else {
     fragmentsExist = true;
-    queryInfo.fragments = fragmentInfoVec_;  // makes a copy
+    std::for_each(
+        fragmentInfoVec_.begin(),
+        fragmentInfoVec_.end(),
+        [&queryInfo](const auto& fragment_owned_ptr) {
+          queryInfo.fragments.emplace_back(*fragment_owned_ptr);  // makes a copy
+        });
   }
   readLock.unlock();
   queryInfo.setPhysicalNumTuples(0);

@@ -22,7 +22,7 @@
 #include "LeafHostInfo.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "QueryEngine/TargetMetaInfo.h"
-#include "gen-cpp/MapD.h"
+#include "gen-cpp/OmniSci.h"
 
 #include "Shared/Logger.h"
 
@@ -98,7 +98,13 @@ class LeafAggregator {
 
   void disconnect(const TSessionId session) { CHECK(false); }
 
-  void interrupt(const TSessionId session) { CHECK(false); }
+  void clone_session(const TSessionId session1, const TSessionId session2) {
+    CHECK(false);
+  };
+
+  void interrupt(const TSessionId query_session, const TSessionId interrupt_session) {
+    CHECK(false);
+  }
 
   void set_execution_mode(const TSessionId session, const TExecuteMode::type mode) {
     CHECK(false);

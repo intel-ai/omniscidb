@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 #ifndef DATAMGR_H
 #define DATAMGR_H
 
-#include "../Shared/MapDParameters.h"
+#include "../Shared/SystemParameters.h"
 #include "../Shared/mapd_shared_mutex.h"
 #include "AbstractBuffer.h"
 #include "AbstractBufferMgr.h"
@@ -33,6 +33,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace File_Namespace {
@@ -63,12 +64,43 @@ struct MemoryInfo {
   std::vector<MemoryData> nodeMemoryData;
 };
 
+//! Parse /proc/meminfo into key/value pairs.
+class ProcMeminfoParser {
+  std::unordered_map<std::string, size_t> items_;
+
+ public:
+  ProcMeminfoParser() {
+    std::ifstream f("/proc/meminfo");
+    std::stringstream ss;
+    ss << f.rdbuf();
+    for (const std::string& line : split(ss.str(), "\n")) {
+      if (line.empty()) {
+        continue;
+      }
+      const auto nv = split(line, ":", 1);
+      CHECK(nv.size() == 2) << "unexpected line format in /proc/meminfo: " << line;
+      const auto name = strip(nv[0]), value = to_lower(strip(nv[1]));
+      auto v = split(value);
+      CHECK(v.size() == 1 || v.size() == 2)
+          << "unexpected line format in /proc/meminfo: " << line;
+      items_[name] = std::atoll(v[0].c_str());
+      if (v.size() == 2) {
+        CHECK(v[1] == "kb") << "unexpected unit suffix in /proc/meminfo: " << line;
+        items_[name] *= 1024;
+      }
+    }
+  }
+  auto operator[](const std::string& name) { return items_[name]; }
+  auto begin() { return items_.begin(); }
+  auto end() { return items_.end(); }
+};
+
 class DataMgr {
   friend class GlobalFileMgr;
 
  public:
   DataMgr(const std::string& dataDir,
-          const MapDParameters& mapd_parameters,
+          const SystemParameters& system_parameters,
           const bool useGpus,
           const int numGpus,
           const int startGpu = 0,
@@ -120,9 +152,20 @@ class DataMgr {
   // database_id, table_id, column_id, fragment_id
   std::vector<int> levelSizes_;
 
+  struct SystemMemoryUsage {
+    int64_t free;      // available CPU RAM memory in bytes
+    int64_t total;     // total CPU RAM memory in bytes
+    int64_t resident;  // resident process memory in bytes
+    int64_t vtotal;    // total process virtual memory in bytes
+    int64_t regular;   // process bytes non-shared
+    int64_t shared;    // process bytes shared (file maps + shmem)
+  };
+
+  SystemMemoryUsage getSystemMemoryUsage() const;
+
  private:
-  size_t getTotalSystemMemory();
-  void populateMgrs(const MapDParameters& mapd_parameters,
+  size_t getTotalSystemMemory() const;
+  void populateMgrs(const SystemParameters& system_parameters,
                     const size_t userSpecifiedNumReaderThreads);
   void convertDB(const std::string basePath);
   void checkpoint();  // checkpoint for whole DB, called from convertDB proc only

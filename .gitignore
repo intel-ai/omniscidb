@@ -43,9 +43,13 @@ Debug/
 
 # VS code settings files
 .vscode/
+*.code-workspace
 
 # VIM editor files
 .*.swp
+
+# Emacs editor files
+*~
 
 # Thrift-generated files
 java/src/gen/
@@ -75,6 +79,7 @@ java/thrift/src/
 *.project
 
 ThirdParty/
+data/
 
 # IntelliJ/CLion settings files
 .idea

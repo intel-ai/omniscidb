@@ -44,6 +44,7 @@ void compare_array(const TargetValue& r,
   size_t ctr = 0;
   for (const ScalarTargetValue scalar_tv : scalar_tv_vector) {
     auto p = boost::get<T>(&scalar_tv);
+    CHECK(p);
     if (tol < 0.) {
       ASSERT_EQ(*p, arr[ctr++]);
     } else {
@@ -118,9 +119,8 @@ template <class T>
 T g(const TargetValue& r) {
   auto geo_r = boost::get<GeoTargetValue>(&r);
   CHECK(geo_r);
-  auto p = boost::get<T>(geo_r);
-  CHECK(p);
-  return *p;
+  CHECK(geo_r->is_initialized());
+  return boost::get<T>(geo_r->get());
 }
 
 template <class T>
@@ -195,6 +195,12 @@ void init_logger_stderr_only(int argc, char const* const* argv) {
   logger::LogOptions log_options(argv[0]);
   log_options.max_files_ = 0;  // stderr only by default
   log_options.parse_command_line(argc, argv);
+  logger::init(log_options);
+}
+
+void init_logger_stderr_only() {
+  logger::LogOptions log_options(nullptr);
+  log_options.max_files_ = 0;  // stderr only by default
   logger::init(log_options);
 }
 

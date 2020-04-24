@@ -3,6 +3,12 @@
 HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+if [ "$TSAN" = "true" ]; then
+  ARROW_TSAN="-DARROW_USE_TSAN=ON"
+elif [ "$TSAN" = "false" ]; then
+  ARROW_TSAN=""
+fi
+
 function download() {
     wget --continue "$1"
 }
@@ -51,15 +57,17 @@ function download_make_install() {
     popd
 }
 
-ARROW_VERSION=apache-arrow-0.13.0
+CMAKE_VERSION=3.16.5
+
+function install_cmake() {
+  CXXFLAGS="-pthread" CFLAGS="-pthread" download_make_install ${HTTP_DEPS}/cmake-${CMAKE_VERSION}.tar.gz
+}
+
+ARROW_VERSION=apache-arrow-0.16.0
 
 function install_arrow() {
   download https://github.com/apache/arrow/archive/$ARROW_VERSION.tar.gz
   extract $ARROW_VERSION.tar.gz
-
-  pushd arrow-$ARROW_VERSION
-  patch -p 1 < ${SCRIPTS_DIR}/ARROW-5517-C-Only-check-header-basename-for-internal.patch
-  popd
 
   mkdir -p arrow-$ARROW_VERSION/cpp/build
   pushd arrow-$ARROW_VERSION/cpp/build
@@ -71,16 +79,19 @@ function install_arrow() {
     -DARROW_BUILD_TESTS=OFF \
     -DARROW_BUILD_BENCHMARKS=OFF \
     -DARROW_WITH_BROTLI=OFF \
-    -DARROW_WITH_ZLIB=OFF \
+    -DARROW_CSV=ON \
+    -DARROW_JSON=ON \
+    -DARROW_WITH_ZLIB=ON \
     -DARROW_WITH_LZ4=OFF \
     -DARROW_WITH_SNAPPY=ON \
-    -DARROW_WITH_ZSTD=OFF \
+    -DARROW_WITH_ZSTD=ON \
     -DARROW_USE_GLOG=OFF \
     -DARROW_JEMALLOC=OFF \
     -DARROW_BOOST_USE_SHARED=${ARROW_BOOST_USE_SHARED:="OFF"} \
     -DARROW_PARQUET=ON \
     -DARROW_CUDA=ON \
     -DTHRIFT_HOME=${THRIFT_HOME:-$PREFIX} \
+    ${ARROW_TSAN} \
     ..
   makej
   make_install
@@ -104,7 +115,7 @@ function install_snappy() {
   popd
 }
 
-AWSCPP_VERSION=1.7.123
+AWSCPP_VERSION=1.7.301
 
 function install_awscpp() {
     # default c++ standard support
@@ -134,12 +145,12 @@ function install_awscpp() {
     popd
 }
 
-LLVM_VERSION=8.0.0
+LLVM_VERSION=9.0.1
 
 function install_llvm() {
     VERS=${LLVM_VERSION}
     download ${HTTP_DEPS}/llvm/$VERS/llvm-$VERS.src.tar.xz
-    download ${HTTP_DEPS}/llvm/$VERS/cfe-$VERS.src.tar.xz
+    download ${HTTP_DEPS}/llvm/$VERS/clang-$VERS.src.tar.xz
     download ${HTTP_DEPS}/llvm/$VERS/compiler-rt-$VERS.src.tar.xz
     download ${HTTP_DEPS}/llvm/$VERS/lldb-$VERS.src.tar.xz
     download ${HTTP_DEPS}/llvm/$VERS/lld-$VERS.src.tar.xz
@@ -148,14 +159,14 @@ function install_llvm() {
     download ${HTTP_DEPS}/llvm/$VERS/clang-tools-extra-$VERS.src.tar.xz
     rm -rf llvm-$VERS.src
     extract llvm-$VERS.src.tar.xz
-    extract cfe-$VERS.src.tar.xz
+    extract clang-$VERS.src.tar.xz
     extract compiler-rt-$VERS.src.tar.xz
     extract lld-$VERS.src.tar.xz
     extract lldb-$VERS.src.tar.xz
     extract libcxx-$VERS.src.tar.xz
     extract libcxxabi-$VERS.src.tar.xz
     extract clang-tools-extra-$VERS.src.tar.xz
-    mv cfe-$VERS.src llvm-$VERS.src/tools/clang
+    mv clang-$VERS.src llvm-$VERS.src/tools/clang
     mv compiler-rt-$VERS.src llvm-$VERS.src/projects/compiler-rt
     mv lld-$VERS.src llvm-$VERS.src/tools/lld
     mv lldb-$VERS.src llvm-$VERS.src/tools/lldb
@@ -168,9 +179,6 @@ function install_llvm() {
     pushd build.llvm-$VERS
     cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PREFIX -DLLVM_ENABLE_RTTI=on -DLLVM_USE_INTEL_JITEVENTS=on ../llvm-$VERS.src
     makej
-    if [ ! -d "lib/python2.7" ]; then
-        cp -R lib64/python2.7 lib/python2.7
-    fi
     make install
     popd
 }
@@ -227,7 +235,7 @@ function install_rdkafka() {
     popd
 }
 
-GO_VERSION=1.12.6
+GO_VERSION=1.14
 
 function install_go() {
     VERS=${GO_VERSION}
@@ -239,4 +247,33 @@ function install_go() {
     extract go$VERS.linux-$ARCH.tar.gz
     rm -rf $PREFIX/go || true
     mv go $PREFIX
+}
+
+NINJA_VERSION=1.10.0
+
+function install_ninja() {
+  download https://github.com/ninja-build/ninja/releases/download/v${NINJA_VERSION}/ninja-linux.zip
+  unzip -u ninja-linux.zip
+  mkdir -p $PREFIX/bin/
+  mv ninja $PREFIX/bin/
+}
+
+TBB_VERSION=2020.2
+
+function install_tbb() {
+  download https://github.com/oneapi-src/oneTBB/archive/v${TBB_VERSION}.tar.gz
+  extract v${TBB_VERSION}.tar.gz
+  pushd oneTBB-${TBB_VERSION}
+  if [ "$1" == "static" ]; then
+    make extra_inc=big_iron.inc
+    install -d $PREFIX/lib
+    install -m755 build/linux_*/*.a* $PREFIX/lib
+  else
+    make
+    install -d $PREFIX/lib
+    install -m755 build/linux_*/*.so* $PREFIX/lib
+  fi
+  install -d $PREFIX/include
+  cp -R include/tbb $PREFIX/include
+  popd
 }

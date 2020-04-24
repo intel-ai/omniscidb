@@ -150,15 +150,27 @@ class Encoder {
   Encoder(Data_Namespace::AbstractBuffer* buffer);
   virtual ~Encoder() {}
 
-  virtual ChunkMetadata appendData(int8_t*& srcData,
-                                   const size_t numAppendElems,
-                                   const SQLTypeInfo&,
-                                   const bool replicating = false) = 0;
+  //! Append data to the chunk buffer backing this encoder.
+  //! @param src_data Source data for the append
+  //! @param num_elems_to_append Number of elements to append
+  //! @param ti SQL Type Info for the column TODO(adb): used?
+  //! @param replicating Pass one value and fill the chunk with it
+  //! @param offset Write data starting at a given offset. Default is -1 which indicates
+  //! an append, an offset of 0 rewrites the chunk up to `num_elems_to_append`.
+  virtual ChunkMetadata appendData(int8_t*& src_data,
+                                   const size_t num_elems_to_append,
+                                   const SQLTypeInfo& ti,
+                                   const bool replicating = false,
+                                   const int64_t offset = -1) = 0;
   virtual void getMetadata(ChunkMetadata& chunkMetadata);
   // Only called from the executor for synthesized meta-information.
   virtual ChunkMetadata getMetadata(const SQLTypeInfo& ti) = 0;
   virtual void updateStats(const int64_t val, const bool is_null) = 0;
   virtual void updateStats(const double val, const bool is_null) = 0;
+
+  // Only called from ArrowStorageInterface to update stats on chunk of data
+  virtual void updateStats(const int8_t* const dst, const size_t numBytes) = 0;
+
   virtual void reduceStats(const Encoder&) = 0;
   virtual void copyMetadata(const Encoder* copyFromEncoder) = 0;
   virtual void writeMetadata(FILE* f /*, const size_t offset*/) = 0;

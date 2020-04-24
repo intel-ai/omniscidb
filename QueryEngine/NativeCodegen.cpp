@@ -21,6 +21,7 @@
 #include "OutputBufferInitialization.h"
 #include "QueryTemplateGenerator.h"
 
+#include "Shared/MathUtils.h"
 #include "Shared/mapdpath.h"
 
 #if LLVM_VERSION_MAJOR < 4
@@ -114,7 +115,7 @@ void optimize_ir(llvm::Function* query_func,
   pass_manager.add(llvm::createGlobalOptimizerPass());
 
   pass_manager.add(llvm::createLICMPass());
-  if (co.opt_level_ == ExecutorOptLevel::LoopStrengthReduction) {
+  if (co.opt_level == ExecutorOptLevel::LoopStrengthReduction) {
     pass_manager.add(llvm::createLoopStrengthReducePass());
   }
   pass_manager.run(*module);
@@ -125,15 +126,6 @@ void optimize_ir(llvm::Function* query_func,
 
 }  // namespace
 
-template <class T>
-std::string serialize_llvm_object(const T* llvm_obj) {
-  std::stringstream ss;
-  llvm::raw_os_ostream os(ss);
-  llvm_obj->print(os);
-  os.flush();
-  return ss.str();
-}
-
 ExecutionEngineWrapper::ExecutionEngineWrapper() {}
 
 ExecutionEngineWrapper::ExecutionEngineWrapper(llvm::ExecutionEngine* execution_engine)
@@ -143,7 +135,7 @@ ExecutionEngineWrapper::ExecutionEngineWrapper(llvm::ExecutionEngine* execution_
                                                const CompilationOptions& co)
     : execution_engine_(execution_engine) {
   if (execution_engine_) {
-    if (co.register_intel_jit_listener_) {
+    if (co.register_intel_jit_listener) {
       intel_jit_listener_.reset(llvm::JITEventListener::createIntelJITEventListener());
       CHECK(intel_jit_listener_);
       execution_engine_->RegisterJITEventListener(intel_jit_listener_.get());
@@ -244,7 +236,7 @@ ExecutionEngineWrapper CodeGenerator::generateNativeCPUCode(
   llvm::TargetOptions to;
   to.EnableFastISel = true;
   eb.setTargetOptions(to);
-  if (co.opt_level_ == ExecutorOptLevel::ReductionJIT) {
+  if (co.opt_level == ExecutorOptLevel::ReductionJIT) {
     eb.setOptLevel(llvm::CodeGenOpt::None);
   }
 
@@ -300,9 +292,9 @@ void CodeGenerator::link_udf_module(const std::unique_ptr<llvm::Module>& udf_mod
           "link_udf_module: *** attempt to overwrite a runtime function with a UDF "
           "function ***");
     } else {
-      LOG(INFO) << "  Adding " << f.getName().str() << " to "
-                << module.getModuleIdentifier() << " from `"
-                << udf_module->getModuleIdentifier() << "`" << std::endl;
+      VLOG(1) << "  Adding " << f.getName().str() << " to "
+              << module.getModuleIdentifier() << " from `"
+              << udf_module->getModuleIdentifier() << "`" << std::endl;
     }
   }
 
@@ -414,6 +406,8 @@ declare i64 @get_composite_key_index_32(i32*, i64, i32*, i64);
 declare i64 @get_composite_key_index_64(i64*, i64, i64*, i64);
 declare i64 @get_bucket_key_for_range_compressed(i8*, i64, double);
 declare i64 @get_bucket_key_for_range_double(i8*, i64, double);
+declare i32 @get_num_buckets_for_bounds(i8*, i32, double, double);
+declare i64 @get_candidate_rows(i32*, i32, i8*, i32, double, double, i32, i64, i64*, i64, i64, i64);
 declare i64 @agg_count_shared(i64*, i64);
 declare i64 @agg_count_skip_val_shared(i64*, i64, i64);
 declare i32 @agg_count_int32_shared(i32*, i32);
@@ -461,6 +455,10 @@ declare void @agg_id_int8_shared(i8*, i8);
 declare void @agg_id_double_shared(i64*, double);
 declare void @agg_id_double_shared_slow(i64*, double*);
 declare void @agg_id_float_shared(i32*, float);
+declare i32 @checked_single_agg_id_shared(i64*, i64, i64);
+declare i32 @checked_single_agg_id_double_shared(i64*, double, double);
+declare i32 @checked_single_agg_id_double_shared_slow(i64*, double*, double);
+declare i32 @checked_single_agg_id_float_shared(i32*, float, float);
 declare i1 @slotEmptyKeyCAS(i64*, i64, i64);
 declare i1 @slotEmptyKeyCAS_int32(i32*, i32, i32);
 declare i1 @slotEmptyKeyCAS_int16(i16*, i16, i16);
@@ -471,10 +469,6 @@ declare i64 @DateTruncate(i32, i64);
 declare i64 @DateTruncateNullable(i32, i64, i64);
 declare i64 @DateTruncateHighPrecisionToDate(i64, i64);
 declare i64 @DateTruncateHighPrecisionToDateNullable(i64, i64, i64);
-declare i64 @DateTruncateAlterPrecisionScaleUp(i64, i64);
-declare i64 @DateTruncateAlterPrecisionScaleDown(i64, i64);
-declare i64 @DateTruncateAlterPrecisionScaleUpNullable(i64, i64, i64);
-declare i64 @DateTruncateAlterPrecisionScaleDownNullable(i64, i64, i64);
 declare i64 @DateDiff(i32, i64, i64);
 declare i64 @DateDiffNullable(i32, i64, i64, i64);
 declare i64 @DateDiffHighPrecision(i32, i64, i64, i32, i64, i64, i64);
@@ -488,6 +482,7 @@ declare i32 @array_size(i8*, i64, i32);
 declare i32 @array_size_nullable(i8*, i64, i32, i32);
 declare i32 @fast_fixlen_array_size(i8*, i32);
 declare i1 @array_is_null(i8*, i64);
+declare i1 @point_coord_array_is_null(i8*, i64);
 declare i8* @array_buff(i8*, i64);
 declare i8* @fast_fixlen_array_buff(i8*, i64);
 declare i8 @array_at_int8_t(i8*, i64, i32);
@@ -547,6 +542,7 @@ declare void @agg_count_distinct_bitmap_skip_val_gpu(i64*, i64, i64, i64, i64, i
 declare void @agg_approximate_count_distinct_gpu(i64*, i64, i32, i64, i64);
 declare i32 @record_error_code(i32, i32*);
 declare i1 @dynamic_watchdog();
+declare i1 @check_interrupt();
 declare void @force_sync();
 declare void @sync_warp();
 declare void @sync_warp_protected(i64, i64);
@@ -819,12 +815,7 @@ std::vector<std::pair<void*, void*>> Executor::optimizeAndCodegenGPU(
          ++it) {
       if (llvm::isa<llvm::CallInst>(*it)) {
         auto& get_gv_call = llvm::cast<llvm::CallInst>(*it);
-        if (get_gv_call.getCalledFunction()->getName() == "get_group_value" ||
-            get_gv_call.getCalledFunction()->getName() ==
-                "get_group_value_with_watchdog" ||
-            get_gv_call.getCalledFunction()->getName() ==
-                "get_matching_group_value_perfect_hash" ||
-            get_gv_call.getCalledFunction()->getName() == "array_size" ||
+        if (get_gv_call.getCalledFunction()->getName() == "array_size" ||
             get_gv_call.getCalledFunction()->getName() == "linear_probabilistic_count") {
           mark_function_never_inline(cgen_state_->row_func_);
           row_func_not_inlined = true;
@@ -1196,6 +1187,10 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
         result.emplace_back(agg_expr->get_is_distinct() ? "agg_count_distinct"
                                                         : "agg_count");
         break;
+      case kSINGLE_VALUE: {
+        result.emplace_back(agg_type_info.is_fp() ? "agg_id_double" : "agg_id");
+        break;
+      }
       case kSAMPLE: {
         // Note that varlen SAMPLE arguments are handled separately above
         result.emplace_back(agg_type_info.is_fp() ? "agg_id_double" : "agg_id");
@@ -1342,12 +1337,20 @@ llvm::Value* find_variable_in_basic_block(llvm::Function* func,
 
 void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
                                            bool run_with_dynamic_watchdog,
+                                           bool run_with_allowing_runtime_interrupt,
                                            ExecutorDeviceType device_type) {
   // check whether the row processing was successful; currently, it can
   // fail by running out of group by buffer slots
 
+  if (run_with_dynamic_watchdog && run_with_allowing_runtime_interrupt) {
+    // when both dynamic watchdog and runtime interrupt turns on
+    // we use dynamic watchdog
+    run_with_allowing_runtime_interrupt = false;
+  }
+
   llvm::Value* row_count = nullptr;
-  if (run_with_dynamic_watchdog && device_type == ExecutorDeviceType::GPU) {
+  if ((run_with_dynamic_watchdog || run_with_allowing_runtime_interrupt) &&
+      device_type == ExecutorDeviceType::GPU) {
     row_count =
         find_variable_in_basic_block<llvm::LoadInst>(query_func, ".entry", "row_count");
   }
@@ -1357,7 +1360,8 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
        ++bb_it) {
     llvm::Value* pos = nullptr;
     for (auto inst_it = bb_it->begin(); inst_it != bb_it->end(); ++inst_it) {
-      if (run_with_dynamic_watchdog && llvm::isa<llvm::PHINode>(*inst_it)) {
+      if ((run_with_dynamic_watchdog || run_with_allowing_runtime_interrupt) &&
+          llvm::isa<llvm::PHINode>(*inst_it)) {
         if (inst_it->getName() == "pos") {
           pos = &*inst_it;
         }
@@ -1378,7 +1382,7 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           CHECK(pos);
           llvm::Value* call_watchdog_lv = nullptr;
           if (device_type == ExecutorDeviceType::GPU) {
-            // In order to make sure all threads wihtin a block see the same barrier,
+            // In order to make sure all threads within a block see the same barrier,
             // only those blocks whose none of their threads have experienced the critical
             // edge will go through the dynamic watchdog computation
             CHECK(row_count);
@@ -1427,6 +1431,62 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           unified_err_lv->addIncoming(timeout_err_lv, watchdog_check_bb);
           unified_err_lv->addIncoming(err_lv, &*bb_it);
           err_lv = unified_err_lv;
+        } else if (run_with_allowing_runtime_interrupt) {
+          CHECK(pos);
+          llvm::Value* call_check_interrupt_lv = nullptr;
+          if (device_type == ExecutorDeviceType::GPU) {
+            // approximate how many times the %pos variable
+            // is increased --> the number of iteration
+            int32_t num_shift_by_gridDim = getExpOfTwo(gridSize());
+            int32_t num_shift_by_blockDim = getExpOfTwo(blockSize());
+            if (!isPowOfTwo(gridSize())) {
+              num_shift_by_gridDim++;
+            }
+            if (!isPowOfTwo(blockSize())) {
+              num_shift_by_blockDim++;
+            }
+            int total_num_shift = num_shift_by_gridDim + num_shift_by_blockDim;
+            // check the interrupt flag for every 64th iteration
+            llvm::Value* pos_shifted_per_iteration =
+                ir_builder.CreateLShr(pos, cgen_state_->llInt(total_num_shift));
+            auto interrupt_predicate =
+                ir_builder.CreateAnd(pos_shifted_per_iteration, uint64_t(0x3f));
+            call_check_interrupt_lv =
+                ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                      interrupt_predicate,
+                                      cgen_state_->llInt(int64_t(0LL)));
+          } else {
+            // CPU path: run interrupt checker for every 64th row
+            auto interrupt_predicate = ir_builder.CreateAnd(pos, uint64_t(0x3f));
+            call_check_interrupt_lv =
+                ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                      interrupt_predicate,
+                                      cgen_state_->llInt(int64_t(0LL)));
+          }
+          CHECK(call_check_interrupt_lv);
+          auto error_check_bb = bb_it->splitBasicBlock(
+              llvm::BasicBlock::iterator(br_instr), ".error_check");
+          auto& check_interrupt_br_instr = bb_it->back();
+
+          auto interrupt_check_bb = llvm::BasicBlock::Create(
+              cgen_state_->context_, ".interrupt_check", query_func, error_check_bb);
+          llvm::IRBuilder<> interrupt_checker_ir_builder(interrupt_check_bb);
+          auto detected_interrupt = interrupt_checker_ir_builder.CreateCall(
+              cgen_state_->module_->getFunction("check_interrupt"), {});
+          auto interrupt_err_lv = interrupt_checker_ir_builder.CreateSelect(
+              detected_interrupt, cgen_state_->llInt(Executor::ERR_INTERRUPTED), err_lv);
+          interrupt_checker_ir_builder.CreateBr(error_check_bb);
+
+          llvm::ReplaceInstWithInst(
+              &check_interrupt_br_instr,
+              llvm::BranchInst::Create(
+                  interrupt_check_bb, error_check_bb, call_check_interrupt_lv));
+          ir_builder.SetInsertPoint(&br_instr);
+          auto unified_err_lv = ir_builder.CreatePHI(err_lv->getType(), 2);
+
+          unified_err_lv->addIncoming(interrupt_err_lv, interrupt_check_bb);
+          unified_err_lv->addIncoming(err_lv, &*bb_it);
+          err_lv = unified_err_lv;
         }
         const auto error_code_arg = get_arg_by_name(query_func, "error_code");
         err_lv =
@@ -1436,9 +1496,16 @@ void Executor::createErrorCheckControlFlow(llvm::Function* query_func,
           // let kernel execution finish as expected, regardless of the observed error,
           // unless it is from the dynamic watchdog where all threads within that block
           // return together.
-          err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
-                                         err_lv,
-                                         cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
+          if (run_with_allowing_runtime_interrupt) {
+            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                           err_lv,
+                                           cgen_state_->llInt(Executor::ERR_INTERRUPTED));
+          } else {
+            err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_EQ,
+                                           err_lv,
+                                           cgen_state_->llInt(Executor::ERR_OUT_OF_TIME));
+          }
+
         } else {
           err_lv = ir_builder.CreateICmp(llvm::ICmpInst::ICMP_NE,
                                          err_lv,
@@ -1581,7 +1648,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   nukeOldState(allow_lazy_fetch, query_infos, &ra_exe_unit);
 
   GroupByAndAggregate group_by_and_aggregate(
-      this, co.device_type_, ra_exe_unit, query_infos, row_set_mem_owner);
+      this, co.device_type, ra_exe_unit, query_infos, row_set_mem_owner);
   auto query_mem_desc =
       group_by_and_aggregate.initQueryMemoryDescriptor(eo.allow_multifrag,
                                                        max_groups_buffer_entry_guess,
@@ -1598,7 +1665,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   const bool output_columnar = query_mem_desc->didOutputColumnar();
 
-  if (co.device_type_ == ExecutorDeviceType::GPU) {
+  if (co.device_type == ExecutorDeviceType::GPU) {
     const size_t num_count_distinct_descs =
         query_mem_desc->getCountDistinctDescriptorsSize();
     for (size_t i = 0; i < num_count_distinct_descs; i++) {
@@ -1606,7 +1673,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
           query_mem_desc->getCountDistinctDescriptor(i);
       if (count_distinct_descriptor.impl_type_ == CountDistinctImplType::StdSet ||
           (count_distinct_descriptor.impl_type_ != CountDistinctImplType::Invalid &&
-           !co.hoist_literals_)) {
+           !co.hoist_literals)) {
         throw QueryMustRunOnCpu();
       }
     }
@@ -1632,7 +1699,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                 CodeGenerator::alwaysCloneRuntimeFunction(func));
       });
 
-  if (co.device_type_ == ExecutorDeviceType::CPU) {
+  if (co.device_type == ExecutorDeviceType::CPU) {
     if (is_udf_module_present(true)) {
       CodeGenerator::link_udf_module(udf_cpu_module, *rt_module_copy, cgen_state_.get());
     }
@@ -1668,13 +1735,13 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   const bool is_group_by{query_mem_desc->isGroupBy()};
   auto query_func = is_group_by ? query_group_by_template(cgen_state_->module_,
-                                                          co.hoist_literals_,
+                                                          co.hoist_literals,
                                                           *query_mem_desc,
-                                                          co.device_type_,
+                                                          co.device_type,
                                                           ra_exe_unit.scan_limit)
                                 : query_template(cgen_state_->module_,
                                                  agg_slot_count,
-                                                 co.hoist_literals_,
+                                                 co.hoist_literals,
                                                  !!ra_exe_unit.estimator);
   bind_pos_placeholders("pos_start", true, query_func, cgen_state_->module_);
   bind_pos_placeholders("group_buff_idx", false, query_func, cgen_state_->module_);
@@ -1688,7 +1755,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   std::tie(cgen_state_->row_func_, col_heads) =
       create_row_function(ra_exe_unit.input_col_descs.size(),
                           is_group_by ? 0 : agg_slot_count,
-                          co.hoist_literals_,
+                          co.hoist_literals,
                           query_func,
                           cgen_state_->module_,
                           cgen_state_->context_);
@@ -1719,20 +1786,24 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
   } else {
     const bool can_return_error =
         compileBody(ra_exe_unit, group_by_and_aggregate, *query_mem_desc, co);
-    if (can_return_error || cgen_state_->needs_error_check_ || eo.with_dynamic_watchdog) {
-      createErrorCheckControlFlow(query_func, eo.with_dynamic_watchdog, co.device_type_);
+    if (can_return_error || cgen_state_->needs_error_check_ || eo.with_dynamic_watchdog ||
+        eo.allow_runtime_query_interrupt) {
+      createErrorCheckControlFlow(query_func,
+                                  eo.with_dynamic_watchdog,
+                                  eo.allow_runtime_query_interrupt,
+                                  co.device_type);
     }
   }
   std::vector<llvm::Value*> hoisted_literals;
 
-  if (co.hoist_literals_) {
+  if (co.hoist_literals) {
     VLOG(1) << "number of hoisted literals: "
             << cgen_state_->query_func_literal_loads_.size()
             << " / literal buffer usage: " << cgen_state_->getLiteralBufferUsage(0)
             << " bytes";
   }
 
-  if (co.hoist_literals_ && !cgen_state_->query_func_literal_loads_.empty()) {
+  if (co.hoist_literals && !cgen_state_->query_func_literal_loads_.empty()) {
     // we have some hoisted literals...
     hoisted_literals = inlineHoistedLiterals();
   }
@@ -1763,11 +1834,11 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
       init_agg_val_vec(ra_exe_unit.target_exprs, ra_exe_unit.quals, *query_mem_desc);
 
   auto multifrag_query_func = cgen_state_->module_->getFunction(
-      "multifrag_query" + std::string(co.hoist_literals_ ? "_hoisted_literals" : ""));
+      "multifrag_query" + std::string(co.hoist_literals ? "_hoisted_literals" : ""));
   CHECK(multifrag_query_func);
 
   bind_query(query_func,
-             "query_stub" + std::string(co.hoist_literals_ ? "_hoisted_literals" : ""),
+             "query_stub" + std::string(co.hoist_literals ? "_hoisted_literals" : ""),
              multifrag_query_func,
              cgen_state_->module_);
 
@@ -1778,7 +1849,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   std::string llvm_ir;
   if (eo.just_explain) {
-    if (co.explain_type_ == ExecutorExplainType::Optimized) {
+    if (co.explain_type == ExecutorExplainType::Optimized) {
 #ifdef WITH_JIT_DEBUG
       throw std::runtime_error(
           "Explain optimized not available when JIT runtime debug symbols are enabled");
@@ -1797,7 +1868,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 
   return std::make_tuple(
       Executor::CompilationResult{
-          co.device_type_ == ExecutorDeviceType::CPU
+          co.device_type == ExecutorDeviceType::CPU
               ? optimizeAndCodegenCPU(query_func, multifrag_query_func, live_funcs, co)
               : optimizeAndCodegenGPU(query_func,
                                       multifrag_query_func,
@@ -1814,6 +1885,9 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
 llvm::BasicBlock* Executor::codegenSkipDeletedOuterTableRow(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CompilationOptions& co) {
+  if (!co.add_delete_column) {
+    return nullptr;
+  }
   CHECK(!ra_exe_unit.input_descs.empty());
   const auto& outer_input_desc = ra_exe_unit.input_descs[0];
   if (outer_input_desc.getSourceType() != InputSourceType::TABLE) {

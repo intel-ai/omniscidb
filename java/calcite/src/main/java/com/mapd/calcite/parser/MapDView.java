@@ -18,7 +18,7 @@ package com.mapd.calcite.parser;
 import static com.mapd.calcite.parser.MapDParser.CURRENT_PARSER;
 
 import com.mapd.calcite.parser.MapDParserOptions;
-import com.mapd.thrift.server.TTableDetails;
+import com.omnisci.thrift.server.TTableDetails;
 
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.prepare.SqlIdentifierCapturer;
@@ -47,7 +47,7 @@ public class MapDView extends MapDTable implements TranslatableTable {
     this.viewSql = view_sql;
     try {
       MapDParserOptions parserOptions = new MapDParserOptions();
-      viewRelRoot = mp.queryToSqlNode(viewSql, parserOptions);
+      viewRelRoot = mp.queryToRelNode(viewSql, parserOptions);
       accessObjects = mp.captureIdentifiers(viewSql, parserOptions.isLegacySyntax());
     } catch (SqlParseException e) {
       MAPDLOGGER.error("error parsing view SQL: " + view_sql, e);

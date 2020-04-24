@@ -26,8 +26,7 @@
  *
  */
 
-#ifndef CATALOG_H
-#define CATALOG_H
+#pragma once
 
 #include <atomic>
 #include <cstdint>
@@ -40,28 +39,34 @@
 #include <utility>
 #include <vector>
 
-#include "ColumnDescriptor.h"
-#include "DashboardDescriptor.h"
-#include "DictDescriptor.h"
-#include "LinkDescriptor.h"
-#include "TableDescriptor.h"
+#include "Calcite/Calcite.h"
+#include "Catalog/ColumnDescriptor.h"
+#include "Catalog/DashboardDescriptor.h"
+#include "Catalog/DictDescriptor.h"
+#include "Catalog/ForeignServer.h"
+#include "Catalog/ForeignTable.h"
+#include "Catalog/LinkDescriptor.h"
+#include "Catalog/SessionInfo.h"
+#include "Catalog/SysCatalog.h"
+#include "Catalog/TableDescriptor.h"
+#include "Catalog/Types.h"
+#include "DataMgr/DataMgr.h"
+#include "LockMgr/LockMgrImpl.h"
+#include "QueryEngine/CompilationOptions.h"
+#include "Shared/mapd_shared_mutex.h"
+#include "SqliteConnector/SqliteConnector.h"
 
-#include "../DataMgr/DataMgr.h"
-#include "../QueryEngine/CompilationOptions.h"
-#include "../SqliteConnector/SqliteConnector.h"
 #include "LeafHostInfo.h"
 
-#include "../Calcite/Calcite.h"
-#include "../Shared/mapd_shared_mutex.h"
-
-#include "SessionInfo.h"
-#include "SysCatalog.h"
+enum GetTablesType { GET_PHYSICAL_TABLES_AND_VIEWS, GET_PHYSICAL_TABLES, GET_VIEWS };
 
 namespace Parser {
 
 class SharedDictionaryDef;
 
 }  // namespace Parser
+
+class TableArchiver;
 
 // SPI means Sequential Positional Index which is equivalent to the input index in a
 // RexInput node
@@ -123,6 +128,7 @@ class Catalog final {
                     const ColumnDescriptor* cd,
                     const std::string& newColumnName);
   void addColumn(const TableDescriptor& td, ColumnDescriptor& cd);
+  void dropColumn(const TableDescriptor& td, const ColumnDescriptor& cd);
   void removeChunks(const int table_id);
 
   /**
@@ -187,10 +193,21 @@ class Catalog final {
   std::vector<const TableDescriptor*> getPhysicalTablesDescriptors(
       const TableDescriptor* logicalTableDesc) const;
 
+  /**
+   * Get names of all tables accessible to user.
+   *
+   * @param user - user to retrieve table names for
+   * @param get_tables_type - enum indicating if tables, views or tables & views
+   * should be returned
+   * @return table_names - vector of table names accessible by user
+   */
+  std::vector<std::string> getTableNamesForUser(
+      const UserMetadata& user,
+      const GetTablesType get_tables_type) const;
+
   int32_t getTableEpoch(const int32_t db_id, const int32_t table_id) const;
   void setTableEpoch(const int db_id, const int table_id, const int new_epoch);
   int getDatabaseId() const { return currentDB_.dbId; }
-
   SqliteConnector& getSqliteConnector() { return sqliteConnector_; }
   void roll(const bool forward);
   DictRef addDictionary(ColumnDescriptor& cd);
@@ -208,7 +225,7 @@ class Catalog final {
                                       bool is_new_db);
   static void remove(const std::string& dbName);
 
-  const bool checkMetadataForDeletedRecs(int dbId, int tableId, int columnId) const;
+  const bool checkMetadataForDeletedRecs(const TableDescriptor* td, int column_id) const;
   const ColumnDescriptor* getDeletedColumn(const TableDescriptor* td) const;
   const ColumnDescriptor* getDeletedColumnIfRowsDeleted(const TableDescriptor* td) const;
 
@@ -221,45 +238,65 @@ class Catalog final {
   void eraseTablePhysicalData(const TableDescriptor* td);
   void vacuumDeletedRows(const TableDescriptor* td) const;
   void vacuumDeletedRows(const int logicalTableId) const;
+  void setForReload(const int32_t tableId);
 
-  // dump & restore
-  void dumpTable(const TableDescriptor* td,
-                 const std::string& path,
-                 const std::string& compression) const;
-  void restoreTable(const SessionInfo& session,
-                    const TableDescriptor* td,
-                    const std::string& file_path,
-                    const std::string& compression);
-  void restoreTable(const SessionInfo& session,
-                    const std::string& table_name,
-                    const std::string& file_path,
-                    const std::string& compression);
   std::vector<std::string> getTableDataDirectories(const TableDescriptor* td) const;
   std::vector<std::string> getTableDictDirectories(const TableDescriptor* td) const;
   std::string getColumnDictDirectory(const ColumnDescriptor* cd) const;
   std::string dumpSchema(const TableDescriptor* td) const;
 
- protected:
-  typedef std::map<std::string, TableDescriptor*> TableDescriptorMap;
-  typedef std::map<int, TableDescriptor*> TableDescriptorMapById;
-  typedef std::map<int32_t, std::vector<int32_t>> LogicalToPhysicalTableMapById;
-  typedef std::tuple<int, std::string> ColumnKey;
-  typedef std::map<ColumnKey, ColumnDescriptor*> ColumnDescriptorMap;
-  typedef std::tuple<int, int> ColumnIdKey;
-  typedef std::map<ColumnIdKey, ColumnDescriptor*> ColumnDescriptorMapById;
-  typedef std::map<DictRef, std::unique_ptr<DictDescriptor>> DictDescriptorMapById;
-  typedef std::map<std::string, std::shared_ptr<DashboardDescriptor>>
-      DashboardDescriptorMap;
-  typedef std::map<std::string, LinkDescriptor*> LinkDescriptorMap;
-  typedef std::map<int, LinkDescriptor*> LinkDescriptorMapById;
-  typedef std::unordered_map<const TableDescriptor*, const ColumnDescriptor*>
-      DeletedColumnPerTableMap;
+  /**
+   * Creates a new foreign server DB object.
+   *
+   * @param foreign_server - unique pointer to struct containing foreign server details
+   * @param if_not_exists - flag indicating whether or not an attempt to create a new
+   * foreign server should occur if a server with the same name already exists. An
+   * exception is thrown if this flag is set to "false" and an attempt is made to create
+   * a pre-existing foreign server
+   */
+  void createForeignServer(std::unique_ptr<foreign_storage::ForeignServer> foreign_server,
+                           bool if_not_exists);
 
+  /**
+   * Gets a pointer to a struct containing foreign server details.
+   *
+   * @param server_name - Name of foreign server whose details will be fetched
+   * @return pointer to a struct containing foreign server details. nullptr is returned if
+   * no foreign server exists with the given name
+   */
+  foreign_storage::ForeignServer* getForeignServer(const std::string& server_name) const;
+
+  /**
+   * Gets a pointer to a struct containing foreign server details.
+   * Skip in-memory cache of foreign server struct when attempting to fetch foreign server
+   * details. This is mainly used for testing.
+   *
+   * @param server_name - Name of foreign server whose details will be fetched
+   * @return pointer to a struct containing foreign server details. nullptr is returned if
+   * no foreign server exists with the given name
+   */
+  foreign_storage::ForeignServer* getForeignServerSkipCache(
+      const std::string& server_name);
+
+  /**
+   * Drops/deletes a foreign server DB object.
+   *
+   * @param server_name - Name of foreign server that will be deleted
+   */
+  void dropForeignServer(const std::string& server_name);
+
+  /**
+   * Creates default local file servers (if they don't already exist).
+   */
+  void createDefaultServersIfNotExists();
+
+ protected:
   void CheckAndExecuteMigrations();
   void CheckAndExecuteMigrationsPostBuildMaps();
   void updateDictionaryNames();
   void updateTableDescriptorSchema();
   void updateFixlenArrayColumns();
+  void updateGeoColumns();
   void updateFrontendViewSchema();
   void updateLinkSchema();
   void updateFrontendViewAndLinkUsers();
@@ -269,15 +306,18 @@ class Catalog final {
   void updatePageSize();
   void updateDeletedColumnIndicator();
   void updateFrontendViewsToDashboards();
+  void createFsiSchemasAndDefaultServers();
+  void dropFsiSchemasAndTables();
   void recordOwnershipOfObjectsInObjectPermissions();
   void checkDateInDaysColumnMigration();
   void createDashboardSystemRoles();
   void buildMaps();
-  void addTableToMap(TableDescriptor& td,
+  void addTableToMap(const TableDescriptor* td,
                      const std::list<ColumnDescriptor>& columns,
                      const std::list<DictDescriptor>& dicts);
   void addReferenceToForeignDict(ColumnDescriptor& referencing_column,
-                                 Parser::SharedDictionaryDef shared_dict_def);
+                                 Parser::SharedDictionaryDef shared_dict_def,
+                                 const bool persist_reference);
   bool setColumnSharedDictionary(
       ColumnDescriptor& cd,
       std::list<ColumnDescriptor>& cdd,
@@ -295,6 +335,7 @@ class Catalog final {
                           const int tableId,
                           const bool is_on_error = false);
   void doDropTable(const TableDescriptor* td);
+  void executeDropTableSqliteQueries(const TableDescriptor* td);
   void doTruncateTable(const TableDescriptor* td);
   void renamePhysicalTable(const TableDescriptor* td, const std::string& newTableName);
   void instantiateFragmenter(TableDescriptor* td) const;
@@ -314,6 +355,10 @@ class Catalog final {
 
   const int getColumnIdBySpiUnlocked(const int table_id, const size_t spi) const;
 
+  void serializeTableJsonUnlocked(const TableDescriptor* td,
+                                  const std::list<ColumnDescriptor>& cds) const;
+  void dropTableFromJsonUnlocked(const std::string& table_name) const;
+
   std::string basePath_;
   TableDescriptorMap tableDescriptorMap_;
   TableDescriptorMapById tableDescriptorMapById_;
@@ -323,6 +368,9 @@ class Catalog final {
   DashboardDescriptorMap dashboardDescriptorMap_;
   LinkDescriptorMap linkDescriptorMap_;
   LinkDescriptorMapById linkDescriptorMapById_;
+  ForeignServerMap foreignServerMap_;
+  ForeignServerMapById foreignServerMapById_;
+
   SqliteConnector sqliteConnector_;
   DBMetadata currentDB_;
   std::shared_ptr<Data_Namespace::DataMgr> dataMgr_;
@@ -353,6 +401,16 @@ class Catalog final {
   void renameTableDirectories(const std::string& temp_data_dir,
                               const std::vector<std::string>& target_paths,
                               const std::string& name_prefix) const;
+  void buildForeignServerMap();
+  void addForeignTableDetails();
+
+  /**
+   * Same as createForeignServer() but without acquiring locks. This should only be called
+   * from within a function/code block that already acquires appropriate locks.
+   */
+  void createForeignServerNoLocks(
+      std::unique_ptr<foreign_storage::ForeignServer> foreign_server,
+      bool if_not_exists);
 
  public:
   mutable std::mutex sqliteMutex_;
@@ -364,5 +422,3 @@ class Catalog final {
 };
 
 }  // namespace Catalog_Namespace
-
-#endif  // CATALOG_H

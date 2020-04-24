@@ -16,17 +16,17 @@
 
 #pragma once
 
-#include "../StringDictionary/StringDictionaryProxy.h"
-#include "Shared/Logger.h"
-
 #include <boost/noncopyable.hpp>
-
 #include <list>
 #include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "DataMgr/AbstractBuffer.h"
+#include "Shared/Logger.h"
+#include "StringDictionary/StringDictionaryProxy.h"
 
 class ResultSet;
 
@@ -55,6 +55,17 @@ class RowSetMemoryOwner : boost::noncopyable {
     varlen_buffers_.push_back(varlen_buffer);
   }
 
+  /**
+   * Adds a GPU buffer containing a variable length input column. Variable length inputs
+   * on GPU are referenced in output projected targets and should not be freed until the
+   * query results have been resolved.
+   */
+  void addVarlenInputBuffer(Data_Namespace::AbstractBuffer* buffer) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    CHECK_EQ(buffer->getType(), Data_Namespace::MemoryLevel::GPU_LEVEL);
+    varlen_input_buffers_.push_back(buffer);
+  }
+
   std::string* addString(const std::string& str) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     strings_.emplace_back(str);
@@ -75,19 +86,20 @@ class RowSetMemoryOwner : boost::noncopyable {
     if (it != str_dict_proxy_owned_.end()) {
       CHECK_EQ(it->second->getDictionary(), str_dict.get());
       it->second->updateGeneration(generation);
-      return it->second;
+      return it->second.get();
     }
-    StringDictionaryProxy* str_dict_proxy =
-        new StringDictionaryProxy(str_dict, generation);
-    str_dict_proxy_owned_.emplace(dict_id, str_dict_proxy);
-    return str_dict_proxy;
+    it = str_dict_proxy_owned_
+             .emplace(dict_id,
+                      std::make_shared<StringDictionaryProxy>(str_dict, generation))
+             .first;
+    return it->second.get();
   }
 
   StringDictionaryProxy* getStringDictProxy(const int dict_id) const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     auto it = str_dict_proxy_owned_.find(dict_id);
     CHECK(it != str_dict_proxy_owned_.end());
-    return it->second;
+    return it->second.get();
   }
 
   void addLiteralStringDictProxy(
@@ -121,13 +133,20 @@ class RowSetMemoryOwner : boost::noncopyable {
     for (auto varlen_buffer : varlen_buffers_) {
       free(varlen_buffer);
     }
+    for (auto varlen_input_buffer : varlen_input_buffers_) {
+      CHECK(varlen_input_buffer);
+      varlen_input_buffer->unPin();
+    }
     for (auto col_buffer : col_buffers_) {
       free(col_buffer);
     }
+  }
 
-    for (auto dict_proxy : str_dict_proxy_owned_) {
-      delete dict_proxy.second;
-    }
+  std::shared_ptr<RowSetMemoryOwner> cloneStrDictDataOnly() {
+    auto rtn = std::make_shared<RowSetMemoryOwner>();
+    rtn->str_dict_proxy_owned_ = str_dict_proxy_owned_;
+    rtn->lit_str_dict_proxy_ = lit_str_dict_proxy_;
+    return rtn;
   }
 
  private:
@@ -143,10 +162,12 @@ class RowSetMemoryOwner : boost::noncopyable {
   std::vector<void*> varlen_buffers_;
   std::list<std::string> strings_;
   std::list<std::vector<int64_t>> arrays_;
-  std::unordered_map<int, StringDictionaryProxy*> str_dict_proxy_owned_;
+  std::unordered_map<int, std::shared_ptr<StringDictionaryProxy>> str_dict_proxy_owned_;
   std::shared_ptr<StringDictionaryProxy> lit_str_dict_proxy_;
   std::vector<void*> col_buffers_;
+  std::vector<Data_Namespace::AbstractBuffer*> varlen_input_buffers_;
   mutable std::mutex state_mutex_;
 
   friend class ResultSet;
+  friend class QueryExecutionContext;
 };

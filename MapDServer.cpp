@@ -15,7 +15,8 @@
  */
 
 #include "MapDServer.h"
-#include "ThriftHandler/MapDHandler.h"
+#include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
+#include "ThriftHandler/DBHandler.h"
 
 #ifdef HAVE_THRIFT_THREADFACTORY
 #include <thrift/concurrency/ThreadFactory.h>
@@ -37,7 +38,7 @@
 
 #include "Archive/S3Archive.h"
 #include "Shared/Logger.h"
-#include "Shared/MapDParameters.h"
+#include "Shared/SystemParameters.h"
 #include "Shared/file_delete.h"
 #include "Shared/mapd_shared_mutex.h"
 #include "Shared/mapd_shared_ptr.h"
@@ -55,8 +56,9 @@
 #include <thread>
 #include <vector>
 #include "MapDRelease.h"
+#include "Shared/Asio.h"
 #include "Shared/Compressor.h"
-#include "Shared/MapDParameters.h"
+#include "Shared/SystemParameters.h"
 #include "Shared/file_delete.h"
 #include "Shared/mapd_shared_ptr.h"
 #include "Shared/scope.h"
@@ -79,32 +81,25 @@ extern size_t g_max_memory_allocation_size;
 extern size_t g_min_memory_allocation_size;
 extern bool g_enable_experimental_string_functions;
 extern bool g_enable_table_functions;
+extern bool g_enable_fsi;
+extern bool g_enable_lazy_fetch;
+extern bool g_enable_interop;
+extern bool g_enable_union;
+extern bool g_use_tbb_pool;
 
 bool g_enable_thrift_logs{false};
 
-std::atomic<bool> g_running{true};
 std::atomic<int> g_saw_signal{-1};
+std::atomic<const char*> g_simple_error_message{nullptr};
 
 mapd_shared_mutex g_thrift_mutex;
 TThreadedServer* g_thrift_http_server{nullptr};
 TThreadedServer* g_thrift_buf_server{nullptr};
 
-TableGenerations table_generations_from_thrift(
-    const std::vector<TTableGeneration>& thrift_table_generations) {
-  TableGenerations table_generations;
-  for (const auto& thrift_table_generation : thrift_table_generations) {
-    table_generations.setGeneration(
-        thrift_table_generation.table_id,
-        TableGeneration{static_cast<size_t>(thrift_table_generation.tuple_count),
-                        static_cast<size_t>(thrift_table_generation.start_rowid)});
-  }
-  return table_generations;
-}
-
-mapd::shared_ptr<MapDHandler> g_warmup_handler =
+mapd::shared_ptr<DBHandler> g_warmup_handler =
     0;  // global "g_warmup_handler" needed to avoid circular dependency
-        // between "MapDHandler" & function "run_warmup_queries"
-mapd::shared_ptr<MapDHandler> g_mapd_handler = 0;
+        // between "DBHandler" & function "run_warmup_queries"
+mapd::shared_ptr<DBHandler> g_mapd_handler = 0;
 std::once_flag g_shutdown_once_flag;
 
 void shutdown_handler() {
@@ -113,24 +108,26 @@ void shutdown_handler() {
   }
 }
 
-void register_signal_handler(int signum, void (*handler)(int)) {
-  struct sigaction act;
-  memset(&act, 0, sizeof(act));
-  if (handler != SIG_DFL && handler != SIG_IGN) {
-    // block all signal deliveries while inside the signal handler
-    sigfillset(&act.sa_mask);
-  }
-  act.sa_handler = handler;
-  sigaction(signum, &act, NULL);
-}
-
 // Signal handler to set a global flag telling the server to exit.
 // Do not call other functions inside this (or any) signal handler
 // unless you really know what you are doing. See also:
 //   man 7 signal-safety
 //   man 7 signal
 //   https://en.wikipedia.org/wiki/Reentrancy_(computing)
-void omnisci_signal_handler(int signum) {
+void omnisci_signal_handler(const boost::system::error_code& error, int signum) {
+  if (error) {  // NOTE: the docs don't say if Boost will ever do this
+    g_simple_error_message = "omnisci_signal_handler: boost error, ignored";
+    return;
+  }
+
+  // For some reason Boost needs us to register a SIGCHLD handler
+  // to make boost::process::system and/or boost::process::child work
+  // correctly when a child gets SIGKILLed. Rather than spend too much
+  // time figuring out why, simply don't do anything here.
+  if (signum == SIGCHLD) {
+    return;
+  }
+
   // Record the signal number for logging during shutdown.
   // Only records the first signal if called more than once.
   int expected_signal{-1};
@@ -140,10 +137,10 @@ void omnisci_signal_handler(int signum) {
 
   // This point should never be reached more than once.
 
-  // Tell heartbeat() to shutdown by unsetting the 'g_running' flag.
-  // If 'g_running' is already false, this has no effect and the
+  // Tell heartbeat() to shutdown by unsetting the 'Asio::running' flag.
+  // If 'Asio::running' is already false, this has no effect and the
   // shutdown is already in progress.
-  g_running = false;
+  Asio::running = false;
 
   // Handle core dumps specially by pausing inside this signal handler
   // because on some systems, some signals will execute their default
@@ -152,26 +149,10 @@ void omnisci_signal_handler(int signum) {
   if (signum == SIGQUIT || signum == SIGABRT || signum == SIGSEGV || signum == SIGFPE) {
     // Wait briefly to give heartbeat() a chance to flush the logs and
     // do any other emergency shutdown tasks.
-    sleep(2);
+    sleep(1);
 
-    // Explicitly trigger whatever default action this signal would
-    // have done, such as terminate the process or dump core.
-    // Signals are currently blocked so this new signal will be queued
-    // until this signal handler returns.
-    register_signal_handler(signum, SIG_DFL);
     kill(getpid(), signum);
   }
-}
-
-void register_signal_handlers() {
-  register_signal_handler(SIGINT, omnisci_signal_handler);
-  register_signal_handler(SIGQUIT, omnisci_signal_handler);
-  register_signal_handler(SIGHUP, omnisci_signal_handler);
-  register_signal_handler(SIGTERM, omnisci_signal_handler);
-  register_signal_handler(SIGSEGV, omnisci_signal_handler);
-  register_signal_handler(SIGABRT, omnisci_signal_handler);
-  // Thrift secure socket can cause problems with SIGPIPE
-  register_signal_handler(SIGPIPE, SIG_IGN);
 }
 
 void start_server(TThreadedServer& server, const int port) {
@@ -189,7 +170,7 @@ void releaseWarmupSession(TSessionId& sessionId, std::ifstream& query_file) {
   }
 }
 
-void run_warmup_queries(mapd::shared_ptr<MapDHandler> handler,
+void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
                         std::string base_path,
                         std::string query_file_path) {
   // run warmup queries to load cache if requested
@@ -226,7 +207,7 @@ void run_warmup_queries(mapd::shared_ptr<MapDHandler> handler,
         std::string single_query;
         while (std::getline(query_file, single_query)) {
           boost::algorithm::trim(single_query);
-          if (single_query.length() == 0) {
+          if (single_query.length() == 0 || single_query[0] == '-') {
             continue;
           }
           if (single_query[0] == '}') {
@@ -275,9 +256,8 @@ class MapDProgramOptions {
     fillAdvancedOptions();
   }
   int http_port = 6278;
-  size_t reserved_gpu_mem = 1 << 27;
+  size_t reserved_gpu_mem = 384 * 1024 * 1024;
   std::string base_path;
-  std::string config_file = {"mapd.conf"};
   std::string cluster_file = {"cluster.conf"};
   std::string cluster_topology_file = {"cluster_topology.conf"};
   std::string license_path = {""};
@@ -291,17 +271,20 @@ class MapDProgramOptions {
   bool enable_legacy_syntax = true;
   AuthMetadata authMetadata;
 
-  MapDParameters mapd_parameters;
+  SystemParameters mapd_parameters;
   bool enable_rendering = false;
   bool enable_auto_clear_render_mem = false;
   int render_oom_retry_threshold = 0;  // in milliseconds
-  size_t render_mem_bytes = 500000000;
+  size_t render_mem_bytes = 1000000000;
   size_t render_poly_cache_bytes = 300000000;
+  size_t max_concurrent_render_sessions = 500;
 
   bool enable_runtime_udf = false;
 
   bool enable_watchdog = true;
   bool enable_dynamic_watchdog = false;
+  bool enable_runtime_query_interrupt = false;
+  unsigned runtime_query_interrupt_frequency = 1000;  // in milliseconds
   unsigned dynamic_watchdog_time_limit = 10000;
 
   /**
@@ -332,6 +315,8 @@ class MapDProgramOptions {
    */
   int max_session_duration = kMinsPerMonth;
   std::string udf_file_name = {""};
+  std::string udf_compiler_path = {""};
+  std::vector<std::string> udf_compiler_options;
 
   void fillOptions();
   void fillAdvancedOptions();
@@ -395,7 +380,7 @@ void MapDProgramOptions::fillOptions() {
                             "Calcite port number.");
   }
   help_desc.add_options()("config",
-                          po::value<std::string>(&config_file),
+                          po::value<std::string>(&mapd_parameters.config_file),
                           "Path to server configuration file.");
   help_desc.add_options()("cpu-buffer-mem-bytes",
                           po::value<size_t>(&mapd_parameters.cpu_buffer_mem_bytes)
@@ -453,6 +438,23 @@ void MapDProgramOptions::fillOptions() {
                               ->implicit_value(true),
                           "Enable the overlaps hash join framework allowing for range "
                           "join (e.g. spatial overlaps) computation using a hash table.");
+  help_desc.add_options()("enable-hashjoin-many-to-many",
+                          po::value<bool>(&g_enable_hashjoin_many_to_many)
+                              ->default_value(g_enable_hashjoin_many_to_many)
+                              ->implicit_value(true),
+                          "Enable the overlaps hash join framework allowing for range "
+                          "join (e.g. spatial overlaps) computation using a hash table.");
+  help_desc.add_options()("enable-runtime-query-interrupt",
+                          po::value<bool>(&enable_runtime_query_interrupt)
+                              ->default_value(enable_runtime_query_interrupt)
+                              ->implicit_value(true),
+                          "Enable runtime query interrupt.");
+  help_desc.add_options()("runtime-query-interrupt-frequency",
+                          po::value<unsigned>(&runtime_query_interrupt_frequency)
+                              ->default_value(runtime_query_interrupt_frequency)
+                              ->implicit_value(1000),
+                          "A frequency of checking the request of runtime query "
+                          "interrupt from user (in millisecond).");
   if (!dist_v5_) {
     help_desc.add_options()(
         "enable-string-dict-hash-cache",
@@ -593,7 +595,35 @@ void MapDProgramOptions::fillOptions() {
                               ->default_value(g_enable_experimental_string_functions)
                               ->implicit_value(true),
                           "Enable experimental string functions.");
-
+#ifdef ENABLE_FSI
+  help_desc.add_options()(
+      "enable-fsi",
+      po::value<bool>(&g_enable_fsi)->default_value(g_enable_fsi)->implicit_value(true),
+      "Enable foreign storage interface.");
+#endif  // ENABLE_FSI
+  help_desc.add_options()(
+      "enable-interoperability",
+      po::value<bool>(&g_enable_interop)
+          ->default_value(g_enable_interop)
+          ->implicit_value(true),
+      "Enable offloading of query portions to an external execution engine.");
+  help_desc.add_options()("enable-union",
+                          po::value<bool>(&g_enable_union)
+                              ->default_value(g_enable_union)
+                              ->implicit_value(true),
+                          "Enable UNION ALL SQL clause.");
+  help_desc.add_options()(
+      "calcite-service-timeout",
+      po::value<size_t>(&mapd_parameters.calcite_timeout)
+          ->default_value(mapd_parameters.calcite_timeout),
+      "Calcite server timeout (milliseconds). Increase this on systems with frequent "
+      "schema changes or when running large numbers of parallel queries.");
+  help_desc.add_options()(
+      "stringdict-parallelizm",
+      po::value<bool>(&g_enable_stringdict_parallel)
+          ->default_value(g_enable_stringdict_parallel)
+          ->implicit_value(false),
+      "Allow StringDictionary to parallelize loads using multiple threads");
   help_desc.add(log_options_.get_options());
 }
 
@@ -658,6 +688,12 @@ void MapDProgramOptions::fillAdvancedOptions() {
           ->default_value(intel_jit_profile)
           ->implicit_value(true),
       "Enable runtime support for the JIT code profiling using Intel VTune.");
+  developer_desc.add_options()(
+      "enable-modern-thread-pool",
+      po::value<bool>(&g_use_tbb_pool)
+          ->default_value(g_use_tbb_pool)
+          ->implicit_value(true),
+      "Enable a new thread pool implementation for queuing kernels for execution.");
   developer_desc.add_options()(
       "skip-intermediate-count",
       po::value<bool>(&g_skip_intermediate_count)
@@ -763,6 +799,27 @@ void MapDProgramOptions::fillAdvancedOptions() {
       po::value<std::string>(&udf_file_name),
       "Load user defined extension functions from this file at startup. The file is "
       "expected to be a C/C++ file with extension .cpp.");
+  developer_desc.add_options()("enable-lazy-fetch",
+                               po::value<bool>(&g_enable_lazy_fetch)
+                                   ->default_value(g_enable_lazy_fetch)
+                                   ->implicit_value(true),
+                               "Enable lazy fetch columns in ResultSets");
+
+  developer_desc.add_options()(
+      "udf-compiler-path",
+      po::value<std::string>(&udf_compiler_path),
+      "Provide absolute path to clang++ used in udf compilation.");
+
+  developer_desc.add_options()("enable-multifrag-rs",
+                               po::value<bool>(&g_enable_multifrag_rs)
+                                   ->default_value(g_enable_multifrag_rs)
+                                   ->implicit_value(true),
+                               "Enable multifragment intermediate result sets");
+
+  developer_desc.add_options()(
+      "udf-compiler-options",
+      po::value<std::vector<std::string> >(&udf_compiler_options),
+      "Specify compiler options to tailor udf compilation.");
 }
 
 namespace {
@@ -861,6 +918,11 @@ void MapDProgramOptions::validate() {
   if (enable_dynamic_watchdog) {
     LOG(INFO) << " Dynamic Watchdog timeout is set to " << dynamic_watchdog_time_limit;
   }
+  LOG(INFO) << " Runtime query interrupt is set to " << enable_runtime_query_interrupt;
+  if (enable_runtime_query_interrupt) {
+    LOG(INFO) << " A frequency of checking runtime query interrupt request is set to "
+              << runtime_query_interrupt_frequency << " (in ms.)";
+  }
 
   LOG(INFO) << " Debug Timer is set to " << g_enable_debug_timer;
 
@@ -883,7 +945,7 @@ boost::optional<int> MapDProgramOptions::parse_command_line(int argc,
     po::notify(vm);
 
     if (vm.count("config")) {
-      std::ifstream settings_file(config_file);
+      std::ifstream settings_file(mapd_parameters.config_file);
 
       auto sanitized_settings = sanitize_config_file(settings_file);
 
@@ -916,7 +978,7 @@ boost::optional<int> MapDProgramOptions::parse_command_line(int argc,
                    "[--http-port <http port number>] [--flush-log] [--version|-v]"
                 << std::endl
                 << std::endl;
-      std::cerr << help_desc << std::endl;
+      std::cout << help_desc << std::endl;
       return 0;
     }
     if (vm.count("dev-options")) {
@@ -935,6 +997,8 @@ boost::optional<int> MapDProgramOptions::parse_command_line(int argc,
     g_enable_watchdog = enable_watchdog;
     g_enable_dynamic_watchdog = enable_dynamic_watchdog;
     g_dynamic_watchdog_time_limit = dynamic_watchdog_time_limit;
+    g_enable_runtime_query_interrupt = enable_runtime_query_interrupt;
+    g_runtime_query_interrupt_frequency = runtime_query_interrupt_frequency;
   } catch (po::error& e) {
     std::cerr << "Usage Error: " << e.what() << std::endl;
     return 1;
@@ -962,6 +1026,18 @@ boost::optional<int> MapDProgramOptions::parse_command_line(int argc,
     }
 
     LOG(INFO) << " User provided extension functions loaded from " << udf_file_name;
+  }
+
+  if (vm.count("udf-compiler-path")) {
+    boost::algorithm::trim_if(udf_compiler_path, boost::is_any_of("\"'"));
+  }
+
+  auto trim_string = [](std::string& s) {
+    boost::algorithm::trim_if(s, boost::is_any_of("\"'"));
+  };
+
+  if (vm.count("udf-compiler-options")) {
+    std::for_each(udf_compiler_options.begin(), udf_compiler_options.end(), trim_string);
   }
 
   if (enable_runtime_udf) {
@@ -1025,11 +1101,14 @@ void heartbeat() {
     throw std::runtime_error("heartbeat() thread startup failed");
   }
 
-  // Sleep until omnisci_signal_handler or anything clears the g_running flag.
+  // Sleep until omnisci_signal_handler or anything clears the Asio::running flag.
   VLOG(1) << "heartbeat thread starting";
-  while (::g_running) {
+  while (Asio::running) {
     using namespace std::chrono;
-    std::this_thread::sleep_for(1s);
+    std::this_thread::sleep_for(500ms);
+    if (const char* simple_error_message = g_simple_error_message.exchange(nullptr)) {
+      LOG(ERROR) << simple_error_message;
+    }
   }
   VLOG(1) << "heartbeat thread exiting";
 
@@ -1067,7 +1146,14 @@ void heartbeat() {
 
 int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server = true) {
   // try to enforce an orderly shutdown even after a signal
-  register_signal_handlers();
+  Asio::register_signal_handler(SIGINT, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGQUIT, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGHUP, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGTERM, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGSEGV, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGABRT, omnisci_signal_handler);
+  Asio::register_signal_handler(SIGCHLD, omnisci_signal_handler);
+  Asio::start();
 
   // register shutdown procedures for when a normal shutdown happens
   // be aware that atexit() functions run in reverse order
@@ -1084,7 +1170,7 @@ int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server
   const unsigned int wait_interval =
       3;  // wait time in secs after looking for deleted file before looking again
   std::thread file_delete_thread(file_delete,
-                                 std::ref(g_running),
+                                 std::ref(Asio::running),
                                  wait_interval,
                                  prog_config_opts.base_path + "/mapd_data");
   std::thread heartbeat_thread(heartbeat);
@@ -1102,30 +1188,33 @@ int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server
 
   try {
     g_mapd_handler =
-        mapd::make_shared<MapDHandler>(prog_config_opts.db_leaves,
-                                       prog_config_opts.string_leaves,
-                                       prog_config_opts.base_path,
-                                       prog_config_opts.cpu_only,
-                                       prog_config_opts.allow_multifrag,
-                                       prog_config_opts.jit_debug,
-                                       prog_config_opts.intel_jit_profile,
-                                       prog_config_opts.read_only,
-                                       prog_config_opts.allow_loop_joins,
-                                       prog_config_opts.enable_rendering,
-                                       prog_config_opts.enable_auto_clear_render_mem,
-                                       prog_config_opts.render_oom_retry_threshold,
-                                       prog_config_opts.render_mem_bytes,
-                                       prog_config_opts.num_gpus,
-                                       prog_config_opts.start_gpu,
-                                       prog_config_opts.reserved_gpu_mem,
-                                       prog_config_opts.num_reader_threads,
-                                       prog_config_opts.authMetadata,
-                                       prog_config_opts.mapd_parameters,
-                                       prog_config_opts.enable_legacy_syntax,
-                                       prog_config_opts.idle_session_duration,
-                                       prog_config_opts.max_session_duration,
-                                       prog_config_opts.enable_runtime_udf,
-                                       prog_config_opts.udf_file_name);
+        mapd::make_shared<DBHandler>(prog_config_opts.db_leaves,
+                                     prog_config_opts.string_leaves,
+                                     prog_config_opts.base_path,
+                                     prog_config_opts.cpu_only,
+                                     prog_config_opts.allow_multifrag,
+                                     prog_config_opts.jit_debug,
+                                     prog_config_opts.intel_jit_profile,
+                                     prog_config_opts.read_only,
+                                     prog_config_opts.allow_loop_joins,
+                                     prog_config_opts.enable_rendering,
+                                     prog_config_opts.enable_auto_clear_render_mem,
+                                     prog_config_opts.render_oom_retry_threshold,
+                                     prog_config_opts.render_mem_bytes,
+                                     prog_config_opts.max_concurrent_render_sessions,
+                                     prog_config_opts.num_gpus,
+                                     prog_config_opts.start_gpu,
+                                     prog_config_opts.reserved_gpu_mem,
+                                     prog_config_opts.num_reader_threads,
+                                     prog_config_opts.authMetadata,
+                                     prog_config_opts.mapd_parameters,
+                                     prog_config_opts.enable_legacy_syntax,
+                                     prog_config_opts.idle_session_duration,
+                                     prog_config_opts.max_session_duration,
+                                     prog_config_opts.enable_runtime_udf,
+                                     prog_config_opts.udf_file_name,
+                                     prog_config_opts.udf_compiler_path,
+                                     prog_config_opts.udf_compiler_options);
   } catch (const std::exception& e) {
     LOG(FATAL) << "Failed to initialize service handler: " << e.what();
   }
@@ -1168,8 +1257,7 @@ int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server
   };
 
   if (prog_config_opts.mapd_parameters.ha_group_id.empty()) {
-    mapd::shared_ptr<TProcessor> processor(new MapDProcessor(g_mapd_handler));
-
+    mapd::shared_ptr<TProcessor> processor(new TrackingProcessor(g_mapd_handler));
     mapd::shared_ptr<TTransportFactory> bufTransportFactory(
         new TBufferedTransportFactory());
     mapd::shared_ptr<TProtocolFactory> bufProtocolFactory(new TBinaryProtocolFactory());
@@ -1186,12 +1274,15 @@ int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server
                           std::ref(bufServer),
                           prog_config_opts.mapd_parameters.omnisci_server_port);
 
-    // run warm up queries if any exists
-    run_warmup_queries(
-        g_mapd_handler, prog_config_opts.base_path, prog_config_opts.db_query_file);
-    if (prog_config_opts.exit_after_warmup) {
-      g_running = false;
-    }
+    // TEMPORARY
+    auto warmup_queries = [&prog_config_opts]() {
+      // run warm up queries if any exists
+      run_warmup_queries(
+          g_mapd_handler, prog_config_opts.base_path, prog_config_opts.db_query_file);
+      if (prog_config_opts.exit_after_warmup) {
+        Asio::running = false;
+      }
+    };
 
     mapd::shared_ptr<TServerTransport> httpServerTransport(httpServerSocket);
     mapd::shared_ptr<TTransportFactory> httpTransportFactory(
@@ -1206,18 +1297,23 @@ int startMapdServer(MapDProgramOptions& prog_config_opts, bool start_http_server
       }
       std::thread httpThread(
           start_server, std::ref(httpServer), prog_config_opts.http_port);
+
+      warmup_queries();
+
       bufThread.join();
       httpThread.join();
     } else {
+      warmup_queries();
       bufThread.join();
     }
   } else {  // running ha server
     LOG(FATAL) << "No High Availability module available, please contact OmniSci support";
   }
 
-  g_running = false;
+  Asio::running = false;
   file_delete_thread.join();
   heartbeat_thread.join();
+  ForeignStorageInterface::destroy();
 
   int signum = g_saw_signal;
   if (signum <= 0 || signum == SIGTERM) {

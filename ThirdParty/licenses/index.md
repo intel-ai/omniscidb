@@ -25,6 +25,8 @@ ncurses | [X11](<http://invisible-island.net/ncurses/ncurses.faq.html#who_owns_i
 PicoSHA2 | [MIT](<https://github.com/okdshin/PicoSHA2/blob/master/LICENSE>) | SHA256 Library |
 rapidjson | [MIT](<https://github.com/miloyip/rapidjson/blob/master/license.txt>) | JSON parsing |
 SQLite | [Public Domain](<https://www.sqlite.org/copyright.html>) | Catalog management |
+TBB | [Apache-2.0](https://raw.githubusercontent.com/oneapi-src/oneTBB/tbb_2020/LICENSE) | Threadpool support |
+TimeGM | [BSD](<https://cdn.netbsd.org/pub/pkgsrc/current/pkgsrc/pkgtools/libnbcompat/files/timegm.c>) | Date/time support |
 Xorg | [MIT](<https://www.x.org/releases/X11R7.7/doc/xorg-docs/License.html>) | OpenGL rendering |
 zlib | [zlib](<http://zlib.net/zlib_license.html>) | PNG support |
 --- | --- | --- |
@@ -59,7 +61,9 @@ dgrijalva/jwt-go | [MIT](<https://github.com/dgrijalva/jwt-go/blob/master/LICENS
 --- | --- | --- |
 Apache commons-cli | [Apache](<https://github.com/apache/commons-cli/blob/trunk/LICENSE.txt>) | CLI flags handler |
 Apache commons-math3 | [Apache](<https://github.com/apache/commons-math/blob/master/LICENSE.txt>) | Math functions |
+Apache commons-text | [Apache](<https://github.com/apache/commons-text/blob/master/LICENSE.txt>) | String parsing functions |
 slf4j-log4j12 | [MIT](<http://www.slf4j.org/license.html>) | Java logging |
+Google Gson | [Apache](<https://github.com/google/gson/blob/master/LICENSE>) | Java JSON parsing |
 Xerial sqlite-jdbc | [Apache](<https://github.com/xerial/sqlite-jdbc/blob/master/LICENSE>) | Catalog connector/reader |
 --- | --- | --- |
 bitshuffle | [MIT](<https://github.com/Blosc/c-blosc/blob/master/LICENSES/BITSHUFFLE.txt>) | Compression support |
@@ -100,7 +104,6 @@ gorilla/websocket | [BSD-2-Clause](<https://github.com/gorilla/websocket/blob/ma
 grpc-ecosystem/go-grpc-middleware | [Apache-2.0](<https://github.com/grpc-ecosystem/go-grpc-middleware/blob/master/LICENSE>) | Distributed consensus |
 grpc-ecosystem/go-grpc-prometheus | [Apache-2.0](<https://github.com/grpc-ecosystem/go-grpc-prometheus/blob/master/LICENSE>) | Distributed consensus |
 grpc-ecosystem/grpc-gateway | [BSD-3-Clause](<https://github.com/grpc-ecosystem/grpc-gateway/blob/master/LICENSE.txt>) | Distributed consensus |
-hashicorp/hcl | [MPL-2.0](<https://github.com/hashicorp/hcl/blob/master/LICENSE>) | Distributed consensus |
 Jeffail/gabs | [MIT](<https://github.com/Jeffail/gabs/blob/master/LICENSE>) | Distributed consensus |
 jonboulle/clockwork | [Apache-2.0](<https://github.com/jonboulle/clockwork/blob/master/LICENSE>) | Distributed consensus |
 kr/pretty | [MIT](<https://github.com/kr/pretty/blob/master/License>) | Distributed consensus |

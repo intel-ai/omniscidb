@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,15 +17,17 @@
 #include <thrift/Thrift.h>
 #include <array>
 #include <boost/filesystem.hpp>
+#include <boost/program_options.hpp>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <string>
+
 #include "Catalog/Catalog.h"
 #include "Import/Importer.h"
+#include "QueryRunner/QueryRunner.h"
 #include "Shared/Logger.h"
 #include "Shared/mapdpath.h"
-#include "boost/program_options.hpp"
 
 #define CALCITEPORT 3279
 
@@ -73,7 +75,7 @@ int main(int argc, char* argv[]) {
                   .run(),
               vm);
     if (vm.count("help")) {
-      std::cout << "Usage: initdb [-f] <catalog path>\n";
+      std::cout << desc;
       return 0;
     }
     if (vm.count("force")) {
@@ -139,10 +141,10 @@ int main(int argc, char* argv[]) {
   logger::init(log_options);
 
   try {
-    MapDParameters mapd_parms;
+    SystemParameters sys_parms;
     auto dummy =
-        std::make_shared<Data_Namespace::DataMgr>(data_path, mapd_parms, false, 0);
-    auto calcite = std::make_shared<Calcite>(-1, CALCITEPORT, base_path, 1024);
+        std::make_shared<Data_Namespace::DataMgr>(data_path, sys_parms, false, 0);
+    auto calcite = std::make_shared<Calcite>(-1, CALCITEPORT, base_path, 1024, 5000);
     auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
     sys_cat.init(base_path, dummy, {}, calcite, true, false, {});
 
@@ -156,7 +158,7 @@ int main(int argc, char* argv[]) {
       Catalog_Namespace::UserMetadata user;
       CHECK(sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user));
 
-      Importer_NS::ImportDriver import_driver(cat, user);
+      QueryRunner::ImportDriver import_driver(cat, user);
 
       const size_t num_samples = SampleGeoFileNames.size();
       for (size_t i = 0; i < num_samples; i++) {

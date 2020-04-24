@@ -67,11 +67,20 @@ llvm::Value* CodeGenerator::codegenCast(llvm::Value* operand_lv,
     CHECK(operand_ti.is_integer() || operand_ti.is_decimal() || operand_ti.is_time() ||
           operand_ti.is_boolean());
     if (operand_ti.is_boolean()) {
+      // cast boolean to int8
       CHECK(operand_lv->getType()->isIntegerTy(1) ||
             operand_lv->getType()->isIntegerTy(8));
       if (operand_lv->getType()->isIntegerTy(1)) {
         operand_lv = cgen_state_->castToTypeIn(operand_lv, 8);
       }
+      if (ti.is_boolean()) {
+        return operand_lv;
+      }
+    }
+    if (operand_ti.is_integer() && operand_lv->getType()->isIntegerTy(8) &&
+        ti.is_boolean()) {
+      // cast int8 to boolean
+      return codegenCastBetweenIntTypes(operand_lv, operand_ti, ti);
     }
     if (operand_ti.get_type() == kTIMESTAMP && ti.get_type() == kDATE) {
       // Maybe we should instead generate DatetruncExpr directly from RelAlgTranslator
@@ -89,7 +98,7 @@ llvm::Value* CodeGenerator::codegenCast(llvm::Value* operand_lv,
           (operand_ti.is_timestamp()) ? operand_ti.get_dimension() : 0;
       if (operand_dimen != ti.get_dimension()) {
         return codegenCastBetweenTimestamps(
-            operand_lv, operand_dimen, ti.get_dimension(), !ti.get_notnull());
+            operand_lv, operand_ti, ti, !ti.get_notnull());
       }
     }
     if (ti.is_integer() || ti.is_decimal() || ti.is_time()) {
@@ -134,31 +143,33 @@ llvm::Value* CodeGenerator::codegenCastTimestampToDate(llvm::Value* ts_lv,
 }
 
 llvm::Value* CodeGenerator::codegenCastBetweenTimestamps(llvm::Value* ts_lv,
-                                                         const int operand_dimen,
-                                                         const int target_dimen,
+                                                         const SQLTypeInfo& operand_ti,
+                                                         const SQLTypeInfo& target_ti,
                                                          const bool nullable) {
+  const auto operand_dimen = operand_ti.get_dimension();
+  const auto target_dimen = target_ti.get_dimension();
   if (operand_dimen == target_dimen) {
     return ts_lv;
   }
   CHECK(ts_lv->getType()->isIntegerTy(64));
-  static const std::string sup_fname{"DateTruncateAlterPrecisionScaleUp"};
-  static const std::string sdn_fname{"DateTruncateAlterPrecisionScaleDown"};
-  static const std::string sup_null_fname{"DateTruncateAlterPrecisionScaleUpNullable"};
-  static const std::string sdn_null_fname{"DateTruncateAlterPrecisionScaleDownNullable"};
-  std::vector<llvm::Value*> f_args{ts_lv,
-                                   cgen_state_->llInt(static_cast<int64_t>(
-                                       DateTimeUtils::get_timestamp_precision_scale(
-                                           abs(operand_dimen - target_dimen))))};
-  if (nullable) {
-    f_args.push_back(cgen_state_->inlineIntNull(SQLTypeInfo(kBIGINT, false)));
+  const auto scale =
+      DateTimeUtils::get_timestamp_precision_scale(abs(operand_dimen - target_dimen));
+  if (operand_dimen < target_dimen) {
+    return nullable
+               ? cgen_state_->emitCall("mul_int64_t_nullable_lhs",
+                                       {ts_lv,
+                                        cgen_state_->llInt(static_cast<int64_t>(scale)),
+                                        cgen_state_->inlineIntNull(operand_ti)})
+               : cgen_state_->ir_builder_.CreateMul(
+                     ts_lv, cgen_state_->llInt(static_cast<int64_t>(scale)));
   }
-  return operand_dimen < target_dimen
-             ? cgen_state_->emitExternalCall(nullable ? sup_null_fname : sup_fname,
-                                             get_int_type(64, cgen_state_->context_),
-                                             f_args)
-             : cgen_state_->emitExternalCall(nullable ? sdn_null_fname : sdn_fname,
-                                             get_int_type(64, cgen_state_->context_),
-                                             f_args);
+  return nullable
+             ? cgen_state_->emitCall("div_int64_t_nullable_lhs",
+                                     {ts_lv,
+                                      cgen_state_->llInt(static_cast<int64_t>(scale)),
+                                      cgen_state_->inlineIntNull(operand_ti)})
+             : cgen_state_->ir_builder_.CreateSDiv(
+                   ts_lv, cgen_state_->llInt(static_cast<int64_t>(scale)));
 }
 
 llvm::Value* CodeGenerator::codegenCastFromString(llvm::Value* operand_lv,
@@ -188,7 +199,7 @@ llvm::Value* CodeGenerator::codegenCastFromString(llvm::Value* operand_lv,
     CHECK_EQ(kENCODING_NONE, operand_ti.get_compression());
     CHECK_EQ(kENCODING_DICT, ti.get_compression());
     CHECK(operand_lv->getType()->isIntegerTy(64));
-    if (co.device_type_ == ExecutorDeviceType::GPU) {
+    if (co.device_type == ExecutorDeviceType::GPU) {
       throw QueryMustRunOnCpu();
     }
     return cgen_state_->emitExternalCall(
@@ -210,15 +221,19 @@ llvm::Value* CodeGenerator::codegenCastFromString(llvm::Value* operand_lv,
           "Cast from dictionary-encoded string to none-encoded would be slow");
     }
     CHECK_EQ(kENCODING_DICT, operand_ti.get_compression());
-    if (co.device_type_ == ExecutorDeviceType::GPU) {
+    if (co.device_type == ExecutorDeviceType::GPU) {
       throw QueryMustRunOnCpu();
     }
+    const int64_t string_dictionary_ptr =
+        operand_ti.get_comp_param() == 0
+            ? reinterpret_cast<int64_t>(
+                  executor()->getRowSetMemoryOwner()->getLiteralStringDictProxy())
+            : reinterpret_cast<int64_t>(executor()->getStringDictionaryProxy(
+                  operand_ti.get_comp_param(), executor()->getRowSetMemoryOwner(), true));
     return cgen_state_->emitExternalCall(
         "string_decompress",
         get_int_type(64, cgen_state_->context_),
-        {operand_lv,
-         cgen_state_->llInt(int64_t(executor()->getStringDictionaryProxy(
-             operand_ti.get_comp_param(), executor()->getRowSetMemoryOwner(), true)))});
+        {operand_lv, cgen_state_->llInt(string_dictionary_ptr)});
   }
   CHECK(operand_is_const);
   CHECK_EQ(kENCODING_DICT, ti.get_compression());

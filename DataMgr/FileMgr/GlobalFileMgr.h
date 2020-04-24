@@ -53,9 +53,6 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
                 const size_t num_reader_threads = 0,
                 const size_t defaultPageSize = 2097152);
 
-  /// Destructor
-  ~GlobalFileMgr() override;
-
   /// Creates a chunk with the specified key and page size.
   AbstractBuffer* createBuffer(const ChunkKey& key,
                                size_t pageSize = 0,
@@ -145,11 +142,16 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   size_t getNumChunks() override;
 
-  FileMgr* findFileMgr(const int db_id,
-                       const int tb_id,
-                       const bool removeFromMap = false);
-  FileMgr* getFileMgr(const int db_id, const int tb_id);
-  FileMgr* getFileMgr(const ChunkKey& key) { return getFileMgr(key[0], key[1]); }
+ private:
+  AbstractBufferMgr* findFileMgr(const int db_id, const int tb_id);
+  void deleteFileMgr(const int db_id, const int tb_id);
+
+ public:
+  AbstractBufferMgr* getFileMgr(const int db_id, const int tb_id);
+  AbstractBufferMgr* getFileMgr(const ChunkKey& key) {
+    return getFileMgr(key[0], key[1]);
+  }
+
   std::string getBasePath() const { return basePath_; }
   size_t getDefaultPageSize() const { return defaultPageSize_; }
 
@@ -172,6 +174,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
                */
   size_t defaultPageSize_;  /// default page size, used to set FileMgr defaultPageSize_
   // bool isDirty_;               /// true if metadata changed since last writeState()
+
   int mapd_db_version_;  /// DB version for DataMgr DS and corresponding file buffer
                          /// read/write code
   /* In future mapd_db_version_ may be added to AbstractBufferMgr class.
@@ -180,7 +183,10 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
    */
   bool dbConvert_;  /// true if conversion should be done between different
                     /// "mapd_db_version_"
-  std::map<std::pair<int, int>, FileMgr*> fileMgrs_;
+
+  std::map<std::pair<int, int>, std::shared_ptr<AbstractBufferMgr>> ownedFileMgrs_;
+  std::map<std::pair<int, int>, AbstractBufferMgr*> allFileMgrs_;
+
   mapd_shared_mutex fileMgrs_mutex_;
 };
 

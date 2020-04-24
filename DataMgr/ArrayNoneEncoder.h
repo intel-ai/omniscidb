@@ -65,10 +65,11 @@ class ArrayNoneEncoder : public Encoder {
     return n - start_idx;
   }
 
-  ChunkMetadata appendData(int8_t*& srcData,
-                           const size_t numAppendElems,
-                           const SQLTypeInfo&,
-                           const bool replicating = false) override {
+  ChunkMetadata appendData(int8_t*& src_data,
+                           const size_t num_elems_to_append,
+                           const SQLTypeInfo& ti,
+                           const bool replicating = false,
+                           const int64_t offset = -1) override {
     UNREACHABLE();  // should never be called for arrays
     return ChunkMetadata{};
   }
@@ -87,10 +88,10 @@ class ArrayNoneEncoder : public Encoder {
     bool first_elem_is_null = false;
     ArrayOffsetT initial_offset = 0;
     if (num_elems_ == 0) {
-      // If the very first ArrayDatum is NULL, initial offset will be set to 4
+      // If the very first ArrayDatum is NULL, initial offset will be set to 8
       // so we could negate it and write it out to index buffer to convey NULLness
       if ((*srcData)[0].is_null) {
-        initial_offset = 4;
+        initial_offset = 8;
         first_elem_is_null = true;
       }
       index_buf->append((int8_t*)&initial_offset,
@@ -112,8 +113,8 @@ class ArrayNoneEncoder : public Encoder {
         last_offset = -last_offset;
       }
     }
-    // Need to start data from 4 byte offset if first array encoded is a NULL array
-    size_t data_size = (first_elem_is_null) ? 4 : 0;
+    // Need to start data from 8 byte offset if first array encoded is a NULL array
+    size_t data_size = (first_elem_is_null) ? 8 : 0;
     for (size_t n = start_idx; n < start_idx + numAppendElems; n++) {
       // NULL arrays don't take any space so don't add to the data size
       if ((*srcData)[replicating ? 0 : n].is_null) {
@@ -125,8 +126,8 @@ class ArrayNoneEncoder : public Encoder {
 
     size_t inbuf_size =
         std::min(std::max(index_size, data_size), (size_t)MAX_INPUT_BUF_SIZE);
-    auto inbuf = new int8_t[inbuf_size];
-    std::unique_ptr<int8_t[]> gc_inbuf(inbuf);
+    auto gc_inbuf = std::make_unique<int8_t[]>(inbuf_size);
+    auto inbuf = gc_inbuf.get();
     for (size_t num_appended = 0; num_appended < numAppendElems;) {
       ArrayOffsetT* p = (ArrayOffsetT*)inbuf;
       size_t i;
@@ -143,9 +144,9 @@ class ArrayNoneEncoder : public Encoder {
       index_buf->append(inbuf, i * sizeof(ArrayOffsetT));
     }
 
-    // Pad buffer_ with 4 bytes if first encoded array is a NULL array
+    // Pad buffer_ with 8 bytes if first encoded array is a NULL array
     if (first_elem_is_null) {
-      buffer_->append(inbuf, 4);
+      buffer_->append(inbuf, 8);
     }
     for (size_t num_appended = 0; num_appended < numAppendElems;) {
       size_t size = 0;
@@ -208,6 +209,10 @@ class ArrayNoneEncoder : public Encoder {
   void updateStats(const int64_t, const bool) override { CHECK(false); }
 
   void updateStats(const double, const bool) override { CHECK(false); }
+
+  void updateStats(const int8_t* const dst, const size_t numBytes) override {
+    CHECK(false);
+  }
 
   void reduceStats(const Encoder&) override { CHECK(false); }
 

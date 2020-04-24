@@ -1,5 +1,5 @@
 pkgname='SPIRV-Cross'
-_tag='2019-04-26'
+_tag='2019-09-04'
 pkgver=${_tag//-/.} # pkgver cannot contain hyphens.
 _srcdir=$pkgname-$_tag
 pkgrel=1
@@ -9,13 +9,14 @@ url="https://github.com/KhronosGroup/SPIRV-Cross"
 license=('Apache-2.0')
 optdepends=()
 source=("https://github.com/KhronosGroup/$pkgname/archive/$_tag.tar.gz")
-sha256sums=('fba92cd232851bcf014fb12ddcd5be73bbe025ed9ca5f544b89262b1059e46d6')
+sha256sums=('b4e2e50c4514eda7dfbfeb3b80656a5306372e0ce904ba770c52fa903802d178')
 
 build(){
   mkdir build
   cd build
   cmake \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=on \
     -DSPIRV_CROSS_ENABLE_TESTS=OFF \
     "../$_srcdir"
   make

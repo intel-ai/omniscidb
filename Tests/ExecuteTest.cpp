@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 MapD Technologies, Inc.
+ * Copyright 2020 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "../QueryEngine/ResultSetReductionJIT.h"
 #include "../QueryRunner/QueryRunner.h"
 #include "../Shared/ConfigResolve.h"
+#include "../Shared/StringTransform.h"
 #include "../Shared/TimeGM.h"
 #include "../Shared/scope.h"
 #include "../SqliteConnector/SqliteConnector.h"
@@ -50,6 +51,7 @@ extern bool g_enable_smem_group_by;
 extern bool g_allow_cpu_retry;
 extern bool g_enable_watchdog;
 extern bool g_skip_intermediate_count;
+extern bool g_use_tbb_pool;
 
 extern unsigned g_trivial_loop_join_threshold;
 extern bool g_enable_overlaps_hashjoin;
@@ -57,8 +59,11 @@ extern double g_gpu_mem_limit_percent;
 
 extern bool g_enable_window_functions;
 extern bool g_enable_bump_allocator;
+extern bool g_enable_interop;
+extern bool g_enable_union;
 
 extern size_t g_leaf_count;
+extern bool g_cluster;
 
 using QR = QueryRunner::QueryRunner;
 
@@ -69,6 +74,7 @@ size_t g_shard_count{0};
 bool g_use_row_iterator{true};
 size_t g_num_leafs{1};
 bool g_keep_test_data{false};
+bool g_use_temporary_tables{false};
 
 size_t choose_shard_count() {
   auto session = QR::get()->getSession();
@@ -94,6 +100,7 @@ std::string build_create_table_statement(
     const ShardInfo& shard_info,
     const std::vector<SharedDictionaryInfo>& shared_dict_info,
     const size_t fragment_size,
+    const bool use_temporary_tables,
     const bool delete_support = true,
     const bool replicated = false) {
   const std::string shard_key_def{
@@ -116,18 +123,17 @@ std::string build_create_table_statement(
 
   if (delete_support) {
     with_statement_assembly << ", vacuum='delayed'";
+  } else {
+    with_statement_assembly << ", vacuum='immediate'";
   }
 
-  // const std::string fragment_size_def{shard_info.shard_col.empty() ? "fragment_size=" +
-  // std::to_string(fragment_size)
-  //                                                                 : ""};
-  // const std::string shard_count_def{shard_info.shard_col.empty() ? "" : "shard_count="
-  // +
-  //                                                                          std::to_string(shard_info.shard_count)};
   const std::string replicated_def{
       (!replicated || !shard_info.shard_col.empty()) ? "" : ", PARTITIONS='REPLICATED' "};
 
-  return "CREATE TABLE " + table_name + "(" + columns_definition + shard_key_def +
+  const std::string create_def{use_temporary_tables ? "CREATE TEMPORARY TABLE "
+                                                    : "CREATE TABLE "};
+
+  return create_def + table_name + "(" + columns_definition + shard_key_def +
          boost::algorithm::join(shared_dict_def, "") + ") WITH (" +
          with_statement_assembly.str() + replicated_def + ");";
 }
@@ -197,8 +203,8 @@ class SQLiteComparator {
   void query(const std::string& query_string) { connector_.query(query_string); }
 
   void compare(const std::string& query_string, const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), query_string, device_type, false);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), query_string, device_type, false);
   }
 
   void compare_arrow_output(const std::string& query_string,
@@ -206,130 +212,134 @@ class SQLiteComparator {
                             const ExecutorDeviceType device_type) {
     const auto results =
         QR::get()->runSQL(query_string, device_type, g_hoist_literals, true);
-    const auto arrow_mapd_results = result_set_arrow_loopback(nullptr, results);
-    compare_impl(arrow_mapd_results.get(), sqlite_query_string, device_type, false, true);
+    const auto arrow_omnisci_results = result_set_arrow_loopback(nullptr, results);
+    compare_impl(
+        arrow_omnisci_results.get(), sqlite_query_string, device_type, false, true);
   }
 
   void compare(const std::string& query_string,
                const std::string& sqlite_query_string,
                const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), sqlite_query_string, device_type, false);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), sqlite_query_string, device_type, false);
   }
 
   // added to deal with time shift for now testing
   void compare_timstamp_approx(const std::string& query_string,
                                const ExecutorDeviceType device_type) {
-    const auto mapd_results = run_multiple_agg(query_string, device_type);
-    compare_impl(mapd_results.get(), query_string, device_type, true);
+    const auto omnisci_results = run_multiple_agg(query_string, device_type);
+    compare_impl(omnisci_results.get(), query_string, device_type, true);
   }
 
  private:
-  template <class MapDResults>
-  void compare_impl(const MapDResults* mapd_results,
+  template <class RESULT_SET>
+  void compare_impl(const RESULT_SET* omnisci_results,
                     const std::string& sqlite_query_string,
                     const ExecutorDeviceType device_type,
                     const bool timestamp_approx,
                     const bool is_arrow = false) {
+    auto const errmsg = ExecutorDeviceType::CPU == device_type
+                            ? "CPU: " + sqlite_query_string
+                            : "GPU: " + sqlite_query_string;
     connector_.query(sqlite_query_string);
-    ASSERT_EQ(connector_.getNumRows(), mapd_results->rowCount());
+    ASSERT_EQ(connector_.getNumRows(), omnisci_results->rowCount()) << errmsg;
     const int num_rows{static_cast<int>(connector_.getNumRows())};
-    if (mapd_results->definitelyHasNoRows()) {
-      ASSERT_EQ(0, num_rows);
+    if (omnisci_results->definitelyHasNoRows()) {
+      ASSERT_EQ(0, num_rows) << errmsg;
       return;
     }
     if (!num_rows) {
       return;
     }
-    CHECK_EQ(connector_.getNumCols(), mapd_results->colCount());
+    CHECK_EQ(connector_.getNumCols(), omnisci_results->colCount()) << errmsg;
     const int num_cols{static_cast<int>(connector_.getNumCols())};
-    auto row_iterator = mapd_results->rowIterator(true, true);
+    auto row_iterator = omnisci_results->rowIterator(true, true);
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
       const auto crt_row =
-          g_use_row_iterator ? *row_iterator++ : mapd_results->getNextRow(true, true);
-      CHECK(!crt_row.empty());
-      CHECK_EQ(static_cast<size_t>(num_cols), crt_row.size());
+          g_use_row_iterator ? *row_iterator++ : omnisci_results->getNextRow(true, true);
+      CHECK(!crt_row.empty()) << errmsg;
+      CHECK_EQ(static_cast<size_t>(num_cols), crt_row.size()) << errmsg;
       for (int col_idx = 0; col_idx < num_cols; ++col_idx) {
         const auto ref_col_type = connector_.columnTypes[col_idx];
-        const auto mapd_variant = crt_row[col_idx];
-        const auto scalar_mapd_variant = boost::get<ScalarTargetValue>(&mapd_variant);
-        CHECK(scalar_mapd_variant);
-        auto mapd_ti = mapd_results->getColType(col_idx);
-        const auto mapd_type = mapd_ti.get_type();
-        checkTypeConsistency(ref_col_type, mapd_ti);
+        const auto omnisci_variant = crt_row[col_idx];
+        const auto scalar_omnisci_variant =
+            boost::get<ScalarTargetValue>(&omnisci_variant);
+        CHECK(scalar_omnisci_variant) << errmsg;
+        auto omnisci_ti = omnisci_results->getColType(col_idx);
+        const auto omnisci_type = omnisci_ti.get_type();
+        checkTypeConsistency(ref_col_type, omnisci_ti);
         const bool ref_is_null = connector_.isNull(row_idx, col_idx);
-        switch (mapd_type) {
+        switch (omnisci_type) {
           case kTINYINT:
           case kSMALLINT:
           case kINT:
           case kBIGINT: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_int_p);
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              ASSERT_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              ASSERT_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<int64_t>(row_idx, col_idx);
-              ASSERT_EQ(ref_val, mapd_val);
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             }
             break;
           }
           case kTEXT:
           case kCHAR:
           case kVARCHAR: {
-            const auto mapd_as_str_p = boost::get<NullableString>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_str_p);
-            const auto mapd_str_notnull = boost::get<std::string>(mapd_as_str_p);
-            if (ref_is_null) {
-              // CHECK(!mapd_str_notnull); // JUST TO DEBUG SOMETHING TO BE UNCOMENTED
+            const auto omnisci_as_str_p =
+                boost::get<NullableString>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_str_p) << errmsg;
+            const auto omnisci_str_notnull = boost::get<std::string>(omnisci_as_str_p);
+            const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
+            if (omnisci_str_notnull) {
+              const auto omnisci_val = *omnisci_str_notnull;
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             } else {
-              const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
-              if (mapd_str_notnull) {
-                const auto mapd_val = *mapd_str_notnull;
-                ASSERT_EQ(ref_val, mapd_val);
-              } else {
-                // not null but no data, so val is empty string
-                const auto mapd_val = "";
-                ASSERT_EQ(ref_val, mapd_val);
-              }
+              // not null but no data, so val is empty string
+              const auto omnisci_val = "";
+              ASSERT_EQ(ref_val, omnisci_val) << errmsg;
             }
             break;
           }
           case kNUMERIC:
           case kDECIMAL:
           case kDOUBLE: {
-            const auto mapd_as_double_p = boost::get<double>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_double_p);
-            const auto mapd_val = *mapd_as_double_p;
+            const auto omnisci_as_double_p = boost::get<double>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_double_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_double_p;
             if (ref_is_null) {
-              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kDOUBLE, false)), mapd_val);
+              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kDOUBLE, false)), omnisci_val)
+                  << errmsg;
             } else {
               const auto ref_val = connector_.getData<double>(row_idx, col_idx);
-              ASSERT_TRUE(approx_eq(ref_val, mapd_val));
+              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
             }
             break;
           }
           case kFLOAT: {
-            const auto mapd_as_float_p = boost::get<float>(scalar_mapd_variant);
-            ASSERT_NE(nullptr, mapd_as_float_p);
-            const auto mapd_val = *mapd_as_float_p;
+            const auto omnisci_as_float_p = boost::get<float>(scalar_omnisci_variant);
+            ASSERT_NE(nullptr, omnisci_as_float_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_float_p;
             if (ref_is_null) {
-              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kFLOAT, false)), mapd_val);
+              ASSERT_EQ(inline_fp_null_val(SQLTypeInfo(kFLOAT, false)), omnisci_val)
+                  << errmsg;
             } else {
               const auto ref_val = connector_.getData<float>(row_idx, col_idx);
-              ASSERT_TRUE(approx_eq(ref_val, mapd_val));
+              ASSERT_TRUE(approx_eq(ref_val, omnisci_val)) << errmsg;
             }
             break;
           }
           case kTIMESTAMP:
           case kDATE: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            CHECK(omnisci_as_int_p);
+            const auto omnisci_val = *omnisci_as_int_p;
             time_t nsec = 0;
-            const int dimen = mapd_ti.get_dimension();
+            const int dimen = omnisci_ti.get_dimension();
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               struct tm tm_struct {
                 0
@@ -337,98 +347,104 @@ class SQLiteComparator {
               const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
               auto end_str =
                   strptime(ref_val.c_str(),
-                           mapd_type == kTIMESTAMP ? "%Y-%m-%d %H:%M:%S" : "%Y-%m-%d",
+                           omnisci_type == kTIMESTAMP ? "%Y-%m-%d %H:%M:%S" : "%Y-%m-%d",
                            &tm_struct);
               // handle fractional seconds
               if (end_str != nullptr && *end_str != '.') {
                 if (end_str) {
-                  ASSERT_EQ(0, *end_str);
+                  ASSERT_EQ(0, *end_str) << errmsg;
                 }
-                ASSERT_EQ(ref_val.size(), static_cast<size_t>(end_str - ref_val.c_str()));
+                ASSERT_EQ(ref_val.size(), static_cast<size_t>(end_str - ref_val.c_str()))
+                    << errmsg;
               }
-              if (dimen > 0 && mapd_type == kTIMESTAMP) {
+              if (dimen > 0 && omnisci_type == kTIMESTAMP) {
                 int fs = 0;
                 if (*end_str == '.') {
                   end_str++;
                   uint frac_num;
                   int ntotal;
                   sscanf(end_str, "%d%n", &frac_num, &ntotal);
-                  fs = parse_fractional_seconds(frac_num, ntotal, mapd_ti);
+                  fs = parse_fractional_seconds(frac_num, ntotal, omnisci_ti);
                   nsec = timegm(&tm_struct) * pow(10, dimen);
                   nsec += fs;
                 } else if (*end_str == '\0') {
                   nsec = timegm(&tm_struct) * pow(10, dimen);
                 } else {
-                  CHECK(false);
+                  CHECK(false) << errmsg;
                 }
               }
               if (timestamp_approx) {
                 // approximate result give 10 second lee way
-                ASSERT_NEAR(*mapd_as_int_p,
+                ASSERT_NEAR(*omnisci_as_int_p,
                             dimen > 0 ? nsec : timegm(&tm_struct),
-                            dimen > 0 ? 10 * pow(10, dimen) : 10);
+                            dimen > 0 ? 10 * pow(10, dimen) : 10)
+                    << errmsg;
               } else {
-                if (is_arrow && mapd_type == kDATE) {
-                  ASSERT_EQ(*mapd_as_int_p, timegm(&tm_struct) * kMilliSecsPerSec);
+                if (is_arrow && omnisci_type == kDATE) {
+                  ASSERT_EQ(*omnisci_as_int_p, timegm(&tm_struct) * kMilliSecsPerSec)
+                      << errmsg;
                 } else {
-                  ASSERT_EQ(*mapd_as_int_p, dimen > 0 ? nsec : timegm(&tm_struct));
+                  ASSERT_EQ(*omnisci_as_int_p, dimen > 0 ? nsec : timegm(&tm_struct))
+                      << errmsg;
                 }
               }
             }
             break;
           }
           case kBOOLEAN: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            CHECK(omnisci_as_int_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
               if (ref_val == "t") {
-                ASSERT_EQ(1, *mapd_as_int_p);
+                ASSERT_EQ(1, *omnisci_as_int_p) << errmsg;
               } else {
-                CHECK_EQ("f", ref_val);
-                ASSERT_EQ(0, *mapd_as_int_p);
+                CHECK_EQ("f", ref_val) << errmsg;
+                ASSERT_EQ(0, *omnisci_as_int_p) << errmsg;
               }
             }
             break;
           }
           case kTIME: {
-            const auto mapd_as_int_p = boost::get<int64_t>(scalar_mapd_variant);
-            CHECK(mapd_as_int_p);
-            const auto mapd_val = *mapd_as_int_p;
+            const auto omnisci_as_int_p = boost::get<int64_t>(scalar_omnisci_variant);
+            CHECK(omnisci_as_int_p) << errmsg;
+            const auto omnisci_val = *omnisci_as_int_p;
             if (ref_is_null) {
-              CHECK_EQ(inline_int_null_val(mapd_ti), mapd_val);
+              CHECK_EQ(inline_int_null_val(omnisci_ti), omnisci_val) << errmsg;
             } else {
               const auto ref_val = connector_.getData<std::string>(row_idx, col_idx);
               std::vector<std::string> time_tokens;
               boost::split(time_tokens, ref_val, boost::is_any_of(":"));
-              ASSERT_EQ(size_t(3), time_tokens.size());
+              ASSERT_EQ(size_t(3), time_tokens.size()) << errmsg;
               ASSERT_EQ(boost::lexical_cast<int64_t>(time_tokens[0]) * 3600 +
                             boost::lexical_cast<int64_t>(time_tokens[1]) * 60 +
                             boost::lexical_cast<int64_t>(time_tokens[2]),
-                        *mapd_as_int_p);
+                        *omnisci_as_int_p)
+                  << errmsg;
             }
             break;
           }
           default:
-            CHECK(false);
+            CHECK(false) << errmsg;
         }
       }
     }
   }
 
  private:
-  static void checkTypeConsistency(const int ref_col_type, const SQLTypeInfo& mapd_ti) {
+  static void checkTypeConsistency(const int ref_col_type,
+                                   const SQLTypeInfo& omnisci_ti) {
     if (ref_col_type == SQLITE_NULL) {
-      // TODO(alex): re-enable the check that mapd_ti is nullable,
+      // TODO(alex): re-enable the check that omnisci_ti is nullable,
       //             got invalidated because of outer joins
       return;
     }
-    if (mapd_ti.is_integer()) {
+    if (omnisci_ti.is_integer()) {
       CHECK_EQ(SQLITE_INTEGER, ref_col_type);
-    } else if (mapd_ti.is_fp() || mapd_ti.is_decimal()) {
+    } else if (omnisci_ti.is_fp() || omnisci_ti.is_decimal()) {
       CHECK(ref_col_type == SQLITE_FLOAT || ref_col_type == SQLITE_INTEGER);
     } else {
       CHECK_EQ(SQLITE_TEXT, ref_col_type);
@@ -485,6 +501,12 @@ void c_arrow(const std::string& query_string, const ExecutorDeviceType device_ty
     EXP;                         \
   } else {                       \
     EXPECT_ANY_THROW(EXP);       \
+  }
+
+#define SKIP_WITH_TEMP_TABLES()                                   \
+  if (g_use_temporary_tables) {                                   \
+    LOG(ERROR) << "Tests not valid when using temporary tables."; \
+    return;                                                       \
   }
 
 bool validate_statement_syntax(const std::string& stmt) {
@@ -2425,6 +2447,8 @@ TEST(Select, Strings) {
     c("SELECT * FROM test WHERE str LIKE 'f%\%' ORDER BY x ASC, y ASC;", dt);
     c("SELECT * FROM test WHERE ss LIKE 'f%\%' ORDER BY x ASC, y ASC;", dt);
     c("SELECT * FROM test WHERE str LIKE '@f%%' ESCAPE '@' ORDER BY x ASC, y ASC;", dt);
+    c(R"(SELECT COUNT(*) FROM test WHERE real_str LIKE '%foo' OR real_str LIKE '%"bar"';)",
+      dt);
     c("SELECT COUNT(*) FROM test WHERE str LIKE 'ba_' or str LIKE 'fo_';", dt);
     c("SELECT COUNT(*) FROM test WHERE str IS NULL;", dt);
     c("SELECT COUNT(*) FROM test WHERE str IS NOT NULL;", dt);
@@ -2899,6 +2923,7 @@ TEST(Select, Time) {
               v<int64_t>(run_simple_agg(
                   "SELECT COUNT(*) FROM test WHERE CAST('15:13:15' AS TIME) <= n;", dt)));
     cta("SELECT DATETIME('NOW') FROM test limit 1;", dt);
+    EXPECT_ANY_THROW(run_simple_agg("SELECT DATETIME(NULL) FROM test LIMIT 1;", dt));
     // these next tests work because all dates are before now 2015-12-8 17:00:00
     ASSERT_EQ(
         2 * g_num_rows,
@@ -2918,6 +2943,9 @@ TEST(Select, Time) {
     ASSERT_EQ(14185957950L,
               v<int64_t>(run_simple_agg(
                   "SELECT MAX(EXTRACT(EPOCH FROM m) * 10) FROM test;", dt)));
+    ASSERT_EQ(14185152000L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT MAX(EXTRACT(DATEEPOCH FROM m) * 10) FROM test;", dt)));
     ASSERT_EQ(20140,
               v<int64_t>(run_simple_agg(
                   "SELECT MAX(EXTRACT(YEAR FROM m) * 10) FROM test;", dt)));
@@ -2967,6 +2995,9 @@ TEST(Select, Time) {
     ASSERT_EQ(
         936835200L,
         v<int64_t>(run_simple_agg("SELECT MAX(EXTRACT(EPOCH FROM o)) FROM test;", dt)));
+    ASSERT_EQ(936835200L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT MAX(EXTRACT(DATEEPOCH FROM o)) FROM test;", dt)));
     ASSERT_EQ(1L,
               v<int64_t>(run_simple_agg("SELECT MAX(EXTRACT(WEEK FROM CAST('2012-01-01 "
                                         "20:15:12' AS TIMESTAMP))) FROM test limit 1;",
@@ -5005,10 +5036,103 @@ TEST(Select, TimeInterval) {
   }
 }
 
+TEST(Select, LogicalValues) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    // empty logical values
+    c("SELECT 1 + 2;", dt);
+    c("SELECT 1 * 2.1;", dt);
+    c("SELECT 'alex', 'omnisci';", dt);
+    c("SELECT COALESCE(5, NULL, 4);", dt);
+    c("SELECT abs(-5) AS tmp;", dt);
+
+    EXPECT_EQ(6, v<double>(run_simple_agg("SELECT ceil(5.556) AS tmp;", dt)));
+    EXPECT_EQ(5, v<double>(run_simple_agg("SELECT floor(5.556) AS tmp;", dt)));
+
+    // values
+    c("SELECT * FROM (VALUES(1,2,3));", dt);
+    c("SELECT * FROM (VALUES(1, NULL, 3));", dt);
+    c("SELECT * FROM (VALUES(1, 2), (3, NULL));", dt);
+    c("SELECT * FROM (SELECT * FROM (VALUES (1,2) , (3,4)) t1) t0 LIMIT 5;", dt);
+
+    {
+      auto rows = run_multiple_agg("SELECT * FROM (VALUES(1, 2, 3)) as t(x, y, z);", dt);
+      EXPECT_EQ(rows->rowCount(), size_t(1));
+      const auto row = rows->getNextRow(false, false);
+      EXPECT_EQ(1, v<int64_t>(row[0]));
+      EXPECT_EQ(2, v<int64_t>(row[1]));
+      EXPECT_EQ(3, v<int64_t>(row[2]));
+    }
+    {
+      auto rows = run_multiple_agg(
+          "SELECT x, COUNT(y) FROM (VALUES(1, 1), (2, 2), (NULL, NULL), (3, 3)) as t(x, "
+          "y) GROUP BY x;",
+          dt);
+      EXPECT_EQ(rows->rowCount(), size_t(4));
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(1, v<int64_t>(row[0]));
+        EXPECT_EQ(1, v<int64_t>(row[1]));
+      }
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(2, v<int64_t>(row[0]));
+        EXPECT_EQ(1, v<int64_t>(row[1]));
+      }
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(3, v<int64_t>(row[0]));
+        EXPECT_EQ(1, v<int64_t>(row[1]));
+      }
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(inline_int_null_val(SQLTypeInfo(kINT, false)), v<int64_t>(row[0]));
+        EXPECT_EQ(0, v<int64_t>(row[1]));
+      }
+    }
+    {
+      auto rows = run_multiple_agg(
+          "SELECT SUM(x), AVG(y), MIN(z) FROM (VALUES(1, 2, 3)) as t(x, y, z);", dt);
+      EXPECT_EQ(rows->rowCount(), size_t(1));
+      const auto row = rows->getNextRow(false, false);
+      EXPECT_EQ(1, v<int64_t>(row[0]));
+      EXPECT_EQ(2, v<double>(row[1]));
+      EXPECT_EQ(3, v<int64_t>(row[2]));
+    }
+    {
+      auto rows = run_multiple_agg("SELECT * FROM (VALUES(1, 2, 3),(4, 5, 6));", dt);
+      EXPECT_EQ(rows->rowCount(), size_t(2));
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(1, v<int64_t>(row[0]));
+        EXPECT_EQ(2, v<int64_t>(row[1]));
+        EXPECT_EQ(3, v<int64_t>(row[2]));
+      }
+      {
+        const auto row = rows->getNextRow(false, false);
+        EXPECT_EQ(4, v<int64_t>(row[0]));
+        EXPECT_EQ(5, v<int64_t>(row[1]));
+        EXPECT_EQ(6, v<int64_t>(row[2]));
+      }
+    }
+    {
+      auto rows = run_multiple_agg(
+          "SELECT SUM(x), AVG(y), MIN(z) FROM (VALUES(1, 2, 3),(4, 5, 6)) as t(x, y, z);",
+          dt);
+      EXPECT_EQ(rows->rowCount(), size_t(1));
+      const auto row = rows->getNextRow(false, false);
+      EXPECT_EQ(5, v<int64_t>(row[0]));
+      ASSERT_NEAR(3.5, v<double>(row[1]), double(0.01));
+      EXPECT_EQ(3, v<int64_t>(row[2]));
+    }
+    EXPECT_ANY_THROW(run_simple_agg("SELECT * FROM (VALUES(1, 'test'));", dt));
+  }
+}
+
 TEST(Select, UnsupportedNodes) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
-    EXPECT_THROW(run_multiple_agg("SELECT 1 + 2;", dt), std::runtime_error);
     // MAT No longer throws a logicalValues gets a regular parse error'
     // EXPECT_THROW(run_multiple_agg("SELECT *;", dt), std::runtime_error);
     EXPECT_THROW(run_multiple_agg("SELECT x, COUNT(*) FROM test GROUP BY ROLLUP(x);", dt),
@@ -5182,6 +5306,24 @@ void import_random_test() {
   }
 }
 
+void import_varlen_lazy_fetch() {
+  const std::string table_name("varlen_table");
+  const std::string drop_varlen_table("DROP TABLE IF EXISTS " + table_name + ";");
+  run_ddl_statement(drop_varlen_table);
+  std::string create_query("CREATE TABLE " + table_name +
+                           " (t tinyint, p POINT, real_str TEXT ENCODING NONE, "
+                           "array_i16 smallint[]) with (FRAGMENT_SIZE = 256);");
+  run_ddl_statement(create_query);
+  std::string insert_query("INSERT INTO " + table_name + " VALUES(");
+  for (int i = 0; i < 255; i++) {
+    run_multiple_agg(
+        insert_query + std::to_string(i - 127) + ", \'POINT(" + std::to_string(i) + " " +
+            std::to_string(i) + ")\', " + "\'number" + std::to_string(i) + "\', " + "{" +
+            std::to_string(2 * i) + ", " + std::to_string(2 * i + 1) + "}" + ");",
+        ExecutorDeviceType::CPU);
+  }
+}
+
 void import_query_rewrite_test() {
   const std::string drop_old_query_rewrite_test{
       "DROP TABLE IF EXISTS query_rewrite_test;"};
@@ -5316,6 +5458,7 @@ void import_join_test(bool with_delete_support) {
                                    {g_shard_count ? "dup_str" : "", g_shard_count},
                                    {},
                                    2,
+                                   g_use_temporary_tables,
                                    with_delete_support,
                                    g_aggregator);
   run_ddl_statement(create_test);
@@ -5385,8 +5528,8 @@ void import_coalesce_cols_join_test(const int id, bool with_delete_support) {
                                                         table_name,
                                                         {"", g_shard_count},
                                                         {},
-
                                                         id == 2 ? 2 : 20,
+                                                        g_use_temporary_tables,
                                                         with_delete_support,
                                                         g_aggregator);
   run_ddl_statement(create_test);
@@ -5516,6 +5659,53 @@ void import_dept_table() {
   }
 }
 
+void import_corr_in_lookup() {
+  const std::string drop_old_test{"DROP TABLE IF EXISTS corr_in_lookup;"};
+  run_ddl_statement(drop_old_test);
+  g_sqlite_comparator.query(drop_old_test);
+  const std::string create_corr_in_lookup_table{
+      "CREATE TABLE corr_in_lookup (id INT, val INT);"};
+  run_ddl_statement(create_corr_in_lookup_table);
+  g_sqlite_comparator.query(create_corr_in_lookup_table);
+
+  std::vector<std::string> lookup_tuples = {"(1,1)", "(2,2)", "(3,3)", "(4,4)"};
+
+  for (std::string tuple : lookup_tuples) {
+    std::stringstream insert_tuple_str;
+    insert_tuple_str << "INSERT INTO corr_in_lookup VALUES " << tuple << ";";
+    run_multiple_agg(insert_tuple_str.str(), ExecutorDeviceType::CPU);
+    g_sqlite_comparator.query(insert_tuple_str.str());
+  }
+}
+
+void import_corr_in_facts() {
+  const std::string drop_old_test{"DROP TABLE IF EXISTS corr_in_facts;"};
+  run_ddl_statement(drop_old_test);
+  g_sqlite_comparator.query(drop_old_test);
+  const std::string create_corr_in_facts_table{
+      "CREATE TABLE corr_in_facts (id INT, val INT);"};
+  run_ddl_statement(create_corr_in_facts_table);
+  g_sqlite_comparator.query(create_corr_in_facts_table);
+
+  std::vector<std::string> facts_tuples = {
+      "(1,1)",
+      "(1,2)",
+      "(1,3)",
+      "(1,4)",
+      "(2,1)",
+      "(2,2)",
+      "(2,3)",
+      "(2,4)",
+  };
+
+  for (std::string tuple : facts_tuples) {
+    std::stringstream insert_tuple_str;
+    insert_tuple_str << "INSERT INTO corr_in_facts VALUES " << tuple << ";";
+    run_multiple_agg(insert_tuple_str.str(), ExecutorDeviceType::CPU);
+    g_sqlite_comparator.query(insert_tuple_str.str());
+  }
+}
+
 void import_geospatial_test() {
   const std::string geospatial_test("DROP TABLE IF EXISTS geospatial_test;");
   run_ddl_statement(geospatial_test);
@@ -5576,7 +5766,8 @@ void import_geospatial_join_test(const bool replicate_inner_table = false) {
                                                        {"", 0},
                                                        {},
                                                        20,
-                                                       true,
+                                                       /*use_temporary_tables=*/false,
+                                                       /*deleted_support=*/true,
                                                        g_aggregator);
   run_ddl_statement(create_statement);
   TestHelpers::ValuesGenerator gen("geospatial_inner_join_test");
@@ -5594,6 +5785,53 @@ void import_geospatial_join_test(const bool replicate_inner_table = false) {
     const std::string mpoly{"'MULTIPOLYGON(((0 0, " + std::to_string(i + 1) + " 0, 0 " +
                             std::to_string(i + 1) + ", 0 0)))'"};
     run_multiple_agg(gen(i, point, linestring, poly, mpoly), ExecutorDeviceType::CPU);
+  }
+}
+
+void import_geospatial_null_test() {
+  const std::string geospatial_null_test("DROP TABLE IF EXISTS geospatial_null_test;");
+  run_ddl_statement(geospatial_null_test);
+  constexpr char create_ddl[] = R"(CREATE TABLE geospatial_null_test (
+        id INT,
+        p POINT,
+        l LINESTRING,
+        poly POLYGON,
+        mpoly MULTIPOLYGON,
+        gpnotnull GEOMETRY(POINT) NOT NULL,
+        gp4326 GEOMETRY(POINT,4326) ENCODING COMPRESSED(32),
+        gp4326none GEOMETRY(POINT,4326) ENCODING NONE,
+        gp900913 GEOMETRY(POINT,900913),
+        gl4326none GEOMETRY(LINESTRING,4326) ENCODING NONE,
+        gpoly4326 GEOMETRY(POLYGON,4326)
+      ) WITH (fragment_size=2);
+  )";
+  run_ddl_statement(create_ddl);
+  TestHelpers::ValuesGenerator gen("geospatial_null_test");
+  for (ssize_t i = 0; i < g_num_rows; ++i) {
+    const std::string point{"'POINT(" + std::to_string(i) + " " + std::to_string(i) +
+                            ")'"};
+    const std::string linestring{
+        "'LINESTRING(" + std::to_string(i) + " 0, " + std::to_string(2 * i) + " " +
+        std::to_string(2 * i) +
+        ((i % 2) ? (", " + std::to_string(2 * i + 1) + " " + std::to_string(2 * i + 1))
+                 : "") +
+        ")'"};
+    const std::string poly{"'POLYGON((0 0, " + std::to_string(i + 1) + " 0, 0 " +
+                           std::to_string(i + 1) + ", 0 0))'"};
+    const std::string mpoly{"'MULTIPOLYGON(((0 0, " + std::to_string(i + 1) + " 0, 0 " +
+                            std::to_string(i + 1) + ", 0 0)))'"};
+    run_multiple_agg(gen(i,
+                         (i % 2 == 0) ? "NULL" : point,
+                         (i == 1) ? "NULL" : linestring,
+                         (i == 2) ? "NULL" : poly,
+                         (i == 3) ? "NULL" : mpoly,
+                         point,
+                         (i == 4) ? "NULL" : point,
+                         (i == 5) ? "NULL" : point,
+                         (i == 6) ? "NULL" : point,
+                         (i == 7) ? "NULL" : linestring,
+                         (i == 8) ? "NULL" : poly),
+                     ExecutorDeviceType::CPU);
   }
 }
 
@@ -5696,6 +5934,54 @@ void import_test_table_with_lots_of_columns() {
   for (size_t i = 0; i < 10; i++) {
     run_multiple_agg(i % 2 ? insert_query2 : insert_query1, ExecutorDeviceType::CPU);
     g_sqlite_comparator.query(i % 2 ? insert_query2 : insert_query1);
+  }
+}
+
+void import_union_all_tests() {
+  std::string sql;
+  auto const dt = ExecutorDeviceType::CPU;
+
+  sql = "DROP TABLE IF EXISTS union_all_a;";
+  g_sqlite_comparator.query(sql);
+  EXPECT_NO_THROW(run_ddl_statement(sql));
+
+  sql = "DROP TABLE IF EXISTS union_all_b;";
+  g_sqlite_comparator.query(sql);
+  EXPECT_NO_THROW(run_ddl_statement(sql));
+
+  sql = "CREATE TABLE union_all_a (a0 SMALLINT, a1 INT, a2 BIGINT, a3 FLOAT);";
+  g_sqlite_comparator.query(sql);
+  sql.insert(sql.size() - 1, " WITH (fragment_size = 2)");
+  EXPECT_NO_THROW(run_ddl_statement(sql));
+
+  sql = "CREATE TABLE union_all_b (b0 SMALLINT, b1 INT, b2 BIGINT, b3 FLOAT);";
+  g_sqlite_comparator.query(sql);
+  sql.insert(sql.size() - 1, " WITH (fragment_size = 3)");
+  EXPECT_NO_THROW(run_ddl_statement(sql));
+  for (int i = 0; i < 10; i++) {
+    sql = cat("INSERT INTO union_all_a VALUES (",
+              110 + i,
+              ',',
+              120 + i,
+              ',',
+              130 + i,
+              ',',
+              140 + i,
+              ");");
+    g_sqlite_comparator.query(sql);
+    EXPECT_NO_THROW(run_multiple_agg(sql, dt));
+
+    sql = cat("INSERT INTO union_all_b VALUES (",
+              210 + i,
+              ',',
+              220 + i,
+              ',',
+              230 + i,
+              ',',
+              240 + i,
+              ");");
+    g_sqlite_comparator.query(sql);
+    EXPECT_NO_THROW(run_multiple_agg(sql, dt));
   }
 }
 
@@ -6066,6 +6352,41 @@ TEST(Select, GpuSort) {
   }
 }
 
+TEST(Select, SpeculativeTopNSort) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c("SELECT x, COUNT(*) AS val FROM gpu_sort_test GROUP BY x ORDER BY val DESC LIMIT "
+      "2;",
+      dt);
+    c("SELECT x from (SELECT COUNT(*) AS val, x FROM gpu_sort_test GROUP BY x ORDER BY "
+      "val ASC LIMIT 3);",
+      dt);
+    c("SELECT val from (SELECT y, COUNT(*) AS val FROM gpu_sort_test GROUP BY y ORDER BY "
+      "val DESC LIMIT 3);",
+      dt);
+  }
+}
+
+TEST(Select, GroupByPerfectHash) {
+  // TODO(Saman): add more systematic tests for single-column perfect hash
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c("SELECT str, x FROM test GROUP BY x, str ORDER BY str, x;", dt);
+    c("SELECT str, x, MAX(smallint_nulls), AVG(y), COUNT(dn) FROM test GROUP BY x, "
+      "str ORDER BY str, x;",
+      dt);
+    c("SELECT str, x, MAX(smallint_nulls), COUNT(dn), COUNT(*) as cnt FROM test GROUP BY "
+      "x, str ORDER BY cnt, str;",
+      dt);
+    c("SELECT x, str, z, SUM(dn), MAX(dn), AVG(dn) FROM test GROUP BY x, str, "
+      "z ORDER BY str, z, x;",
+      dt);
+    c("SELECT x, SUM(dn), str, MAX(dn), z, AVG(dn), COUNT(*) FROM test GROUP BY z, x, "
+      "str ORDER BY str, z, x;",
+      dt);
+  }
+}
+
 TEST(Select, GroupByBaselineHash) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -6154,49 +6475,71 @@ TEST(Select, BigDecimalRange) {
   }
 }
 
+TEST(Select, ScalarSubquery) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c("SELECT SUM(x) + SUM(y) FROM test GROUP BY z HAVING (SELECT x FROM test "
+      "GROUP BY x HAVING x > 7 LIMIT 1) > 7 ORDER BY z;",
+      dt);
+    c("SELECT SUM(x) + SUM(y) FROM test GROUP BY z HAVING (SELECT d FROM test "
+      "GROUP BY d HAVING d > 2.4 LIMIT 1) > 2.4 ORDER BY z;",
+      dt);
+    /* TODO(adb): triggers as assert when setting the result of the scalar subquery
+    descriptor const auto save_watchdog = g_enable_watchdog; g_enable_watchdog = false;
+    ScopeGuard reset_watchdog_state = [&save_watchdog] {
+      g_enable_watchdog = save_watchdog;
+    };
+    SKIP_ON_AGGREGATOR(
+        c("SELECT COUNT(*) FROM test GROUP BY x, y HAVING (SELECT str FROM test GROUP BY "
+          "str HAVING length(str) = 3 ORDER BY str LIMIT 1) = 'bar';",
+          dt));
+    */
+  }
+}
+
 TEST(Select, DecimalCompression) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
-    std::string mapd_sql = "";
+    std::string omnisci_sql = "";
     std::string sqlite_sql = "";
 
-    mapd_sql =
+    omnisci_sql =
         "SELECT AVG(big_dec), AVG(med_dec), AVG(small_dec) FROM "
         "decimal_compression_test;";
     sqlite_sql =
         "SELECT 1.0*AVG(big_dec), 1.0*AVG(med_dec), 1.0*AVG(small_dec) FROM "
         "decimal_compression_test;";
-    c(mapd_sql, sqlite_sql, dt);
+    c(omnisci_sql, sqlite_sql, dt);
     c(sqlite_sql, sqlite_sql, dt);
 
-    mapd_sql =
+    omnisci_sql =
         "SELECT SUM(big_dec), SUM(med_dec), SUM(small_dec) FROM "
         "decimal_compression_test;";
     sqlite_sql =
         "SELECT 1.0*SUM(big_dec), 1.0*SUM(med_dec), 1.0*SUM(small_dec) FROM "
         "decimal_compression_test;";
-    c(mapd_sql, sqlite_sql, dt);
+    c(omnisci_sql, sqlite_sql, dt);
     c(sqlite_sql, sqlite_sql, dt);
 
-    mapd_sql =
+    omnisci_sql =
         "SELECT MIN(big_dec), MIN(med_dec), MIN(small_dec) FROM "
         "decimal_compression_test;";
     sqlite_sql =
         "SELECT 1.0*MIN(big_dec), 1.0*MIN(med_dec), 1.0*MIN(small_dec) FROM "
         "decimal_compression_test;";
-    c(mapd_sql, sqlite_sql, dt);
+    c(omnisci_sql, sqlite_sql, dt);
     c(sqlite_sql, sqlite_sql, dt);
 
-    mapd_sql =
+    omnisci_sql =
         "SELECT MAX(big_dec), MAX(med_dec), MAX(small_dec) FROM "
         "decimal_compression_test;";
     sqlite_sql =
         "SELECT 1.0*MAX(big_dec), 1.0*MAX(med_dec), 1.0*MAX(small_dec) FROM "
         "decimal_compression_test;";
-    c(mapd_sql, sqlite_sql, dt);
+    c(omnisci_sql, sqlite_sql, dt);
     c(sqlite_sql, sqlite_sql, dt);
 
-    mapd_sql =
+    omnisci_sql =
         "SELECT big_dec, COUNT(*) as n, AVG(med_dec) as med_dec_avg, SUM(small_dec) as "
         "small_dec_sum FROM decimal_compression_test GROUP BY big_dec ORDER BY "
         "small_dec_sum;";
@@ -6204,7 +6547,7 @@ TEST(Select, DecimalCompression) {
         "SELECT 1.0*big_dec, COUNT(*) as n, 1.0*AVG(med_dec) as med_dec_avg, "
         "1.0*SUM(small_dec) as small_dec_sum FROM decimal_compression_test GROUP BY "
         "big_dec ORDER BY small_dec_sum;";
-    c(mapd_sql, sqlite_sql, dt);
+    c(omnisci_sql, sqlite_sql, dt);
     c(sqlite_sql, sqlite_sql, dt);
 
     c("SELECT CASE WHEN big_dec > 0 THEN med_dec ELSE NULL END FROM "
@@ -6214,10 +6557,21 @@ TEST(Select, DecimalCompression) {
 }
 
 TEST(Update, DecimalOverflow) {
+  // TODO: Move decimal validator into temp table update codegen
+  SKIP_WITH_TEMP_TABLES();
+
   auto test = [](int precision, int scale) -> void {
     run_ddl_statement("DROP TABLE IF EXISTS decimal_overflow_test;");
-    run_ddl_statement("CREATE TABLE decimal_overflow_test (d DECIMAL(" +
-                      std::to_string(precision) + ", " + std::to_string(scale) + "));");
+    const auto create = build_create_table_statement(
+        "d DECIMAL(" + std::to_string(precision) + ", " + std::to_string(scale) + ")",
+        "decimal_overflow_test",
+        {"", 0},
+        {},
+        10,
+        g_use_temporary_tables,
+        true,
+        false);
+    run_ddl_statement(create);
     run_multiple_agg("INSERT INTO decimal_overflow_test VALUES(null);",
                      ExecutorDeviceType::CPU);
     int64_t val = (int64_t)std::pow((double)10, precision - scale);
@@ -6786,6 +7140,15 @@ TEST(Select, Joins_InnerJoin_TwoTables) {
       "BY 1, 2) t1 INNER JOIN (SELECT y, Sum(x) sum2 FROM test GROUP BY 1) t2 ON "
       "t1.y = t2.y GROUP BY 1, 2, 3, 4;",
       dt);
+
+    const auto watchdog_state = g_enable_watchdog;
+    ScopeGuard reset = [watchdog_state] { g_enable_watchdog = watchdog_state; };
+    g_enable_watchdog = false;
+    SKIP_ON_AGGREGATOR(
+        c("SELECT str FROM test JOIN (SELECT 'foo' AS val, 12345 AS cnt) subq ON "
+          "test.str = "
+          "subq.val;",
+          dt));
   }
 }
 
@@ -6943,6 +7306,27 @@ TEST(Select, Joins_InnerJoin_Sharded) {
         "and st3.s <> 'foo' ORDER BY st1.i;",
         dt);
     });
+  }
+}
+
+TEST(Select, Joins_Sharded_Empty_Last_Appended_Storage) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    size_t num_shards = choose_shard_count();
+
+    // we make a query filtering out all tuples in the last shard
+    // and force project it
+
+    // id of the last shard
+    int id_filtered_shard = num_shards - 1;
+
+    std::stringstream query;
+    // i % num_shards != id_filtered_shard is a filter condition
+    // to remove all tuples in the last shard
+    query << "SELECT t1.i, t1.j, t1.s FROM (SELECT i, j, s FROM st4 WHERE i % "
+          << num_shards << " != " << id_filtered_shard
+          << ") t1, st4 t2 WHERE t1.i = t2.i ORDER BY t1.i, t1.j, t1.s;";
+    SKIP_ON_AGGREGATOR(c(query.str(), dt));
   }
 }
 
@@ -7350,6 +7734,391 @@ TEST(Select, Joins_LeftJoin_Filters) {
   }
 }
 
+TEST(Select, Joins_OuterJoin_OptBy_NullRejection) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    // single-column outer join predicate
+
+    // 1. execute full outer join via left outer join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a is not null and c < 2 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where a is not null and c < 2 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a > 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where a > 7 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a is not null and c < 3 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where a is not null and c < 3 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a > 6 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where a > 6 order by a,b,c,d,e,f;",
+      dt);
+
+    //    c) return multiple matching rows (four rows)
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b is not null and c < 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on b = e "
+      "where b is not null and c < 7 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b > 1 and c < 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on b = e "
+      "where b > 1 and c < 7 order by a,b,c,d,e,f;",
+      dt);
+
+    //    d) expect to throw an error due to unsupported full outer join
+    //    --> we need a filter predicate in probe-side (i.e., outer) table
+    EXPECT_THROW(
+        run_multiple_agg(
+            "select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a "
+            "= d where d is not null and c < 2 order by a,b,c,d,e,f;",
+            dt),
+        std::runtime_error);
+    EXPECT_THROW(run_multiple_agg(
+                     "select a,b,c,d,e,f from outer_join_foo full outer join "
+                     "outer_join_bar on a = d where e is not null order by a,b,c,d,e,f;",
+                     dt),
+                 std::runtime_error);
+    EXPECT_THROW(
+        run_multiple_agg(
+            "select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a "
+            "= d where f is not null and e < 2 order by a,b,c,d,e,f;",
+            dt),
+        std::runtime_error);
+    EXPECT_THROW(
+        run_multiple_agg("select a,b,c,d,e,f from outer_join_foo full outer join "
+                         "outer_join_bar on a = d where c < 2 order by a,b,c,d,e,f;",
+                         dt),
+        std::runtime_error);
+    EXPECT_THROW(
+        run_multiple_agg("select a,b,c,d,e,f from outer_join_foo full outer join "
+                         "outer_join_bar on a = d where d < 5 order by a,b,c,d,e,f;",
+                         dt),
+        std::runtime_error);
+    EXPECT_THROW(
+        run_multiple_agg("select a,b,c,d,e,f from outer_join_foo full outer join "
+                         "outer_join_bar on a = d where e < 8 order by a,b,c,d,e,f;",
+                         dt),
+        std::runtime_error);
+
+    // 2. execute full outer join via inner join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where e is not null and b is not null and a < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and e is not "
+      "null and b is not null and a < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where e < 5 and b < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and e < 5 and "
+      "b < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where e > -14 and b < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and e > -14 "
+      "and b < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b between 1 and 4 and e < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and b between "
+      "1 and 4 and e < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where d is not null and a is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and d is not "
+      "null and a is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a is not null and d < 2 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and a is not "
+      "null and d < 2 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a is not null and d > -14 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and a is not "
+      "null and d > -14 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "where a is not null and d between 1 and 3 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and a is not "
+      "null and d between 1 and 3 order by a,b,c,d,e,f;",
+      dt);
+
+    //    c) return multiple matching rows (four rows)
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where e is not null and b is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and e is not "
+      "null and b is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b < 5 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and b < 5 "
+      "order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b is not null and e > -14 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and b is not "
+      "null and e > -14 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on b = e "
+      "where b is not null and e between 1 and 4 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and b is not "
+      "null and e between 1 and 4 order by a,b,c,d,e,f;",
+      dt);
+
+    // 3. execute left outer join via inner join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where d is not null and a < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and d is not "
+      "null and a < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on b = e "
+      "where b is not null and a < 0 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and b is not "
+      "null and a < 0 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "where a is not null and d is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and a is not "
+      "null and d is not null order by a,b,c,d,e,f;",
+      dt);
+
+    //    c) return multiple matching rows (four rows)
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on b = e "
+      "where e > 1 and b > 1 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where b = e and e > 1 and "
+      "b > 1",
+      dt);
+
+    // multi-column outer join predicates
+    // 1. execute full outer join via left outer join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null and c < 2 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null and c < 2 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null and c < 3 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null and c < 3 order by a,b,c,d,e,f;",
+      dt);
+
+    //    c) return multiple matching rows
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where b is not null and b < 6 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where b is not null and b < 6 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and c = f where c is not null and c < 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and c = f where c is not null and c < 7 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on c = f "
+      "and b = e where b is not null and c is not null and c < 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on c = f "
+      "and b = e where b is not null and c is not null and c < 7 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where b is not null and b < 6 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where b is not null and b < 6 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where c is not null and c < 7 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where c is not null and c < 7 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and b is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and b is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where b is not null and c is not null and c < 7 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where b is not null and c is not null and c < 7 order by "
+      "a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and c is not null order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and c is not null order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and b is not null and c is not null order "
+      "by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e and c = f where a is not null and b is not null and c is not null order "
+      "by a,b,c,d,e,f;",
+      dt);
+
+    //    d) expect to throw an error due to unsupported full outer join
+    //    --> we need a filter predicate in probe-side (i.e., outer) table
+    EXPECT_THROW(
+        run_multiple_agg(
+            "select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a "
+            "= d and c = f where d is not null and b < 2 order by a,b,c,d,e,f;",
+            dt),
+        std::runtime_error);
+    EXPECT_THROW(
+        run_multiple_agg(
+            "select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a "
+            "= d and c = f where b < 2 order by a,b,c,d,e,f;",
+            dt),
+        std::runtime_error);
+
+    // 2. execute full outer join via inner join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null and d < 1 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and b = e and "
+      "a is not null and b is not null and d < 1 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null and d < 1 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and c = f and "
+      "a is not null and c is not null and d < 1 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on c = f "
+      "and b = e where c is not null and b is not null and f > 4 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where c = f and b = e and "
+      "c is not null and b is not null and f > 4 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null and d < 999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and b = e and "
+      "a is not null and b is not null and d < 999999 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null and d < 9999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and c = f and "
+      "a is not null and c is not null and d < 9999999 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo full outer join outer_join_bar on c = f "
+      "and b = e where c is not null and b is not null and e < 9999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where c = f and b = e and "
+      "c is not null and b is not null and e < 9999999 order by a,b,c,d,e,f;",
+      dt);
+
+    // 3. execute left outer join via inner join
+    //    a) return zero matching row
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null and d < 1 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and b = e and "
+      "a is not null and b is not null and d < 1 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null and d < 1 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and c = f and "
+      "a is not null and c is not null and d < 1 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on c = f "
+      "and b = e where c is not null and b is not null and f > 4 order by a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where c = f and b = e and "
+      "c is not null and b is not null and f > 4 order by a,b,c,d,e,f;",
+      dt);
+
+    //    b) return a single matching row
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and b = e where a is not null and b is not null and d < 999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and b = e and "
+      "a is not null and b is not null and d < 999999 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on a = d "
+      "and c = f where a is not null and c is not null and d < 9999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where a = d and c = f and "
+      "a is not null and c is not null and d < 9999999 order by a,b,c,d,e,f;",
+      dt);
+
+    c("select a,b,c,d,e,f from outer_join_foo left outer join outer_join_bar on c = f "
+      "and b = e where c is not null and b is not null and e < 9999999 order by "
+      "a,b,c,d,e,f;",
+      "select a,b,c,d,e,f from outer_join_foo, outer_join_bar where c = f and b = e and "
+      "c is not null and b is not null and e < 9999999 order by a,b,c,d,e,f;",
+      dt);
+  }
+}
+
 TEST(Select, Joins_MultiCompositeColumns) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -7495,6 +8264,10 @@ TEST(Select, Joins_ComplexQueries) {
       "SELECT COUNT(*) FROM test a JOIN (SELECT str FROM test) b ON a.str = b.str OR "
       "0;",
       dt);
+    EXPECT_ANY_THROW(
+        c("SELECT * FROM (SELECT test.x, test.y, d, f FROM test JOIN test_inner ON "
+          "test.x = test_inner.x ORDER BY f ASC LIMIT 4) ORDER BY d DESC;",
+          dt));
   }
 }
 
@@ -7646,8 +8419,14 @@ class JoinTest : public ::testing::Test {
 
       const std::string columns_definition{
           "x int not null, y int, str text encoding dict"};
-      const auto table_create = build_create_table_statement(
-          columns_definition, table_name, {"", 0}, {}, 50, true, false);
+      const auto table_create = build_create_table_statement(columns_definition,
+                                                             table_name,
+                                                             {"", 0},
+                                                             {},
+                                                             50,
+                                                             g_use_temporary_tables,
+                                                             true,
+                                                             false);
       run_ddl_statement(table_create);
 
       TestHelpers::ValuesGenerator gen(table_name);
@@ -7762,6 +8541,7 @@ TEST(Select, RuntimeFunctions) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     c("SELECT SUM(ABS(-x + 1)) FROM test;", dt);
+    c("SELECT SUM(ABS(-w + 1)) FROM test;", dt);
     c("SELECT SUM(ABS(-y + 1)) FROM test;", dt);
     c("SELECT SUM(ABS(-z + 1)) FROM test;", dt);
     c("SELECT SUM(ABS(-t + 1)) FROM test;", dt);
@@ -7969,6 +8749,8 @@ TEST(Select, UnsupportedSortOfIntermediateResult) {
 }
 
 TEST(Select, Views) {
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     c("SELECT x, COUNT(*) FROM view_test WHERE y > 41 GROUP BY x;", dt);
@@ -7977,6 +8759,8 @@ TEST(Select, Views) {
 }
 
 TEST(Select, Views_With_Subquery) {
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     c("SELECT x, COUNT(*) FROM view_test WHERE y < (SELECT max(y) FROM test) GROUP BY x;",
@@ -7986,6 +8770,7 @@ TEST(Select, Views_With_Subquery) {
 
 TEST(Select, CreateTableAsSelect) {
   SKIP_ALL_ON_AGGREGATOR();
+  SKIP_WITH_TEMP_TABLES();
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -8146,6 +8931,10 @@ TEST(Select, TimestampMeridiesEncoding) {
         v<int64_t>(run_simple_agg(
             "SELECT count(*) FROM ts_meridies where extract(epoch from ts) = 1325444400;",
             dt)));
+    ASSERT_EQ(10,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM ts_meridies where "
+                                        "extract(dateepoch from ts) = 1325376000;",
+                                        dt)));
   }
 }
 
@@ -8244,6 +9033,18 @@ TEST(Select, TimestampPrecisionMeridiesEncoding) {
         v<int64_t>(run_simple_agg("SELECT count(*) FROM ts_meridies_precisions where "
                                   "extract(epoch from ts9) = 1325430000123456789;",
                                   dt)));
+    ASSERT_EQ(8,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM ts_meridies_precisions "
+                                        "where extract(dateepoch from ts3) = 1325376000;",
+                                        dt)));
+    ASSERT_EQ(8,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM ts_meridies_precisions "
+                                        "where extract(dateepoch from ts6) = 1325376000;",
+                                        dt)));
+    ASSERT_EQ(8,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM ts_meridies_precisions "
+                                        "where extract(dateepoch from ts9) = 1325376000;",
+                                        dt)));
   }
 }
 
@@ -8436,6 +9237,9 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(1146023344607435125L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(epoch from m_9) FROM test limit 1;", dt)));
+    ASSERT_EQ(1146009600L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT EXTRACT(dateepoch from m_9) FROM test limit 1;", dt)));
     ASSERT_EQ(4607435125L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(nanosecond from m_9) FROM test limit 1;", dt)));
@@ -8484,6 +9288,9 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(931701773874533L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(epoch from m_6) FROM test limit 1;", dt)));
+    ASSERT_EQ(931651200L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT EXTRACT(dateepoch from m_6) FROM test limit 1;", dt)));
     ASSERT_EQ(53874533000L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(nanosecond from m_6) FROM test limit 1;", dt)));
@@ -8532,6 +9339,9 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(1418509395323L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(epoch from m_3) FROM test limit 1;", dt)));
+    ASSERT_EQ(1418428800L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT EXTRACT(dateepoch from m_3) FROM test limit 1;", dt)));
     ASSERT_EQ(15323000000L,
               v<int64_t>(run_simple_agg(
                   "SELECT EXTRACT(nanosecond from m_3) FROM test limit 1;", dt)));
@@ -8678,6 +9488,7 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(4607435125L,
               v<int64_t>(run_simple_agg(
                   "SELECT DATEPART('nanosecond', m_9) FROM test limit 1;", dt)));
+    EXPECT_ANY_THROW(run_simple_agg("SELECT DATEPART(NULL, m_9) FROM test limit 1;", dt));
     /* ---DATE ADD --- */
     ASSERT_EQ(1177559344607435125L,
               v<int64_t>(run_simple_agg(
@@ -8798,6 +9609,10 @@ TEST(Select, TimestampPrecision) {
         1146023345607436000L,
         v<int64_t>(run_simple_agg(
             "SELECT DATEADD('nanosecond', 1000000875, m_9) FROM test limit 1;", dt)));
+    EXPECT_ANY_THROW(
+        run_simple_agg("SELECT DATEADD(NULL, NULL, m_9) FROM test LIMIT 1;", dt));
+    EXPECT_ANY_THROW(run_simple_agg(
+        "SELECT DATEADD('microsecond', NULL, m_9) FROM test LIMIT 1;", dt));
     /* ---DATE DIFF --- */
     ASSERT_EQ(1146023344607435125L - 931701773874533000L,
               v<int64_t>(run_simple_agg(
@@ -9123,7 +9938,8 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(0,
               v<int64_t>(run_simple_agg(
                   "SELECT DATEDIFF('year', m, m_3) FROM test limit 1;", dt)));
-
+    EXPECT_ANY_THROW(
+        run_simple_agg("SELECT DATEDIFF(NULL, m, m_3) FROM test limit 1;", dt));
     /* ---TIMESTAMPADD --- */
     ASSERT_EQ(1177559344607435125L,
               v<int64_t>(run_simple_agg(
@@ -9447,6 +10263,8 @@ TEST(Select, TimestampPrecision) {
             "timestamp(3)) between "
             "TIMESTAMP(3) '2014-12-13 22:23:14' and TIMESTAMP(3) '2014-12-13 22:23:15'",
             dt)));
+    ASSERT_ANY_THROW(
+        run_simple_agg("SELECT PG_DATE_TRUNC(NULL, m) FROM test LIMIT 1;", dt));
     /*-- Dates ---*/
     ASSERT_EQ(
         g_num_rows + g_num_rows / 2,
@@ -10779,7 +11597,14 @@ TEST(Update, VarlenSmartSwitch) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists smartswitch;");
-    run_ddl_statement("create table smartswitch (x int, y int[], z text );");
+    run_ddl_statement(build_create_table_statement("x int, y int[], z text encoding none",
+                                                   "smartswitch",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into smartswitch values (0, ARRAY[1,2,3,4], 'Flake');", dt);
     run_multiple_agg("insert into smartswitch values (1, ARRAY[5,6,7,8], 'Goofy');", dt);
@@ -10844,6 +11669,13 @@ TEST(Update, VarlenSmartSwitch) {
     ASSERT_EQ(x_pre_rowid_2, x_post_rowid_3);
     ASSERT_EQ(x_pre_rowid_3, x_post_rowid_4);
 
+    if (g_use_temporary_tables) {
+      // TODO: Support varlen updates on temp tables
+      EXPECT_ANY_THROW(
+          run_simple_agg("UPDATE smartswitch SET y=ARRAY[9,10,11,12] WHERE y[1]=1;", dt));
+      continue;
+    }
+
     // Test RelCompound-driven update
 
     auto y_pre_rowid_1 =
@@ -10897,18 +11729,67 @@ TEST(Update, VarlenSmartSwitch) {
   }
 }
 
+TEST(Update, SimpleFilter) {
+  if (!std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
+    return;
+  }
+
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    run_ddl_statement("DROP TABLE IF EXISTS simple_filter;");
+    run_ddl_statement(build_create_table_statement("x int, y double, z decimal(18,2)",
+                                                   "simple_filter",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+    g_sqlite_comparator.query("DROP TABLE IF EXISTS simple_filter;");
+    g_sqlite_comparator.query(
+        "CREATE TABLE simple_filter (x int, y double, z decimal(18,2))");
+    ScopeGuard reset = [] {
+      run_ddl_statement("DROP TABLE IF EXISTS simple_filter;");
+      g_sqlite_comparator.query("DROP TABLE IF EXISTS simple_filter;");
+    };
+
+    for (size_t i = 1; i <= 5; i++) {
+      std::string insert_stmt{"INSERT INTO simple_filter VALUES (" + std::to_string(i) +
+                              ", " + std::to_string(static_cast<double>(i) * 1.1) + ", " +
+                              std::to_string(static_cast<double>(i) * 1.01) + ");"};
+      run_multiple_agg(insert_stmt, dt);
+      g_sqlite_comparator.query(insert_stmt);
+    }
+
+    c("UPDATE simple_filter SET x = 6 WHERE y > 3;", dt);
+    c("SELECT * FROM simple_filter ORDER BY x, y, z;", dt);
+    c("UPDATE simple_filter SET y = 2*x WHERE y > 4;", dt);
+    c("SELECT * FROM simple_filter ORDER BY x, y, z;", dt);
+    c("UPDATE simple_filter SET y = 2*x WHERE z > 1.02;", dt);
+    c("SELECT * FROM simple_filter ORDER BY x, y, z;", dt);
+    c("UPDATE simple_filter SET z = 2*z WHERE x < 6;", dt);
+    c("SELECT * FROM simple_filter ORDER BY x, y, z;", dt);
+    c("SELECT sum(x) FROM simple_filter WHERE x < 6;", dt);  // check metadata
+  }
+}
+
 TEST(Update, Text) {
   if (!std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
     return;
   }
-  auto save_watchdog = g_enable_watchdog;
+  const auto save_watchdog = g_enable_watchdog;
+  ScopeGuard reset_watchdog_state = [&save_watchdog] {
+    g_enable_watchdog = save_watchdog;
+  };
   g_enable_watchdog = false;
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists text_default;");
-    run_ddl_statement("create table text_default (t text) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "t text", "text_default", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into text_default values ('do');", dt);
     run_multiple_agg("insert into text_default values ('you');", dt);
@@ -10946,7 +11827,8 @@ TEST(Update, TextINVariant) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists text_default;");
-    run_ddl_statement("create table text_default (t text) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "t text", "text_default", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into text_default values ('do');", dt);
     run_multiple_agg("insert into text_default values ('you');", dt);
@@ -10977,9 +11859,14 @@ TEST(Update, TextEncodingDict16) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists textenc16_default;");
-    run_ddl_statement(
-        "create table textenc16_default (t text encoding dict(16)) with "
-        "(vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("t text encoding dict(16)",
+                                                   "textenc16_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into textenc16_default values ('do');", dt);
     run_multiple_agg("insert into textenc16_default values ('you');", dt);
@@ -11018,9 +11905,15 @@ TEST(Update, TextEncodingDict8) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists textenc8_default;");
-    run_ddl_statement(
-        "create table textenc8_default (t text encoding dict(8)) with "
-        "(vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("t text encoding dict(8)",
+                                                   "textenc8_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into textenc8_default values ('do');", dt);
     run_multiple_agg("insert into textenc8_default values ('you');", dt);
     run_multiple_agg("insert into textenc8_default values ('know');", dt);
@@ -11053,15 +11946,29 @@ TEST(Update, MultiColumnInteger) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists multicoltable;");
-    run_ddl_statement(
-        "create table multicoltable (x integer, y integer, z integer) with "
-        "(vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("x integer, y integer, z integer",
+                                                   "multicoltable",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into multicoltable values (2,3,4);", dt);
     run_multiple_agg("insert into multicoltable values (4,9,16);", dt);
 
+    if (g_use_temporary_tables) {
+      EXPECT_ANY_THROW(run_multiple_agg(
+          "update multicoltable set x=-power(x,2),y=-power(y,2),z=-power(z,2) where x < "
+          "10 and y < 10 and z < 10;",
+          dt));
+      continue;
+    }
+
     run_multiple_agg(
-        "update multicoltable set x=-power(x,2),y=-power(y,2),z=-power(z,2) where x < 10 "
-        "and y < 10 and z < 10;",
+        "update multicoltable set x=-power(x,2),y=-power(y,2),z=-power(z,2) where x "
+        "< 10 and y < 10 and z < 10;",
         dt);
     ASSERT_EQ(int64_t(0),
               v<int64_t>(run_simple_agg("select sum(x) from multicoltable;", dt)));
@@ -11083,24 +11990,30 @@ TEST(Update, TimestampUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists timestamp_default;");
-    run_ddl_statement(
-        "create table timestamp_default (t timestamp) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("t timestamp",
+                                                   "timestamp_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into timestamp_default values ('12/01/2013:000001');", dt);
     run_multiple_agg("insert into timestamp_default values ('12/01/2013:000002');", dt);
     run_multiple_agg("insert into timestamp_default values ('12/01/2013:000003');", dt);
     run_multiple_agg("insert into timestamp_default values ('12/01/2013:000004');", dt);
     run_multiple_agg(
-        "update timestamp_default set t=timestampadd( second, 59, date_trunc( minute, t "
+        "update timestamp_default set t=timestampadd( second, 59, date_trunc( "
+        "minute, t "
         ") ) where mod( extract( second "
         "from t ), 2 )=1;",
         dt);
 
-    ASSERT_EQ(
-        int64_t(2),
-        v<int64_t>(run_simple_agg(
-            "select count(t) from timestamp_default where extract( second from t )=59;",
-            dt)));
+    ASSERT_EQ(int64_t(2),
+              v<int64_t>(run_simple_agg("select count(t) from timestamp_default "
+                                        "where extract( second from t )=59;",
+                                        dt)));
 
     run_ddl_statement("drop table timestamp_default;");
   }
@@ -11115,7 +12028,8 @@ TEST(Update, TimeUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists time_default;");
-    run_ddl_statement("create table time_default (t time) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "t time", "time_default", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into time_default values('00:00:01');", dt);
     run_multiple_agg("insert into time_default values('00:01:00');", dt);
@@ -11151,7 +12065,8 @@ TEST(Update, DateUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists date_default;");
-    run_ddl_statement("create table date_default (d date) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "d date", "date_default", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into date_default values('01/01/1901');", dt);
     run_multiple_agg("insert into date_default values('02/02/1902');", dt);
@@ -11169,11 +12084,21 @@ TEST(Update, DateUpdate) {
 }
 
 TEST(Update, DateUpdateNull) {
+  SKIP_WITH_TEMP_TABLES();  // Alter on temp tables not yet supported
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
     run_ddl_statement("Drop table IF EXISTS date_update;");
-    run_ddl_statement("create table date_update(a text, b date);");
+    run_ddl_statement(build_create_table_statement("a text, b date",
+                                                   "date_update",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into date_update values('1', '2018-01-04');", dt);
     run_multiple_agg("insert into date_update values('2', '2018-01-05');", dt);
     run_multiple_agg("insert into date_update values(null, null);", dt);
@@ -11200,7 +12125,8 @@ TEST(Update, FloatUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists float_default;");
-    run_ddl_statement("create table float_default (f float) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "f float", "float_default", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into float_default values(-0.01);", dt);
     run_multiple_agg("insert into float_default values( 0.02);", dt);
@@ -11228,8 +12154,14 @@ TEST(Update, IntegerUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists integer_default;");
-    run_ddl_statement(
-        "create table integer_default (i integer) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("i integer",
+                                                   "integer_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into integer_default values(-1);", dt);
     run_multiple_agg("insert into integer_default values( 2);", dt);
@@ -11256,7 +12188,14 @@ TEST(Update, DoubleUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists double_default;");
-    run_ddl_statement("create table double_default (d double) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("d double",
+                                                   "double_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into double_default values(-0.01);", dt);
     run_multiple_agg("insert into double_default values( 0.02);", dt);
@@ -11285,8 +12224,14 @@ TEST(Update, SmallIntUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists smallint_default;");
-    run_ddl_statement(
-        "create table smallint_default (s smallint) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("s smallint",
+                                                   "smallint_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
 
     run_multiple_agg("insert into smallint_default values(-1);", dt);
     run_multiple_agg("insert into smallint_default values( 2);", dt);
@@ -11312,7 +12257,15 @@ TEST(Update, BigIntUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists bigint_default;");
-    run_ddl_statement("create table bigint_default (b bigint) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("b bigint",
+                                                   "bigint_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into bigint_default values(-1);", dt);
     run_multiple_agg("insert into bigint_default values( 2);", dt);
     run_multiple_agg("insert into bigint_default values(-3);", dt);
@@ -11335,8 +12288,15 @@ TEST(Update, DecimalUpdate) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists decimal_default;");
-    run_ddl_statement(
-        "create table decimal_default (d decimal(5)) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("d decimal(5)",
+                                                   "decimal_default",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into decimal_default values(-1);", dt);
     run_multiple_agg("insert into decimal_default values( 2);", dt);
     run_multiple_agg("insert into decimal_default values(-3);", dt);
@@ -11352,50 +12312,6 @@ TEST(Update, DecimalUpdate) {
   }
 }
 
-TEST(Update, JoinCacheInvalidationTest) {
-  if (!std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
-    return;
-  }
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
-    SKIP_NO_GPU();
-
-    run_ddl_statement("drop table if exists string_join1");
-    run_ddl_statement("drop table if exists string_join2");
-    run_ddl_statement("create table string_join1 ( t text ) with (vacuum='delayed')");
-    run_ddl_statement(
-        "create table string_join2 ( t text ) with (vacuum='delayed', "
-        "partitions='REPLICATED')");
-
-    run_multiple_agg("insert into string_join1 values ('muffin')", dt);
-    run_multiple_agg("insert into string_join1 values ('pizza')", dt);
-    run_multiple_agg("insert into string_join1 values ('ice cream')", dt);
-    run_multiple_agg("insert into string_join1 values ('poutine')", dt);
-    run_multiple_agg("insert into string_join1 values ('samosa')", dt);
-    run_multiple_agg("insert into string_join2 values ('tomato')", dt);
-    run_multiple_agg("insert into string_join2 values ('potato')", dt);
-    run_multiple_agg("insert into string_join2 values ('apple')", dt);
-    run_multiple_agg("insert into string_join2 values ('orange')", dt);
-    run_multiple_agg("insert into string_join2 values ('chutney')", dt);
-    run_multiple_agg("insert into string_join2 values ('poutine')", dt);
-
-    run_simple_agg(
-        "select count(string_join1.t) from string_join1 inner join string_join2 on "
-        "string_join1.t = string_join2.t;",
-        dt);
-    run_multiple_agg("update string_join1 set t='not poutine' where t='poutine';", dt);
-
-    ASSERT_EQ(
-        int64_t(0),
-        v<int64_t>(run_simple_agg(
-            "select count(string_join1.t) from string_join1 inner join string_join2 on "
-            "string_join1.t = string_join2.t;",
-            dt)));
-
-    run_ddl_statement("drop table string_join1;");
-    run_ddl_statement("drop table string_join2;");
-  }
-}
-
 TEST(Delete, WithoutVacuumAttribute) {
   if (std::is_same<CalciteDeletePathSelector, PreprocessorFalse>::value) {
     return;
@@ -11405,13 +12321,20 @@ TEST(Delete, WithoutVacuumAttribute) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists no_deletes;");
-    run_ddl_statement("create table no_deletes (x integer) with (vacuum='immediate');");
+    run_ddl_statement(build_create_table_statement("x integer",
+                                                   "no_deletes",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   false,
+                                                   false));
+    ScopeGuard drop_table = [] { run_ddl_statement("DROP TABLE IF EXISTS no_deletes;"); };
     run_multiple_agg("insert into no_deletes values (10);", dt);
     run_multiple_agg("insert into no_deletes values (11);", dt);
     EXPECT_THROW(run_multiple_agg("delete from no_deletes where x > 10;", dt),
                  std::runtime_error);
     EXPECT_THROW(run_multiple_agg("delete from no_deletes;", dt), std::runtime_error);
-    run_ddl_statement("drop table no_deletes;");
   }
 }
 
@@ -11424,7 +12347,9 @@ TEST(Update, ImplicitCastToDate4) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists datetab;");
-    run_ddl_statement("create table datetab ( d1 date ) with ( vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement(
+        "d1 date", "datetab", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_multiple_agg("insert into datetab values ('2001-04-05');", dt);
 
     EXPECT_THROW(run_multiple_agg("update datetab set d1='nonsense';", dt),
@@ -11482,8 +12407,14 @@ TEST(Update, ImplicitCastToDate2) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists datetab4;");
-    run_ddl_statement(
-        "create table datetab4 ( d1 date encoding fixed(16)) with ( vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement("d1 date encoding fixed(16)",
+                                                   "datetab4",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
     run_multiple_agg("insert into datetab4 values ('2001-04-05');", dt);
 
     EXPECT_THROW(run_multiple_agg("update datetab4 set d1='nonsense';", dt),
@@ -11537,14 +12468,22 @@ TEST(Update, ImplicitCastToEncodedString) {
     return;
   }
 
+  SKIP_WITH_TEMP_TABLES();  // requires dict translation for updates
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists textenc;");
-    run_ddl_statement(
-        "create table textenc ( s1 text encoding dict(32), s2 text encoding dict(16), s3 "
-        "text encoding dict(8) ) with "
-        "(vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "s1 text encoding dict(32), s2 text encoding dict(16), s3 "
+        "text encoding dict(8)",
+        "textenc",
+        {"", 0},
+        {},
+        2,
+        g_use_temporary_tables,
+        true,
+        false));
     run_multiple_agg("insert into textenc values ( 'kanye', 'omari', 'west' );", dt);
 
     run_multiple_agg("update textenc set s1 = 'the';", dt);
@@ -11713,6 +12652,8 @@ TEST(Update, ImplicitCastToNoneEncodedString) {
     return;
   }
 
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
@@ -11763,19 +12704,32 @@ TEST(Update, ImplicitCastToNumericTypes) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists floattest;");
-    run_ddl_statement("create table floattest ( f float ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "f float", "floattest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists doubletest;");
-    run_ddl_statement("create table doubletest ( d double ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "d double", "doubletest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists inttest;");
-    run_ddl_statement("create table inttest ( i integer ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "i integer", "inttest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists sinttest;");
-    run_ddl_statement("create table sinttest ( i integer ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "i integer", "sinttest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists binttest;");
-    run_ddl_statement("create table binttest ( i integer ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "i integer", "binttest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists booltest;");
-    run_ddl_statement("create table booltest ( b boolean ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "b boolean", "booltest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+
     run_ddl_statement("drop table if exists dectest;");
-    run_ddl_statement("create table dectest ( d decimal(10) ) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement(
+        "d decimal(10)", "dectest", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
 
     run_multiple_agg("insert into floattest values ( 0.1234 );", dt);
     run_multiple_agg("insert into doubletest values ( 0.1234 );", dt);
@@ -12102,8 +13056,14 @@ TEST(Update, ImplicitCastToTime4) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists time4;");
-    run_ddl_statement(
-        "create table time4 ( t1 time encoding fixed(32) ) with ( vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement("t1 time encoding fixed(32)",
+                                                   "time4",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
     run_multiple_agg("insert into time4 values ('01:23:45');", dt);
 
     EXPECT_THROW(run_multiple_agg("update time4 set t1='nonsense';", dt), std::exception);
@@ -12151,7 +13111,9 @@ TEST(Update, ImplicitCastToTime8) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists timetab;");
-    run_ddl_statement("create table timetab ( t1 time ) with ( vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement(
+        "t1 time", "timetab", {"", 0}, {}, 10, g_use_temporary_tables, true, false));
+
     run_multiple_agg("insert into timetab values ('01:23:45');", dt);
 
     EXPECT_THROW(run_multiple_agg("update timetab set t1='nonsense';", dt),
@@ -12196,7 +13158,9 @@ TEST(Update, ImplicitCastToTimestamp8) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists tstamp;");
-    run_ddl_statement("create table tstamp ( t1 timestamp ) with ( vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement(
+        "t1 timestamp", "tstamp", {"", 0}, {}, 10, g_use_temporary_tables, true, false));
+
     run_multiple_agg("insert into tstamp values ('2000-01-01 00:00:00');", dt);
 
     EXPECT_THROW(run_multiple_agg("update tstamp set t1='nonsense';", dt),
@@ -12245,9 +13209,15 @@ TEST(Update, ImplicitCastToTimestamp4) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists tstamp4;");
-    run_ddl_statement(
-        "create table tstamp4 ( t1 timestamp encoding fixed(32) ) with ( "
-        "vacuum='delayed' );");
+    run_ddl_statement(build_create_table_statement("t1 timestamp encoding fixed(32)",
+                                                   "tstamp4",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+
     run_multiple_agg("insert into tstamp4 values ('2000-01-01 00:00:00');", dt);
 
     EXPECT_THROW(run_multiple_agg("update tstamp4 set t1='nonsense';", dt),
@@ -12296,6 +13266,8 @@ TEST(Update, ShardedTableShardKeyTest) {
     return;
   }
 
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
@@ -12339,10 +13311,18 @@ TEST(Update, UsingDateColumns) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     run_ddl_statement("drop table if exists chelsea_updates;");
-    run_ddl_statement(
-        "create table chelsea_updates (col_src date, col_dst_16 date encoding fixed(16), "
+    run_ddl_statement(build_create_table_statement(
+        "col_src date, col_dst_16 date encoding fixed(16), "
         "col_dst date, col_dst_ts timestamp(0), col_dst_ts_32 timestamp encoding "
-        "fixed(32)) with ( vacuum='delayed' );");
+        "fixed(32)",
+        "chelsea_updates",
+        {"", 0},
+        {},
+        2,
+        g_use_temporary_tables,
+        true,
+        false));
+
     run_multiple_agg(
         "insert into chelsea_updates values('1911-01-01', null, null, null, null);", dt);
     run_multiple_agg(
@@ -12385,10 +13365,16 @@ TEST(Delete, ShardedTableDeleteTest) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
-    run_ddl_statement("drop table if exists shardkey;");
-    run_ddl_statement(
-        "create table shardkey ( x integer, y integer, shard key (x) ) with "
-        "(vacuum='delayed', shard_count=4);");
+    run_ddl_statement("DROP TABLE IF EXISTS shardkey;");
+    run_ddl_statement(build_create_table_statement("x integer, y integer",
+                                                   "shardkey",
+                                                   {"x", 4},
+                                                   {},
+                                                   20,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+    ScopeGuard drop_table = [] { run_ddl_statement("DROP TABLE IF EXISTS shard_key;"); };
 
     run_multiple_agg("insert into shardkey values (1,2);", dt);
     run_multiple_agg("insert into shardkey values (3,4);", dt);
@@ -12406,52 +13392,6 @@ TEST(Delete, ShardedTableDeleteTest) {
 
     ASSERT_EQ(int64_t(11 + 13 + 15 + 17),
               v<int64_t>(run_simple_agg("select sum(x) from shardkey;", dt)));
-
-    run_ddl_statement("drop table shardkey;");
-  }
-}
-
-TEST(Delete, JoinCacheInvalidationTest) {
-  if (std::is_same<CalciteDeletePathSelector, PreprocessorFalse>::value) {
-    return;
-  }
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
-    SKIP_NO_GPU();
-
-    run_ddl_statement("drop table if exists string_join1;");
-    run_ddl_statement("drop table if exists string_join2;");
-    run_ddl_statement("create table string_join1 ( t text ) with (vacuum='delayed')");
-    run_ddl_statement(
-        "create table string_join2 ( t text ) with (vacuum='delayed', "
-        "partitions='REPLICATED')");
-
-    run_multiple_agg("insert into string_join1 values ('muffin')", dt);
-    run_multiple_agg("insert into string_join1 values ('pizza')", dt);
-    run_multiple_agg("insert into string_join1 values ('ice cream')", dt);
-    run_multiple_agg("insert into string_join1 values ('poutine')", dt);
-    run_multiple_agg("insert into string_join1 values ('samosa')", dt);
-    run_multiple_agg("insert into string_join2 values ('tomato')", dt);
-    run_multiple_agg("insert into string_join2 values ('potato')", dt);
-    run_multiple_agg("insert into string_join2 values ('apple')", dt);
-    run_multiple_agg("insert into string_join2 values ('orange')", dt);
-    run_multiple_agg("insert into string_join2 values ('chutney')", dt);
-    run_multiple_agg("insert into string_join2 values ('poutine')", dt);
-
-    run_simple_agg(
-        "select count(string_join1.t) from string_join1 inner join string_join2 on "
-        "string_join1.t = string_join2.t;",
-        dt);
-    run_multiple_agg("delete from string_join1 where t='poutine';", dt);
-
-    ASSERT_EQ(
-        int64_t(0),
-        v<int64_t>(run_simple_agg(
-            "select count(string_join1.t) from string_join1 inner join string_join2 on "
-            "string_join1.t = string_join2.t;",
-            dt)));
-
-    run_ddl_statement("drop table string_join1;");
-    run_ddl_statement("drop table string_join2;");
   }
 }
 
@@ -12463,10 +13403,11 @@ TEST(Delete, ScanLimitOptimization) {
     SKIP_NO_GPU();
 
     run_ddl_statement("DROP TABLE IF EXISTS test_scan_limit;");
-    run_ddl_statement(
-        "CREATE TABLE test_scan_limit ( i int ) WITH (vacuum='delayed', "
-        "fragment_size=2)");
-    ScopeGuard drop_table = [] { run_ddl_statement("DROP TABLE test_scan_limit;"); };
+    run_ddl_statement(build_create_table_statement(
+        "i int", "test_scan_limit", {"", 0}, {}, 2, g_use_temporary_tables, true, false));
+    ScopeGuard drop_table = [] {
+      run_ddl_statement("DROP TABLE IF EXISTS test_scan_limit;");
+    };
 
     run_multiple_agg("INSERT INTO test_scan_limit VALUES (0);", ExecutorDeviceType::CPU);
     run_multiple_agg("INSERT INTO test_scan_limit VALUES (1);", ExecutorDeviceType::CPU);
@@ -12504,8 +13445,18 @@ TEST(Delete, IntraFragment) {
     SKIP_NO_GPU();
 
     run_ddl_statement("drop table if exists vacuum_test;");
-    run_ddl_statement(
-        "create table vacuum_test (i1 integer, t1 text) with (vacuum='delayed');");
+    run_ddl_statement(build_create_table_statement("i1 integer, t1 text",
+                                                   "vacuum_test",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+    ScopeGuard drop_table = [] {
+      run_ddl_statement("DROP TABLE IF EXISTS vacuum_test;");
+    };
+
     run_multiple_agg("insert into vacuum_test values(1, '1');", dt);
     run_multiple_agg("insert into vacuum_test values(2, '2');", dt);
     run_multiple_agg("insert into vacuum_test values(3, '3');", dt);
@@ -12514,8 +13465,6 @@ TEST(Delete, IntraFragment) {
 
     ASSERT_EQ(int64_t(0),
               v<int64_t>(run_simple_agg("SELECT COUNT(i1) FROM vacuum_test;", dt)));
-
-    run_ddl_statement("drop table vacuum_test;");
   }
 }
 
@@ -13086,10 +14035,19 @@ TEST(Delete, ExtraFragment) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
-    run_ddl_statement("drop table if exists vacuum_test;");
-    run_ddl_statement(
-        "create table vacuum_test (i1 integer, t1 text) with (vacuum='delayed', "
-        "fragment_size=10);");
+    run_ddl_statement("DROP TABLE IF EXISTS vacuum_test;");
+    run_ddl_statement(build_create_table_statement("i1 integer, t1 text",
+                                                   "vacuum_test",
+                                                   {"", 0},
+                                                   {},
+                                                   10,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+    ScopeGuard drop_table = [] {
+      run_ddl_statement("DROP TABLE IF EXISTS vacuum_test;");
+    };
+
     for (int i = 1; i <= 100; i++) {
       run_multiple_agg(insert_op(i), dt);
     }
@@ -13097,6 +14055,55 @@ TEST(Delete, ExtraFragment) {
     ASSERT_EQ(int64_t(50),
               v<int64_t>(run_simple_agg("SELECT COUNT(i1) FROM vacuum_test;", dt)));
     run_ddl_statement("drop table vacuum_test;");
+  }
+}
+
+TEST(Delete, MultiDelete) {
+  if (std::is_same<CalciteDeletePathSelector, PreprocessorFalse>::value) {
+    return;
+  }
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    run_ddl_statement("DROP TABLE IF EXISTS multi_delete;");
+    run_ddl_statement(build_create_table_statement("x int, str text",
+                                                   "multi_delete",
+                                                   {"", 0},
+                                                   {},
+                                                   2,
+                                                   g_use_temporary_tables,
+                                                   true,
+                                                   false));
+    ScopeGuard drop_table = [] {
+      run_ddl_statement("DROP TABLE IF EXISTS multi_delete;");
+    };
+
+    run_multiple_agg("INSERT INTO multi_delete VALUES (1, 'foo');",
+                     ExecutorDeviceType::CPU);
+    run_multiple_agg("INSERT INTO multi_delete VALUES (2, 'bar');",
+                     ExecutorDeviceType::CPU);
+    run_multiple_agg("INSERT INTO multi_delete VALUES (3, 'baz');",
+                     ExecutorDeviceType::CPU);
+    run_multiple_agg("INSERT INTO multi_delete VALUES (4, 'hello');",
+                     ExecutorDeviceType::CPU);
+    run_multiple_agg("INSERT INTO multi_delete VALUES (5, 'world');",
+                     ExecutorDeviceType::CPU);
+
+    EXPECT_EQ(15, v<int64_t>(run_simple_agg("SELECT SUM(x) FROM multi_delete", dt)));
+
+    run_multiple_agg("DELETE FROM multi_delete WHERE x <= 3;", dt);
+
+    EXPECT_EQ(9, v<int64_t>(run_simple_agg("SELECT SUM(x) FROM multi_delete", dt)));
+
+    run_multiple_agg("INSERT INTO multi_delete VALUES (1, 'test');", dt);
+
+    EXPECT_EQ("test",
+              boost::get<std::string>(v<NullableString>(
+                  run_simple_agg("SELECT str FROM multi_delete WHERE x = 1;", dt))));
+
+    run_multiple_agg("DELETE FROM multi_delete WHERE x = 1;", dt);
+
+    EXPECT_EQ(9, v<int64_t>(run_simple_agg("SELECT SUM(x) FROM multi_delete", dt)));
   }
 }
 
@@ -13235,6 +14242,91 @@ TEST(Select, Correlated_Exists) {
   }
 }
 
+TEST(Select, Correlated_In) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    c("SELECT f.val FROM corr_in_facts f WHERE f.val IN (SELECT l.val FROM "
+      "corr_in_lookup l WHERE f.id = "
+      "l.id) AND f.val > 3",
+      dt);
+    c("SELECT f.val FROM corr_in_facts f WHERE f.val IN (SELECT l.val FROM "
+      "corr_in_lookup l WHERE f.id "
+      "<> l.id) AND f.val > 3",
+      dt);
+    c("SELECT f.id FROM corr_in_facts f WHERE f.id IN (SELECT l.id FROM corr_in_lookup l "
+      "WHERE f.val <> "
+      "l.val) AND f.val < 2",
+      dt);
+    c("SELECT f.id FROM corr_in_facts f WHERE f.id IN (SELECT l.id FROM corr_in_lookup l "
+      "WHERE f.val = "
+      "l.val) AND f.val < 2",
+      dt);
+  }
+}
+
+TEST(Create, QuotedColumnIdentifier) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    run_ddl_statement("drop table if exists identifier_test;");
+    EXPECT_ANY_THROW(
+        run_ddl_statement("create table identifier_test (id integer, sum bigint);"));
+
+    run_ddl_statement("create table identifier_test (id integer, \"sum\" bigint);");
+
+    run_multiple_agg("insert into identifier_test values(1, 1);", dt);
+    run_multiple_agg("insert into identifier_test values(2, 2);", dt);
+    run_multiple_agg("insert into identifier_test values(3, 3);", dt);
+
+    EXPECT_ANY_THROW(run_simple_agg("SELECT sum FROM identifier_test;", dt));
+
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT \"sum\" FROM identifier_test where id = 1;", dt)));
+
+    run_ddl_statement("alter table identifier_test rename column \"sum\" to \"count\";");
+
+    ASSERT_EQ(static_cast<int64_t>(2),
+              v<int64_t>(run_simple_agg(
+                  "SELECT \"count\" FROM identifier_test where id = 2;", dt)));
+
+    run_ddl_statement("alter table identifier_test drop column \"count\";");
+  }
+}
+
+TEST(Create, QuotedTableIdentifier) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+
+    run_ddl_statement("drop table if exists \"sum\";");
+    EXPECT_ANY_THROW(run_ddl_statement("create table sum (id integer, val integer);"));
+
+    run_ddl_statement("create table \"sum\" (id integer, val integer);");
+
+    EXPECT_ANY_THROW(run_multiple_agg("insert into sum values(1, 1);", dt));
+    run_multiple_agg("insert into \"sum\" values(1, 1);", dt);
+
+    EXPECT_ANY_THROW(run_simple_agg("SELECT val FROM sum;", dt));
+
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg("SELECT val FROM \"sum\";", dt)));
+
+    EXPECT_ANY_THROW(run_ddl_statement("alter table sum rename to count;"));
+
+    run_ddl_statement("alter table \"sum\" rename to \"count\";");
+
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg("SELECT val FROM \"count\";", dt)));
+
+    EXPECT_ANY_THROW(run_ddl_statement("alter table count drop column val;"));
+    run_ddl_statement("alter table \"count\" drop column val;");
+
+    EXPECT_ANY_THROW(run_ddl_statement("drop table count;"));
+    run_ddl_statement("drop table \"count\";");
+  }
+}
+
 TEST(Create, Delete) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -13277,6 +14369,8 @@ TEST(Select, Deleted) {
 #endif
 
 TEST(Select, GeoSpatial_Basics) {
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     ASSERT_EQ(static_cast<int64_t>(g_num_rows),
@@ -13327,6 +14421,12 @@ TEST(Select, GeoSpatial_Basics) {
                                   "WHERE ST_Distance(p, 'LINESTRING(-1 0, 0 1)') < 2.5;",
                                   dt)));
 
+    // SRID mismatch
+    EXPECT_THROW(run_simple_agg("SELECT ST_Distance('POINT(0 0)', "
+                                "ST_Transform(ST_SetSRID(p, 4326), 900913)) "
+                                "FROM geospatial_test limit 1;",
+                                dt),
+                 std::runtime_error);
     // Unsupported aggs
     EXPECT_THROW(run_simple_agg("SELECT MIN(p) FROM geospatial_test;", dt),
                  std::runtime_error);
@@ -13339,7 +14439,91 @@ TEST(Select, GeoSpatial_Basics) {
   }
 }
 
+TEST(Select, GeoSpatial_Null) {
+  SKIP_WITH_TEMP_TABLES();
+
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows / 2),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_null_test where p IS NOT NULL;", dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows / 2),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_null_test where p IS NULL;", dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(g_num_rows / 2),
+        v<int64_t>(run_simple_agg(
+            "SELECT COUNT(*) FROM geospatial_null_test WHERE ST_Distance(p,p) < 0.1;",
+            dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(g_num_rows / 2),
+        v<int64_t>(run_simple_agg(
+            "SELECT COUNT(*) FROM geospatial_null_test WHERE ST_Distance(p,p) IS NULL;",
+            dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test WHERE "
+                                        "ST_Distance(l,gpnotnull) IS NULL;",
+                                        dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(gpnotnull) FROM geospatial_null_test;", dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows / 2),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ST_X(p)) FROM geospatial_null_test;", dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows - 1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ST_X(gp4326)) FROM geospatial_null_test;", dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows / 2),
+              v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test WHERE "
+                                        "ST_Distance('POINT(0 0)', p) < 100.0;",
+                                        dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(3),
+        v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test WHERE "
+                                  "ST_Distance(ST_GeomFromText('POINT(0 0)'), p) < 9;",
+                                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            "SELECT COUNT(*) FROM geospatial_null_test WHERE ST_Distance(p,l) < 2.0;",
+            dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows / 2),
+              v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test WHERE "
+                                        "ST_Distance(p,gpnotnull) >= 0.0;",
+                                        dt)));
+    ASSERT_EQ(static_cast<int64_t>(2),
+              v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test WHERE "
+                                        "ST_Distance(gp4326,gp4326none) IS NULL;",
+                                        dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(2),
+        v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_null_test "
+                                  "WHERE ST_Distance('LINESTRING(-1 0, 0 1)', p) < 6.0;",
+                                  dt)));
+
+    ASSERT_EQ("POINT (1 1)",
+              boost::get<std::string>(v<NullableString>(run_simple_agg(
+                  "SELECT p FROM geospatial_null_test WHERE id = 1;", dt, false))));
+    ASSERT_EQ("NULL",
+              boost::get<std::string>(v<NullableString>(run_simple_agg(
+                  "SELECT p FROM geospatial_null_test WHERE id = 2;", dt, false))));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Contains(poly,p) FROM geospatial_null_test WHERE id=1;",
+                  dt,
+                  false)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            "SELECT ST_Contains(poly,p) IS NULL FROM geospatial_null_test WHERE id=2;",
+            dt,
+            false)));
+  }
+}
+
 TEST(Select, GeoSpatial_Projection) {
+  SKIP_WITH_TEMP_TABLES();
+
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     // Select *
@@ -14661,9 +15845,22 @@ TEST(Select, GeoSpatial_Projection) {
 }
 
 TEST(Select, GeoSpatial_GeoJoin) {
+  SKIP_WITH_TEMP_TABLES();
+
+  const auto enable_overlaps_hashjoin_state = g_enable_overlaps_hashjoin;
+  g_enable_overlaps_hashjoin = false;
+  ScopeGuard reset_overlaps_state = [&enable_overlaps_hashjoin_state] {
+    g_enable_overlaps_hashjoin = enable_overlaps_hashjoin_state;
+  };
+
   // Test loop joins
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg(
+                  "SELECT a.id FROM geospatial_test a JOIN geospatial_inner_join_test "
+                  "b ON ST_Intersects(b.poly, a.poly) ORDER BY a.id;",
+                  dt)));
 
     ASSERT_NO_THROW(run_simple_agg(
         "SELECT a.id FROM geospatial_test a INNER JOIN geospatial_inner_join_test "
@@ -14705,11 +15902,7 @@ TEST(Select, GeoSpatial_GeoJoin) {
         std::runtime_error));
   }
 
-  const auto enable_overlaps_hashjoin_state = g_enable_overlaps_hashjoin;
   g_enable_overlaps_hashjoin = true;
-  ScopeGuard reset_overlaps_state = [&enable_overlaps_hashjoin_state] {
-    g_enable_overlaps_hashjoin = enable_overlaps_hashjoin_state;
-  };
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -14719,6 +15912,12 @@ TEST(Select, GeoSpatial_GeoJoin) {
         "SELECT a.id FROM geospatial_test a INNER JOIN geospatial_inner_join_test "
         "b ON ST_Contains(b.poly, a.p);",
         dt));
+
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg(
+                  "SELECT a.id FROM geospatial_test a JOIN geospatial_inner_join_test "
+                  "b ON ST_Intersects(b.poly, a.poly) ORDER BY a.id;",
+                  dt)));
 
     SKIP_ON_AGGREGATOR(ASSERT_EQ(
         static_cast<int64_t>(1),
@@ -14746,15 +15945,16 @@ TEST(Select, GeoSpatial_GeoJoin) {
         static_cast<int64_t>(1),
         v<int64_t>(run_simple_agg(
             "SELECT a.id FROM geospatial_test a INNER JOIN geospatial_inner_join_test "
-            "b ON ST_Contains(b.poly, a.gp4326) WHERE b.id = 2 OFFSET 1;",
+            "b ON ST_Contains(ST_SetSRID(b.poly, 4326), a.gp4326) WHERE b.id = 2 "
+            "OFFSET 1;",
             dt))));
 
-    ASSERT_EQ(
-        static_cast<int64_t>(3),
-        v<int64_t>(run_simple_agg("SELECT count(*) FROM geospatial_test a INNER JOIN "
-                                  "geospatial_inner_join_test b ON ST_Contains(b.poly, "
-                                  "a.gp4326) WHERE b.id = 4;",
-                                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(3),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test a INNER JOIN "
+                  "geospatial_inner_join_test b ON ST_Contains(ST_SetSRID(b.poly, 4326), "
+                  "a.gp4326) WHERE b.id = 4;",
+                  dt)));
   }
 }
 
@@ -15282,7 +16482,6 @@ TEST(Select, DatesDaysEncodingTest) {
 }
 
 TEST(Select, WindowFunctionRank) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   std::string part1 =
       "SELECT x, y, ROW_NUMBER() OVER (PARTITION BY y ORDER BY x ASC) r1, RANK() OVER "
@@ -15293,7 +16492,6 @@ TEST(Select, WindowFunctionRank) {
 }
 
 TEST(Select, WindowFunctionOneRowPartitions) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   std::string part1 = "SELECT y, RANK() OVER (PARTITION BY y ORDER BY n ASC";
   std::string part2 =
@@ -15302,7 +16500,6 @@ TEST(Select, WindowFunctionOneRowPartitions) {
 }
 
 TEST(Select, WindowFunctionEmptyPartitions) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   EXPECT_THROW(
       run_simple_agg("SELECT x, ROW_NUMBER() OVER () FROM test_window_func;", dt),
@@ -15310,7 +16507,6 @@ TEST(Select, WindowFunctionEmptyPartitions) {
 }
 
 TEST(Select, WindowFunctionPercentRank) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   std::string part1 =
       "SELECT x, y, PERCENT_RANK() OVER (PARTITION BY y ORDER BY x ASC) p FROM "
@@ -15320,7 +16516,6 @@ TEST(Select, WindowFunctionPercentRank) {
 }
 
 TEST(Select, WindowFunctionTile) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   std::string part1 =
       "SELECT x, y, NTILE(2) OVER (PARTITION BY y ORDER BY x ASC) n FROM "
@@ -15330,7 +16525,6 @@ TEST(Select, WindowFunctionTile) {
 }
 
 TEST(Select, WindowFunctionCumeDist) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   std::string part1 =
       "SELECT x, y, CUME_DIST() OVER (PARTITION BY y ORDER BY x ASC) c FROM "
@@ -15340,7 +16534,6 @@ TEST(Select, WindowFunctionCumeDist) {
 }
 
 TEST(Select, WindowFunctionLag) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   for (int lag = -5; lag <= 5; ++lag) {
     {
@@ -15361,7 +16554,6 @@ TEST(Select, WindowFunctionLag) {
 }
 
 TEST(Select, WindowFunctionFirst) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   {
     std::string part1 =
@@ -15380,7 +16572,6 @@ TEST(Select, WindowFunctionFirst) {
 }
 
 TEST(Select, WindowFunctionLead) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   for (int lead = -5; lead <= 5; ++lead) {
     {
@@ -15401,7 +16592,6 @@ TEST(Select, WindowFunctionLead) {
 }
 
 TEST(Select, WindowFunctionLast) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   {
     std::string part1 =
@@ -15422,7 +16612,6 @@ TEST(Select, WindowFunctionLast) {
 }
 
 TEST(Select, WindowFunctionAggregate) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   {
     std::string part1 =
@@ -15558,7 +16747,6 @@ TEST(Select, WindowFunctionAggregate) {
 }
 
 TEST(Select, WindowFunctionAggregateNoOrder) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   {
     std::string part1 =
@@ -15646,7 +16834,6 @@ TEST(Select, WindowFunctionAggregateNoOrder) {
 }
 
 TEST(Select, WindowFunctionSum) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   c("SELECT total FROM (SELECT SUM(n) OVER (PARTITION BY y) AS total FROM (SELECT y, "
     "COUNT(*) AS n FROM test_window_func GROUP BY y)) ORDER BY total ASC;",
@@ -15658,7 +16845,6 @@ TEST(Select, WindowFunctionSum) {
 }
 
 TEST(Select, WindowFunctionComplexExpressions) {
-  SKIP_ALL_ON_AGGREGATOR();
   const ExecutorDeviceType dt = ExecutorDeviceType::CPU;
   {
     std::string part1 =
@@ -15948,6 +17134,10 @@ TEST(Select, GroupEmptyBlank) {
     const std::string drop_old_test{"DROP TABLE IF EXISTS blank_test;"};
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
+    ScopeGuard cleanup = [&drop_old_test] {
+      run_ddl_statement(drop_old_test);
+      g_sqlite_comparator.query(drop_old_test);
+    };
     std::string columns_definition{"t1 TEXT NOT NULL, i1 INTEGER"};
     const std::string create_test =
         build_create_table_statement(columns_definition,
@@ -15955,6 +17145,7 @@ TEST(Select, GroupEmptyBlank) {
                                      {g_shard_count ? "i1" : "", g_shard_count},
                                      {},
                                      10,
+                                     g_use_temporary_tables,
                                      true);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query("CREATE TABLE blank_test (t1 TEXT NOT NULL, i1 INTEGER);");
@@ -15966,6 +17157,187 @@ TEST(Select, GroupEmptyBlank) {
 
     c("select t1 from blank_test group by t1 order by t1;", dt);
   }
+}
+
+// Uses tables from import_union_all_tests().
+TEST(Select, UnionAll) {
+  bool enable_union = true;
+  std::swap(g_enable_union, enable_union);
+  for (auto dt : {ExecutorDeviceType::CPU /*, ExecutorDeviceType::GPU*/}) {
+    SKIP_NO_GPU();
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 BETWEEN 111 AND 115"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 BETWEEN 211 AND 217"
+      " ORDER BY a1;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 216"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 216"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 115"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 216"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 215"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 100"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 216"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 200"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 2, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 2"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT MAX(b0) max0, b1 % 2, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 2"
+      " UNION ALL"
+      " SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT MAX(a0) max0, a1 % 3, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 3"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 2, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 2"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT MAX(a0) max0, a1 % 2, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 2"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT MAX(a0) max0, a1 % 3, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 3"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 2, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 2"
+      " UNION ALL"
+      " SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT MAX(a0) max0, a1 % 2, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 2"
+      " UNION ALL"
+      " SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT MAX(a0), a1 % 2, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 2"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 116"
+      " UNION ALL"
+      " SELECT b0, b1, b2, b3 FROM union_all_b"
+      " WHERE b0 < 215"
+      " UNION ALL"
+      " SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 117"
+      " UNION ALL"
+      " SELECT MAX(a0), a1 % 2, MAX(a2), MAX(a3) FROM union_all_a"
+      " GROUP BY a1 % 2"
+      " UNION ALL"
+      " SELECT MAX(b0), b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " ORDER BY a0;",
+      dt);
+    c("SELECT MAX(b0) max0, b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " HAVING b1 % 3 = 1"
+      " UNION ALL"
+      " SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 117"
+      " ORDER BY max0;",
+      dt);
+    c("SELECT a0, a1, a2, a3 FROM union_all_a"
+      " WHERE a0 < 117"
+      " UNION ALL"
+      " SELECT MAX(b0) max0, b1 % 3, MAX(b2), MAX(b3) FROM union_all_b"
+      " GROUP BY b1 % 3"
+      " HAVING b1 % 3 = 1"
+      " ORDER BY a0;",
+      dt);
+    // sqlite sorts NULLs differently, and doesn't recognize NULLS FIRST/LAST.
+    c("SELECT str FROM test"
+      " UNION ALL"
+      " SELECT COALESCE(shared_dict,'NULL') FROM test"
+      " ORDER BY str;",
+      dt);
+    // The goal is that these should work.
+    // Exception: Subqueries of a UNION must have exact same data types.
+    EXPECT_THROW(run_multiple_agg("SELECT str FROM test UNION ALL "
+                                  "SELECT real_str FROM test ORDER BY str;",
+                                  dt),
+                 std::runtime_error);
+    // Exception: Columnar conversion not supported for variable length types
+    EXPECT_THROW(run_multiple_agg("SELECT real_str FROM test UNION ALL "
+                                  "SELECT real_str FROM test ORDER BY real_str;",
+                                  dt),
+                 std::runtime_error);
+    // Exception: Subqueries of a UNION must have exact same data types.
+    EXPECT_THROW(run_multiple_agg("SELECT str FROM test UNION ALL "
+                                  "SELECT fixed_str FROM test ORDER BY str;",
+                                  dt),
+                 std::runtime_error);
+  }
+  g_enable_union = enable_union;
 }
 
 TEST(Select, VariableLengthAggs) {
@@ -15987,29 +17359,32 @@ TEST(Select, VariableLengthAggs) {
                  std::runtime_error);
 
     // geometry:
-    {
-      std::string query("SELECT id, COUNT(poly) FROM geospatial_test GROUP BY id;");
-      auto result = run_multiple_agg(query, dt);
-      ASSERT_EQ(result->rowCount(), size_t(g_num_rows));
+    if (!g_use_temporary_tables) {
+      // Geospatial not yet supported in temporary tables
+      {
+        std::string query("SELECT id, COUNT(poly) FROM geospatial_test GROUP BY id;");
+        auto result = run_multiple_agg(query, dt);
+        ASSERT_EQ(result->rowCount(), size_t(g_num_rows));
+      }
+      EXPECT_THROW(
+          run_multiple_agg(
+              "SELECT id, MIN(p) FROM geospatial_test GROUP BY id ORDER BY id DESC;", dt),
+          std::runtime_error);
+      EXPECT_THROW(
+          run_multiple_agg(
+              "SELECT id, MAX(l) FROM geospatial_test GROUP BY id ORDER BY id DESC;", dt),
+          std::runtime_error);
+      EXPECT_THROW(
+          run_multiple_agg(
+              "SELECT id, SUM(poly) FROM geospatial_test GROUP BY id ORDER BY id DESC;",
+              dt),
+          std::runtime_error);
+      EXPECT_THROW(
+          run_multiple_agg(
+              "SELECT id, AVG(mpoly) FROM geospatial_test GROUP BY id ORDER BY id DESC;",
+              dt),
+          std::runtime_error);
     }
-    EXPECT_THROW(
-        run_multiple_agg(
-            "SELECT id, MIN(p) FROM geospatial_test GROUP BY id ORDER BY id DESC;", dt),
-        std::runtime_error);
-    EXPECT_THROW(
-        run_multiple_agg(
-            "SELECT id, MAX(l) FROM geospatial_test GROUP BY id ORDER BY id DESC;", dt),
-        std::runtime_error);
-    EXPECT_THROW(
-        run_multiple_agg(
-            "SELECT id, SUM(poly) FROM geospatial_test GROUP BY id ORDER BY id DESC;",
-            dt),
-        std::runtime_error);
-    EXPECT_THROW(
-        run_multiple_agg(
-            "SELECT id, AVG(mpoly) FROM geospatial_test GROUP BY id ORDER BY id DESC;",
-            dt),
-        std::runtime_error);
 
     // arrays:
     {
@@ -16036,6 +17411,83 @@ TEST(Select, VariableLengthAggs) {
   }
 }
 
+TEST(TemporaryTables, Unsupported) {
+  if (!g_use_temporary_tables) {
+    LOG(ERROR) << "Tests not valid without temporary tables.";
+    return;
+  }
+
+  // ensure a newly created table cannot share a dictionary with a temporary table
+  ScopeGuard reset = [] {
+    run_ddl_statement("DROP TABLE IF EXISTS sharing_temp_table_dict;");
+  };
+  EXPECT_ANY_THROW(
+      run_ddl_statement("CREATE TABLE sharing_temp_table_dict (x INT, str TEXT, SHARED "
+                        "DICTIONARY(str) REFERENCES test(null_str));"));
+}
+
+TEST(Select, Interop) {
+  SKIP_ALL_ON_AGGREGATOR();
+  g_enable_interop = true;
+  ScopeGuard interop_guard = [] { g_enable_interop = false; };
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c("SELECT 'dict_' || str c1, 'fake_' || substring(real_str, 6) c2, x + 56 c3, f c4, "
+      "-d c5, smallint_nulls c6 FROM test WHERE ('fake_' || substring(real_str, 6)) LIKE "
+      "'%_ba%' ORDER BY c1 ASC, c2 ASC, c3 ASC, c4 ASC, c5 ASC, c6 ASC;",
+      "SELECT 'dict_' || str c1, 'fake_' || substr(real_str, 6) c2, x + 56 c3, f c4, -d "
+      "c5, smallint_nulls c6 FROM test WHERE ('fake_' || substr(real_str, 6)) LIKE "
+      "'%_ba%' ORDER BY c1 ASC, c2 ASC, c3 ASC, c4 ASC, c5 ASC, c6 ASC;",
+      dt);
+    c("SELECT 'dict_' || str c1, 'fake_' || substring(real_str, 6) c2, x + 56 c3, f c4, "
+      "-d c5, smallint_nulls c6 FROM test ORDER BY c1 ASC, c2 ASC, c3 ASC, c4 ASC, c5 "
+      "ASC, c6 ASC;",
+      "SELECT 'dict_' || str c1, 'fake_' || substr(real_str, 6) c2, x + 56 c3, f c4, -d "
+      "c5, smallint_nulls c6 FROM test ORDER BY c1 ASC, c2 ASC, c3 ASC, c4 ASC, c5 ASC, "
+      "c6 ASC;",
+      dt);
+    c("SELECT str || '_dict' AS c1, COUNT(*) c2 FROM test GROUP BY str ORDER BY c1 ASC, "
+      "c2 ASC;",
+      dt);
+    c("SELECT str || '_dict' AS c1, COUNT(*) c2 FROM test WHERE x <> 8 GROUP BY str "
+      "ORDER BY c1 ASC, c2 ASC;",
+      dt);
+    {
+      std::string part1 =
+          "SELECT x, y, ROW_NUMBER() OVER (PARTITION BY y ORDER BY x ASC) - 1 r1, RANK() "
+          "OVER (PARTITION BY y ORDER BY x ASC) r2, DENSE_RANK() OVER (PARTITION BY y "
+          "ORDER BY x DESC) r3 FROM test_window_func ORDER BY x ASC";
+      std::string part2 = ", y ASC, r1 ASC, r2 ASC, r3 ASC;";
+      c(part1 + " NULLS FIRST" + part2, part1 + part2, dt);
+    }
+    c("SELECT CAST(('fake_' || SUBSTRING(real_str, 6)) LIKE '%_ba%' AS INT) b from test "
+      "ORDER BY b;",
+      "SELECT ('fake_' || SUBSTR(real_str, 6)) LIKE '%_ba%' b from test ORDER BY b;",
+      dt);
+  }
+  g_enable_interop = false;
+}
+
+TEST(Select, VarlenLazyFetch) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    {
+      // rowid not meaningful in dstributed mode
+      SKIP_ALL_ON_AGGREGATOR();
+      const auto query(
+          "SELECT t, p, real_str, array_i16 FROM varlen_table where rowid = 222;");
+      auto result = run_multiple_agg(query, dt);
+      const auto first_row = result->getNextRow(true, true);
+      ASSERT_EQ(size_t(4), first_row.size());
+      ASSERT_EQ(int64_t(95), v<int64_t>(first_row[0]));
+      ASSERT_EQ(boost::get<std::string>(v<NullableString>(first_row[1])),
+                "POINT (222 222)");
+      ASSERT_EQ(boost::get<std::string>(v<NullableString>(first_row[2])), "number222");
+      compare_array(first_row[3], std::vector<int64_t>({444, 445}));
+    }
+  }
+}
+
 namespace {
 
 int create_sharded_join_table(const std::string& table_name,
@@ -16055,6 +17507,7 @@ int create_sharded_join_table(const std::string& table_name,
                                                          shard_info,
                                                          {},
                                                          fragment_size,
+                                                         g_use_temporary_tables,
                                                          with_delete_support);
     run_ddl_statement(create_ddl);
     g_sqlite_comparator.query("CREATE TABLE " + table_name + "(i int, j int, s text);");
@@ -16208,7 +17661,8 @@ int create_and_populate_rounding_table() {
   return 0;
 }
 
-int create_and_populate_tables(bool with_delete_support = true) {
+int create_and_populate_tables(const bool use_temporary_tables,
+                               const bool with_delete_support = true) {
   try {
     const std::string drop_old_test{"DROP TABLE IF EXISTS test_inner;"};
     run_ddl_statement(drop_old_test);
@@ -16223,6 +17677,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "str" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_test_inner);
@@ -16261,6 +17716,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "x" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_bweq_test);
@@ -16290,6 +17746,58 @@ int create_and_populate_tables(bool with_delete_support = true) {
     }
   }
   try {
+    const std::string drop_old_outer_join_foo{"DROP TABLE IF EXISTS outer_join_foo;"};
+    run_ddl_statement(drop_old_outer_join_foo);
+    g_sqlite_comparator.query(drop_old_outer_join_foo);
+    const std::string create_outer_join_foo{
+        "CREATE TABLE outer_join_foo (a int, b int, c int);"};
+    run_ddl_statement(create_outer_join_foo);
+    g_sqlite_comparator.query(create_outer_join_foo);
+  } catch (...) {
+    LOG(ERROR) << "Failed to (re-)create table 'outer_join_foo'";
+    return -EEXIST;
+  }
+  {
+    std::vector<std::string> row_vec;
+    row_vec.emplace_back("INSERT INTO outer_join_foo VALUES (1,3,2)");
+    row_vec.emplace_back("INSERT INTO outer_join_foo VALUES (2,3,4)");
+    row_vec.emplace_back("INSERT INTO outer_join_foo VALUES (null,6,7)");
+    row_vec.emplace_back("INSERT INTO outer_join_foo VALUES (7,null,8)");
+    row_vec.emplace_back("INSERT INTO outer_join_foo VALUES (null,null,10)");
+    for (std::string insert_query : row_vec) {
+      run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+      g_sqlite_comparator.query(insert_query);
+    }
+  }
+  try {
+    const std::string drop_old_outer_join_bar{"DROP TABLE IF EXISTS outer_join_bar;"};
+    run_ddl_statement(drop_old_outer_join_bar);
+    g_sqlite_comparator.query(drop_old_outer_join_bar);
+    if (g_aggregator) {
+      run_ddl_statement(
+          "CREATE TABLE outer_join_bar (d int, e int, f int) WITH "
+          "(PARTITIONS='REPLICATED');");
+    } else {
+      run_ddl_statement("CREATE TABLE outer_join_bar (d int, e int, f int)");
+    }
+    g_sqlite_comparator.query("CREATE TABLE outer_join_bar (d int, e int, f int)");
+  } catch (...) {
+    LOG(ERROR) << "Failed to (re-)create table 'outer_join_bar'";
+    return -EEXIST;
+  }
+  {
+    std::vector<std::string> row_vec;
+    row_vec.emplace_back("INSERT INTO outer_join_bar VALUES (1,3,4)");
+    row_vec.emplace_back("INSERT INTO outer_join_bar VALUES (4,3,5)");
+    row_vec.emplace_back("INSERT INTO outer_join_bar VALUES (null,9,7)");
+    row_vec.emplace_back("INSERT INTO outer_join_bar VALUES (9,null,8)");
+    row_vec.emplace_back("INSERT INTO outer_join_bar VALUES (null,null,11)");
+    for (std::string insert_query : row_vec) {
+      run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+      g_sqlite_comparator.query(insert_query);
+    }
+  }
+  try {
     const std::string drop_old_test{"DROP TABLE IF EXISTS vacuum_test_alt;"};
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
@@ -16300,6 +17808,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "x" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_vacuum_test_alt);
@@ -16332,7 +17841,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
     std::string columns_definition{"x int not null, y int, str text encoding dict, deleted boolean"};
 
     const auto create_test_inner_deleted =
-        build_create_table_statement(columns_definition, "test_inner_deleted", {"", 0}, {}, 2, with_delete_support );
+        build_create_table_statement(columns_definition, "test_inner_deleted", {"", 0}, {}, 2, use_temporary_tables, with_delete_support);
     run_ddl_statement(create_test_inner_deleted);
     auto& cat = QR::get()->getSession()->getCatalog();
     const auto td = cat.getMetadataForTable("test_inner_deleted");
@@ -16364,6 +17873,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "x" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_test_inner);
@@ -16389,6 +17899,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "x" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_test_inner);
@@ -16413,8 +17924,14 @@ int create_and_populate_tables(bool with_delete_support = true) {
     run_ddl_statement(drop_old_bar);
     g_sqlite_comparator.query(drop_old_bar);
     std::string columns_definition{"str text encoding dict"};
-    const auto create_bar = build_create_table_statement(
-        columns_definition, "bar", {"", 0}, {}, 2, with_delete_support, g_aggregator);
+    const auto create_bar = build_create_table_statement(columns_definition,
+                                                         "bar",
+                                                         {"", 0},
+                                                         {},
+                                                         2,
+                                                         use_temporary_tables,
+                                                         with_delete_support,
+                                                         g_aggregator);
     run_ddl_statement(create_bar);
     g_sqlite_comparator.query("CREATE TABLE bar(str text);");
   } catch (...) {
@@ -16458,7 +17975,8 @@ int create_and_populate_tables(bool with_delete_support = true) {
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
     std::string columns_definition{
-        "x int not null, y int, z smallint, t bigint, b boolean, f float, ff float, fn "
+        "x int not null, w tinyint, y int, z smallint, t bigint, b boolean, f float, ff "
+        "float, fn "
         "float, d double, dn double, str "
         "varchar(10), null_str text encoding dict, fixed_str text encoding dict(16), "
         "fixed_null_str text encoding "
@@ -16476,10 +17994,12 @@ int create_and_populate_tables(bool with_delete_support = true) {
         {g_shard_count ? "str" : "", g_shard_count},
         {{"str", "test_inner", "str"}, {"shared_dict", "test", "str"}},
         2,
+        use_temporary_tables,
         with_delete_support);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query(
-        "CREATE TABLE test(x int not null, y int, z smallint, t bigint, b boolean, f "
+        "CREATE TABLE test(x int not null, w tinyint, y int, z smallint, t bigint, b "
+        "boolean, f "
         "float, ff float, fn float, d "
         "double, dn double, str varchar(10), null_str text, fixed_str text, "
         "fixed_null_str text, real_str text, "
@@ -16497,7 +18017,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
   CHECK_EQ(g_num_rows % 2, 0);
   for (ssize_t i = 0; i < g_num_rows; ++i) {
     const std::string insert_query{
-        "INSERT INTO test VALUES(7, 42, 101, 1001, 't', 1.1, 1.1, null, 2.2, null, "
+        "INSERT INTO test VALUES(7, -8, 42, 101, 1001, 't', 1.1, 1.1, null, 2.2, null, "
         "'foo', null, 'foo', null, "
         "'real_foo', 'foo',"
         "'2014-12-13 22:23:15', '2014-12-13 22:23:15.323', '1999-07-11 "
@@ -16513,7 +18033,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
   }
   for (ssize_t i = 0; i < g_num_rows / 2; ++i) {
     const std::string insert_query{
-        "INSERT INTO test VALUES(8, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, 2.4, "
+        "INSERT INTO test VALUES(8, -7, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, 2.4, "
         "-2002.4, 'bar', null, 'bar', null, "
         "'real_bar', NULL, '2014-12-13 22:23:15', '2014-12-13 22:23:15.323', "
         "'2014-12-13 "
@@ -16528,7 +18048,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
   }
   for (ssize_t i = 0; i < g_num_rows / 2; ++i) {
     const std::string insert_query{
-        "INSERT INTO test VALUES(7, 43, 102, 1002, 't', 1.3, 1000.3, -1000.3, 2.6, "
+        "INSERT INTO test VALUES(7, -7, 43, 102, 1002, 't', 1.3, 1000.3, -1000.3, 2.6, "
         "-220.6, 'baz', null, null, null, "
         "'real_baz', 'baz', '2014-12-14 22:23:15', '2014-12-14 22:23:15.750', "
         "'2014-12-14 22:23:15.437321', "
@@ -16545,7 +18065,8 @@ int create_and_populate_tables(bool with_delete_support = true) {
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
     std::string columns_definition{
-        "x int not null, y int, z smallint, t bigint, b boolean, f float, ff float, fn "
+        "x int not null, w tinyint, y int, z smallint, t bigint, b boolean, f float, ff "
+        "float, fn "
         "float, d double, dn double, str "
         "varchar(10), null_str text encoding dict, fixed_str text encoding dict(16), "
         "fixed_null_str text encoding "
@@ -16561,11 +18082,13 @@ int create_and_populate_tables(bool with_delete_support = true) {
         {g_shard_count ? "str" : "", g_shard_count},
         {{"str", "test_inner", "str"}, {"shared_dict", "test", "str"}},
         2,
+        use_temporary_tables,
         with_delete_support,
         g_aggregator);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query(
-        "CREATE TABLE test_empty(x int not null, y int, z smallint, t bigint, b "
+        "CREATE TABLE test_empty(x int not null, w tinyint, y int, z smallint, t bigint, "
+        "b "
         "boolean, "
         "f "
         "float, ff float, fn float, d "
@@ -16586,7 +18109,8 @@ int create_and_populate_tables(bool with_delete_support = true) {
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
     std::string columns_definition{
-        "x int not null, y int, z smallint, t bigint, b boolean, f float, ff float, fn "
+        "x int not null, w tinyint, y int, z smallint, t bigint, b boolean, f float, ff "
+        "float, fn "
         "float, d double, dn double, str "
         "varchar(10), null_str text encoding dict, fixed_str text encoding dict(16), "
         "fixed_null_str text encoding "
@@ -16602,11 +18126,13 @@ int create_and_populate_tables(bool with_delete_support = true) {
         {g_shard_count ? "str" : "", g_shard_count},
         {{"str", "test_inner", "str"}, {"shared_dict", "test", "str"}},
         2,
+        use_temporary_tables,
         with_delete_support,
         g_aggregator);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query(
-        "CREATE TABLE test_one_row(x int not null, y int, z smallint, t bigint, b "
+        "CREATE TABLE test_one_row(x int not null, w tinyint, y int, z smallint, t "
+        "bigint, b "
         "boolean, "
         "f "
         "float, ff float, fn float, d "
@@ -16624,7 +18150,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
   }
   {
     const std::string insert_query{
-        "INSERT INTO test_one_row VALUES(8, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, "
+        "INSERT INTO test_one_row VALUES(8, -8, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, "
         "2.4, "
         "-2002.4, 'bar', null, 'bar', null, "
         "'real_bar', NULL, '2014-12-13 22:23:15', "
@@ -16640,8 +18166,13 @@ int create_and_populate_tables(bool with_delete_support = true) {
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
     std::string columns_definition{"i INT, b BIGINT"};
-    const std::string create_test = build_create_table_statement(
-        columns_definition, "test_ranges", {"", 0}, {}, 2, with_delete_support);
+    const std::string create_test = build_create_table_statement(columns_definition,
+                                                                 "test_ranges",
+                                                                 {"", 0},
+                                                                 {},
+                                                                 2,
+                                                                 use_temporary_tables,
+                                                                 with_delete_support);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query("CREATE TABLE test_ranges(i INT, b BIGINT);");
   } catch (...) {
@@ -16681,6 +18212,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {g_shard_count ? "x" : "", g_shard_count},
                                      {},
                                      2,
+                                     use_temporary_tables,
                                      with_delete_support);
     run_ddl_statement(create_test);
     g_sqlite_comparator.query(
@@ -16755,6 +18287,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
                                      {"", 0},
                                      {},
                                      32000000,
+                                     use_temporary_tables,
                                      with_delete_support,
                                      g_aggregator);
     run_ddl_statement(create_array_test);
@@ -16801,6 +18334,8 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "st2", fragment_size, num_shards * fragment_size, shard_info, delete_support);
     create_sharded_join_table(
         "st3", fragment_size, 8 * num_shards, shard_info, delete_support);
+    create_sharded_join_table(
+        "st4", fragment_size, num_shards, shard_info, delete_support);
 
   } catch (...) {
     LOG(ERROR) << "Failed to (re-)create table 'array_test_inner'";
@@ -16856,6 +18391,12 @@ int create_and_populate_tables(bool with_delete_support = true) {
     import_random_test();
   } catch (...) {
     LOG(ERROR) << "Failed to (re-)create table 'random_test'";
+    return -EEXIST;
+  }
+  try {
+    import_varlen_lazy_fetch();
+  } catch (...) {
+    LOG(ERROR) << "Failed to (re-)create table 'varlen_table'";
     return -EEXIST;
   }
   try {
@@ -16923,15 +18464,36 @@ int create_and_populate_tables(bool with_delete_support = true) {
     return -EEXIST;
   }
   try {
-    import_geospatial_test();
+    import_corr_in_lookup();
   } catch (...) {
-    LOG(ERROR) << "Failed to (re-)create table 'geospatial_test'";
+    LOG(ERROR) << "Failed to (re-)create table 'corr_in_lookup'";
     return -EEXIST;
   }
   try {
-    import_geospatial_join_test(g_aggregator);
+    import_corr_in_facts();
   } catch (...) {
-    LOG(ERROR) << "Failed to (re-)create table 'geospatial_inner_join_test'";
+    LOG(ERROR) << "Failed to (re-)create table 'corr_in_facts'";
+    return -EEXIST;
+  }
+  if (!use_temporary_tables) {
+    // Geospatial not yet supported in temporary tables
+    try {
+      import_geospatial_null_test();
+    } catch (...) {
+      LOG(ERROR) << "Failed to (re-)create table 'geospatial_null_test'";
+      return -EEXIST;
+    }
+    try {
+      import_geospatial_test();
+    } catch (...) {
+      LOG(ERROR) << "Failed to (re-)create table 'geospatial_test'";
+      return -EEXIST;
+    }
+    try {
+      import_geospatial_join_test(g_aggregator);
+    } catch (...) {
+      LOG(ERROR) << "Failed to (re-)create table 'geospatial_inner_join_test'";
+    }
   }
   try {
     const std::string drop_old_empty{"DROP TABLE IF EXISTS emptytab;"};
@@ -16986,6 +18548,13 @@ int create_and_populate_tables(bool with_delete_support = true) {
     import_test_table_with_lots_of_columns();
   } catch (...) {
     LOG(ERROR) << "Failed to (re-)create table 'test_lots_cols'";
+  }
+  try {
+    import_union_all_tests();
+  } catch (std::exception const& e) {
+    LOG(ERROR) << "Exception thrown from import_union_all_tests(): " << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Unknown error in import_union_all_tests().";
   }
   {
     std::string insert_query{"INSERT INTO test_in_bitmap VALUES('a');"};
@@ -17136,6 +18705,8 @@ void drop_tables() {
   run_ddl_statement(drop_gpu_sort_test);
   const std::string drop_random_test{"DROP TABLE random_test;"};
   run_ddl_statement(drop_random_test);
+  const std::string drop_varlen_lazy_fetch_test{"DROP TABLE varlen_table;"};
+  run_ddl_statement(drop_varlen_lazy_fetch_test);
   g_sqlite_comparator.query(drop_gpu_sort_test);
   const std::string drop_query_rewrite_test{"DROP TABLE query_rewrite_test;"};
   run_ddl_statement(drop_query_rewrite_test);
@@ -17181,7 +18752,21 @@ void drop_tables() {
   const std::string drop_dept_table{"DROP TABLE dept;"};
   g_sqlite_comparator.query(drop_dept_table);
   run_ddl_statement(drop_dept_table);
-  run_ddl_statement("DROP TABLE geospatial_test;");
+  const std::string drop_corr_in_lookup_table{"DROP TABLE IF EXISTS corr_in_lookup;"};
+  run_ddl_statement(drop_corr_in_lookup_table);
+  g_sqlite_comparator.query(drop_corr_in_lookup_table);
+  const std::string drop_corr_in_facts_table{"DROP TABLE IF EXISTS corr_in_facts;"};
+  run_ddl_statement(drop_corr_in_facts_table);
+  g_sqlite_comparator.query(drop_corr_in_facts_table);
+  const std::string drop_outer_join_foo{"DROP TABLE IF EXISTS outer_join_foo;"};
+  run_ddl_statement(drop_outer_join_foo);
+  g_sqlite_comparator.query(drop_outer_join_foo);
+  const std::string drop_outer_join_bar{"DROP TABLE IF EXISTS outer_join_bar;"};
+  run_ddl_statement(drop_outer_join_bar);
+  g_sqlite_comparator.query(drop_outer_join_bar);
+  if (!g_use_temporary_tables) {
+    run_ddl_statement("DROP TABLE geospatial_test;");
+  }
   const std::string drop_test_in_bitmap{"DROP TABLE test_in_bitmap;"};
   g_sqlite_comparator.query(drop_test_in_bitmap);
   run_ddl_statement(drop_test_in_bitmap);
@@ -17195,7 +18780,7 @@ void drop_tables() {
   g_sqlite_comparator.query(drop_test_lots_cols);
   run_ddl_statement(drop_test_lots_cols);
 
-  if (!g_aggregator) {
+  if (!g_aggregator && !g_use_temporary_tables) {
     const std::string drop_ctas_test{"DROP TABLE ctas_test;"};
     g_sqlite_comparator.query(drop_ctas_test);
     run_ddl_statement(drop_ctas_test);
@@ -17214,6 +18799,9 @@ void drop_tables() {
 }
 
 void drop_views() {
+  if (g_use_temporary_tables) {
+    return;
+  }
   const std::string drop_view_test{"DROP VIEW view_test;"};
   run_ddl_statement(drop_view_test);
   g_sqlite_comparator.query(drop_view_test);
@@ -17268,16 +18856,24 @@ int main(int argc, char** argv) {
                      "Don't create and drop tables and only run select tests (it "
                      "implies --keep-data).");
   desc.add_options()("dump-ir",
-                     po::value<std::string>(),
-                     "Dump IR for all executed queries to file. Currently only supports "
-                     "single node tests.");
+                     po::value<bool>()->default_value(false)->implicit_value(true),
+                     "Dump IR and PTX for all executed queries to file."
+                     " Currently only supports single node tests.");
+  desc.add_options()("use-temporary-tables",
+                     "Use temporary tables instead of physical storage.");
+  desc.add_options()("use-tbb",
+                     po::value<bool>(&g_use_tbb_pool)
+                         ->default_value(g_use_tbb_pool)
+                         ->implicit_value(true),
+                     "Use TBB thread pool implementation for query dispatch.");
 
   desc.add_options()(
       "test-help",
       "Print all ExecuteTest specific options (for gtest options use `--help`).");
 
   logger::LogOptions log_options(argv[0]);
-  log_options.max_files_ = 0;  // stderr only by default
+  log_options.severity_ = logger::Severity::FATAL;
+  log_options.set_options();  // update default values
   desc.add(log_options.get_options());
 
   po::variables_map vm;
@@ -17290,6 +18886,12 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (vm["dump-ir"].as<bool>()) {
+    // Only log IR, PTX channels to file with no rotation size.
+    log_options.channels_ = {logger::Channel::IR, logger::Channel::PTX};
+    log_options.rotation_size_ = std::numeric_limits<size_t>::max();
+  }
+
   logger::init(log_options);
 
   if (vm.count("disable-literal-hoisting")) {
@@ -17297,18 +18899,20 @@ int main(int argc, char** argv) {
   }
 
   g_enable_window_functions = true;
+  g_enable_interop = false;
 
   QR::init(BASE_PATH);
   if (vm.count("with-sharding")) {
     g_shard_count = choose_shard_count();
   }
-  if (vm.count("dump-ir")) {
-    const auto filename = vm["dump-ir"].as<std::string>();
-    QR::get()->setIRFilename(filename);
-  }
 
   if (vm.count("keep-data")) {
     g_keep_test_data = true;
+  }
+
+  if (vm.count("use-temporary-tables")) {
+    LOG(INFO) << "Running ExecuteTest using temporary tables.";
+    g_use_temporary_tables = true;
   }
 
   // insert artificial gap of columnId so as to test against the gap w/o
@@ -17321,14 +18925,14 @@ int main(int argc, char** argv) {
   if (use_existing_data) {
     testing::GTEST_FLAG(filter) = "Select*";
   } else {
-    err = create_and_populate_tables();
-    if (!err) {
+    err = create_and_populate_tables(g_use_temporary_tables);
+    if (!err && !g_use_temporary_tables) {
       err = create_views();
     }
-    if (!err) {
+    if (!err && !g_use_temporary_tables) {
       SKIP_ON_AGGREGATOR(err = create_as_select());
     }
-    if (!err) {
+    if (!err && !g_use_temporary_tables) {
       SKIP_ON_AGGREGATOR(err = create_as_select_empty());
     }
   }
