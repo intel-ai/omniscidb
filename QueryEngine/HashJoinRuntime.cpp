@@ -1221,7 +1221,7 @@ void inclusive_scan(InputIterator first,
   OffsetType start_off = 0;
   OffsetType end_off = std::min(step, elem_count);
   std::vector<ElementType> partial_sums(thread_count);
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t thread_idx = 0; thread_idx < thread_count; ++thread_idx,
               start_off = std::min(start_off + step, elem_count),
               end_off = std::min(start_off + step, elem_count)) {
@@ -1285,7 +1285,7 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (unsigned cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     counter_threads.push_back(
         utils::async(count_matches_func, cpu_thread_idx, cpu_thread_count));
@@ -1304,7 +1304,7 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
 #endif
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     pos_threads.push_back(utils::async(
         [&](size_t thread_idx) {
@@ -1322,7 +1322,7 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     rowid_threads.push_back(
         utils::async(fill_row_ids_func, cpu_thread_idx, cpu_thread_count));
@@ -1469,7 +1469,7 @@ void fill_one_to_many_hash_table_sharded_impl(
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     counter_threads.push_back(
         utils::async(count_matches_launcher, cpu_thread_idx, cpu_thread_count));
@@ -1484,7 +1484,7 @@ void fill_one_to_many_hash_table_sharded_impl(
   memcpy(&count_copy[1], count_buff, (hash_entry_count - 1) * sizeof(int32_t));
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     pos_threads.push_back(utils::async(
         [&](const unsigned thread_idx) {
@@ -1502,7 +1502,7 @@ void fill_one_to_many_hash_table_sharded_impl(
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     rowid_threads.push_back(
         utils::async(fill_row_ids_launcher, cpu_thread_idx, cpu_thread_count));
@@ -1721,7 +1721,7 @@ void fill_one_to_many_baseline_hash_table(
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     if (join_buckets_per_key.size() > 0) {
       counter_threads.push_back(utils::async([count_buff,
@@ -1780,7 +1780,7 @@ void fill_one_to_many_baseline_hash_table(
   memcpy(&count_copy[1], count_buff, (hash_entry_count - 1) * sizeof(int32_t));
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     pos_threads.push_back(utils::async(
         [&](const int thread_idx) {
@@ -1797,7 +1797,7 @@ void fill_one_to_many_baseline_hash_table(
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     if (join_buckets_per_key.size() > 0) {
       rowid_threads.push_back(utils::async([buff,
@@ -1917,7 +1917,7 @@ void approximate_distinct_tuples(uint8_t* hll_buffer_all_cpus,
   CHECK_EQ(join_column_per_key.size(), type_info_per_key.size());
   CHECK(!join_column_per_key.empty());
 
-  std::vector<std::future<void>> approx_distinct_threads;
+  std::vector<utils::future<void>> approx_distinct_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     approx_distinct_threads.push_back(utils::async([&join_column_per_key,
                                                     &type_info_per_key,
@@ -1961,7 +1961,7 @@ void approximate_distinct_tuples_overlaps(
   CHECK_EQ(join_column_per_key.size(), type_info_per_key.size());
   CHECK(!join_column_per_key.empty());
 
-  std::vector<std::future<void>> approx_distinct_threads;
+  std::vector<utils::future<void>> approx_distinct_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     approx_distinct_threads.push_back(utils::async([&join_column_per_key,
                                                     &join_buckets_per_key,
@@ -2004,7 +2004,7 @@ void compute_bucket_sizes(std::vector<double>& bucket_sizes_for_dimension,
     bucket_sizes_for_threads.emplace_back(bucket_sizes_for_dimension.size(),
                                           std::numeric_limits<double>::max());
   }
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     threads.push_back(utils::async(
                                  compute_bucket_sizes_impl<2>,

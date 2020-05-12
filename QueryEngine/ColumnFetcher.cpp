@@ -353,7 +353,7 @@ const int8_t* ColumnFetcher::getResultSetColumn(
   }
 
   {
-    std::lock_guard<ResultSet> rs_guard(*buffer);
+    std::lock_guard<ResultSet> rs_guard(*buffer); // std::recursive_mutex
     if (!it->second[frag_id]) {
       it->second[frag_id] = std::shared_ptr<const ColumnarResults>(
           columnarize_result(executor_->row_set_mem_owner_, buffer, frag_id));

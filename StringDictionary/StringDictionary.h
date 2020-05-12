@@ -20,6 +20,7 @@
 #include "../Shared/mapd_shared_mutex.h"
 #include "DictRef.h"
 #include "DictionaryCache.hpp"
+#include "../Utils/Threading.h"
 
 #include <future>
 #include <map>
@@ -137,7 +138,7 @@ class StringDictionary {
   };
 
   void processDictionaryFutures(
-      std::vector<std::future<std::vector<std::pair<uint32_t, unsigned int>>>>&
+      std::vector<utils::future<std::vector<std::pair<uint32_t, unsigned int>>>>&
           dictionary_futures);
   bool fillRateIsHigh(const size_t num_strings) const noexcept;
   void increaseCapacity() noexcept;

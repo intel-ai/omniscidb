@@ -494,7 +494,7 @@ void JoinHashTable::reify() {
   gpu_hash_table_buff_.resize(device_count_);
   gpu_hash_table_err_buff_.resize(device_count_);
 #endif  // HAVE_CUDA
-  std::vector<std::future<void>> init_threads;
+  std::vector<utils::future<void>> init_threads;
   const int shard_count = shardCount();
 
   try {
@@ -515,9 +515,6 @@ void JoinHashTable::reify() {
     }
     for (auto& init_thread : init_threads) {
       init_thread.wait();
-    }
-    for (auto& init_thread : init_threads) {
-      init_thread.get();
     }
 
   } catch (const NeedsOneToManyHash& e) {
@@ -720,7 +717,7 @@ void JoinHashTable::initOneToOneHashTableOnCpu(
       CHECK(sd_outer_proxy);
     }
     int thread_count = cpu_threads();
-    std::vector<std::future<void>> init_cpu_buff_threads;
+    std::vector<utils::future<void>> init_cpu_buff_threads;
     for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
       init_cpu_buff_threads.emplace_back(utils::async(
           [this, hash_entry_info, hash_join_invalid_val, thread_idx, thread_count] {
@@ -813,7 +810,7 @@ void JoinHashTable::initOneToManyHashTableOnCpu(
     CHECK(sd_outer_proxy);
   }
   int thread_count = cpu_threads();
-  std::vector<std::future<void>> init_threads;
+  std::vector<utils::future<void>> init_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     init_threads.emplace_back(utils::async(init_hash_join_buff,
                                            &(*cpu_hash_table_buff_)[0],

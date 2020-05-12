@@ -25,8 +25,7 @@
 #include "Encoder.h"
 
 #include <Shared/DatumFetchers.h>
-#include <tbb/parallel_for.h>
-#include <tbb/parallel_reduce.h>
+#include <Utils/Threading.h>
 #include <tuple>
 
 template <typename T, typename V>
@@ -123,8 +122,8 @@ class FixedLengthEncoder : public Encoder {
   void updateStats(const int8_t* const dst, const size_t numElements) override {
     const V* data = reinterpret_cast<const V*>(dst);
 
-    std::tie(dataMin, dataMax, has_nulls) = tbb::parallel_reduce(
-        tbb::blocked_range(0UL, numElements),
+    std::tie(dataMin, dataMax, has_nulls) = utils::parallel_reduce(
+        utils::blocked_range(0UL, numElements),
         std::tuple(static_cast<V>(dataMin), static_cast<V>(dataMax), has_nulls),
         [&](const auto& range, auto init) {
           auto [min, max, nulls] = init;

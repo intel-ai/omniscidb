@@ -70,7 +70,7 @@ class SimpleThreadController {
   }
   template <typename FuncType, typename... Args>
   void startThread(FuncType&& func, Args&&... args) {
-    threads_.emplace_back(utils::async(func, args...));
+    threads_.emplace_back(std::async(func, args...));
   }
   virtual void finish() {
     for (auto& t : threads_) {

@@ -4,6 +4,7 @@ set(utils_source_files
     ChunkIter.cpp
     ChunkAccessorTable.cpp
     DdlUtils.cpp
+    Threading.cpp
 )
 
 include_directories(${Arrow_INCLUDE_DIRS})

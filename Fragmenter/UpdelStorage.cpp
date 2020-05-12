@@ -40,7 +40,7 @@ extern bool g_enable_experimental_string_functions;
 
 namespace Fragmenter_Namespace {
 
-inline void wait_cleanup_threads(std::vector<std::future<void>>& threads) {
+inline void wait_cleanup_threads(std::vector<utils::future<void>>& threads) {
   for (auto& t : threads) {
     t.get();
   }
@@ -537,7 +537,7 @@ void InsertOrderFragmenter::updateColumns(
 
   if (can_go_parallel) {
     const size_t num_worker_threads = cpu_threads();
-    std::vector<std::future<void>> worker_threads;
+    std::vector<utils::future<void>> worker_threads;
     for (size_t i = 0,
                 start_entry = 0,
                 stride = (num_entries + num_worker_threads - 1) / num_worker_threads;
@@ -642,7 +642,7 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
   std::vector<int64_t> min_int64t_per_thread(ncore, std::numeric_limits<int64_t>::max());
 
   // parallel update elements
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
 
   const auto segsz = (nrow + ncore - 1) / ncore;
   auto dbuf = chunk->get_buffer();
@@ -1045,7 +1045,7 @@ const std::vector<uint64_t> InsertOrderFragmenter::getVacuumOffsets(
   const size_t segsz = (nrows_in_chunk + ncore - 1) / ncore;
   std::vector<std::vector<uint64_t>> deleted_offsets;
   deleted_offsets.resize(ncore);
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   for (size_t rbegin = 0; rbegin < nrows_in_chunk; rbegin += segsz) {
     threads.emplace_back(utils::async([=, &deleted_offsets] {
       const auto rend = std::min<size_t>(rbegin + segsz, nrows_in_chunk);
@@ -1215,7 +1215,7 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
   std::vector<int64_t> min_int64t_per_thread(ncol, std::numeric_limits<uint64_t>::max());
 
   // parallel delete columns
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   auto nrows_to_vacuum = frag_offsets.size();
   auto nrows_in_fragment = fragment.getPhysicalNumTuples();
   auto nrows_to_keep = nrows_in_fragment - nrows_to_vacuum;

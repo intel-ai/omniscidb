@@ -212,7 +212,7 @@ std::map<int, ChunkMetadata> synthesize_metadata(const ResultSet* rows) {
   };
   if (use_parallel_algorithms(*rows)) {
     const size_t worker_count = cpu_threads();
-    std::vector<std::future<void>> compute_stats_threads;
+    std::vector<utils::future<void>> compute_stats_threads;
     const auto entry_count = rows->entryCount();
     for (size_t i = 0,
                 start_entry = 0,
@@ -236,9 +236,6 @@ std::map<int, ChunkMetadata> synthesize_metadata(const ResultSet* rows) {
     }
     for (auto& child : compute_stats_threads) {
       child.wait();
-    }
-    for (auto& child : compute_stats_threads) {
-      child.get();
     }
   } else {
     while (true) {

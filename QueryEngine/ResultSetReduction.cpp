@@ -30,18 +30,16 @@
 #include "RuntimeFunctions.h"
 #include "Shared/SqlTypesLayout.h"
 
-#include <tbb/tbb.h>
 #include "Shared/likely.h"
 #include "Shared/thread_count.h"
 #include "Shared/threadpool.h"
+#include "Utils/Threading.h"
 
 #include <llvm/ExecutionEngine/GenericValue.h>
 
 #include <algorithm>
 #include <future>
 #include <numeric>
-
-#include "Utils/Threading.h"
 
 extern bool g_enable_dynamic_watchdog;
 
@@ -233,26 +231,26 @@ void ResultSetStorage::reduce(const ResultSetStorage& that,
           "supported in Distributed mode");
     }
     if (use_multithreaded_reduction(that_entry_count)) {
-      LOG(WARNING) << "-- parallel in " << that_entry_count/100000;
-      tbb::parallel_for(tbb::blocked_range<size_t>(0, that_entry_count, 100000),
-        [&, this](auto r) {
-          if (reduction_code.ir_reduce_loop) {
-            run_reduction_code(reduction_code,
-                              this_buff,
-                              that_buff,
-                              r.begin(),
-                              r.end(),
-                              that_entry_count,
-                              &query_mem_desc_,
-                              &that.query_mem_desc_,
-                              nullptr);
-          } else {
-            for (size_t entry_idx = r.begin(); entry_idx < r.end(); ++entry_idx) {
-              reduceOneEntryBaseline(
-                  this_buff, that_buff, entry_idx, that_entry_count, that);
+      LOG(DEBUG1) << "-- parallel_for " << that_entry_count / 100000;
+      utils::parallel_for(
+          utils::blocked_range<size_t>(0, that_entry_count, 100000), [&, this](auto r) {
+            if (reduction_code.ir_reduce_loop) {
+              run_reduction_code(reduction_code,
+                                 this_buff,
+                                 that_buff,
+                                 r.begin(),
+                                 r.end(),
+                                 that_entry_count,
+                                 &query_mem_desc_,
+                                 &that.query_mem_desc_,
+                                 nullptr);
+            } else {
+              for (size_t entry_idx = r.begin(); entry_idx < r.end(); ++entry_idx) {
+                reduceOneEntryBaseline(
+                    this_buff, that_buff, entry_idx, that_entry_count, that);
+              }
             }
-          }
-      });
+          });
     } else {
       if (reduction_code.ir_reduce_loop) {
         run_reduction_code(reduction_code,
@@ -273,31 +271,25 @@ void ResultSetStorage::reduce(const ResultSetStorage& that,
     return;
   }
   if (use_multithreaded_reduction(entry_count)) {
-    LOG(WARNING) << "-- parallel in " << entry_count/100000;
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, entry_count, 100000),
-    [&, this](auto r) {
-        if (query_mem_desc_.didOutputColumnar()) {
-          reduceEntriesNoCollisionsColWise(
-              this_buff,
-              that_buff,
-              that,
-              r.begin(),
-              r.end(),
-              serialized_varlen_buffer);
-        } else {
-          CHECK(reduction_code.ir_reduce_loop);
-          run_reduction_code(
-              reduction_code,
-              this_buff,
-              that_buff,
-              r.begin(),
-              r.end(),
-              that_entry_count,
-              &query_mem_desc_,
-              &that.query_mem_desc_,
-              &serialized_varlen_buffer);
-        }
-    });
+    LOG(DEBUG1) << "-- parallel_for " << entry_count / 100000;
+    utils::parallel_for(
+        utils::blocked_range<size_t>(0, entry_count, 100000), [&, this](auto r) {
+          if (query_mem_desc_.didOutputColumnar()) {
+            reduceEntriesNoCollisionsColWise(
+                this_buff, that_buff, that, r.begin(), r.end(), serialized_varlen_buffer);
+          } else {
+            CHECK(reduction_code.ir_reduce_loop);
+            run_reduction_code(reduction_code,
+                               this_buff,
+                               that_buff,
+                               r.begin(),
+                               r.end(),
+                               that_entry_count,
+                               &query_mem_desc_,
+                               &that.query_mem_desc_,
+                               &serialized_varlen_buffer);
+          }
+        });
   } else {
     if (query_mem_desc_.didOutputColumnar()) {
       reduceEntriesNoCollisionsColWise(this_buff,
@@ -848,20 +840,20 @@ void ResultSetStorage::moveEntriesToBuffer(int8_t* new_buff,
   const auto row_qw_count = get_row_qw_count(query_mem_desc_);
   const auto key_byte_width = query_mem_desc_.getEffectiveKeyWidth();
   if (use_multithreaded_reduction(query_mem_desc_.getEntryCount())) {
-
-    LOG(WARNING) << "-- parallel in " << query_mem_desc_.getEntryCount();
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, query_mem_desc_.getEntryCount()),
-    [&, this](auto r) {
-      for (size_t entry_idx = r.begin(); entry_idx < r.end(); ++entry_idx) {
-        moveOneEntryToBuffer<KeyType>(entry_idx,
-                                      new_buff_i64,
-                                      new_entry_count,
-                                      key_count,
-                                      row_qw_count,
-                                      src_buff,
-                                      key_byte_width);
-      }
-    });
+    LOG(DEBUG1) << "-- parallel_for " << query_mem_desc_.getEntryCount() / 100000;
+    utils::parallel_for(
+        utils::blocked_range<size_t>(0, query_mem_desc_.getEntryCount(), 100000),
+        [&, this](auto r) {
+          for (size_t entry_idx = r.begin(); entry_idx < r.end(); ++entry_idx) {
+            moveOneEntryToBuffer<KeyType>(entry_idx,
+                                          new_buff_i64,
+                                          new_entry_count,
+                                          key_count,
+                                          row_qw_count,
+                                          src_buff,
+                                          key_byte_width);
+          }
+        });
   } else {
     for (size_t entry_idx = 0; entry_idx < query_mem_desc_.getEntryCount(); ++entry_idx) {
       moveOneEntryToBuffer<KeyType>(entry_idx,
@@ -1090,24 +1082,26 @@ void ResultSetStorage::initializeColWise() const {
   const auto key_count = query_mem_desc_.getGroupbyColCount();
   auto this_buff = reinterpret_cast<int64_t*>(buff_);
   CHECK(!query_mem_desc_.hasKeylessHash());
-  tbb::parallel_for(size_t(0), key_count, [this, this_buff](size_t key_idx) {
+  utils::parallel_for(size_t(0), key_count, [this, this_buff](size_t key_idx) {
     const auto first_key_off =
         key_offset_colwise(0, key_idx, query_mem_desc_.getEntryCount());
-    tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, query_mem_desc_.getEntryCount(), 2*1024*1024/sizeof(int64_t)),
+    utils::parallel_for(
+        utils::blocked_range<size_t>(
+            0, query_mem_desc_.getEntryCount(), 2 * 1024 * 1024 / sizeof(int64_t)),
         [this, this_buff, first_key_off](auto r) {
           for (auto i = r.begin(); i < r.end(); i++)
             this_buff[first_key_off + i] = EMPTY_KEY_64;
         });
   });
-  tbb::parallel_for(
+  utils::parallel_for(
       size_t(0),
       target_init_vals_.size(),
       [this, this_buff, key_count](size_t target_idx) {
         const auto first_val_off = slot_offset_colwise(
             0, target_idx, key_count, query_mem_desc_.getEntryCount());
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, query_mem_desc_.getEntryCount(), 2*1024*1024/sizeof(int64_t)),
+        utils::parallel_for(
+            utils::blocked_range<size_t>(
+                0, query_mem_desc_.getEntryCount(), 2 * 1024 * 1024 / sizeof(int64_t)),
             [this, this_buff, target_idx, first_val_off](auto r) {
               for (auto i = r.begin(); i < r.end(); i++)
                 this_buff[first_val_off + i] = target_init_vals_[target_idx];

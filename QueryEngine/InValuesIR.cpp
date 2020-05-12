@@ -126,7 +126,7 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
     const auto needle_null_val = inline_int_null_val(ti);
     const int worker_count = val_count > 10000 ? cpu_threads() : int(1);
     std::vector<std::vector<int64_t>> values_set(worker_count, std::vector<int64_t>());
-    std::vector<std::future<bool>> worker_threads;
+    std::vector<utils::future<bool>> worker_threads;
     auto start_it = value_list.begin();
     for (size_t i = 0,
                 start_val = 0,

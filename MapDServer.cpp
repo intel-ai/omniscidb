@@ -221,10 +221,12 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
           }
 
           try {
-            g_warmup_handler->sql_execute(ret, sessionId, single_query, true, "", -1, -1);
+            g_warmup_handler->sql_execute(ret, sessionId, single_query, true, "", 1, -1);
+          } catch (const std::exception &e) {
+            LOG(ERROR) << "Ignoring exception ("<< e.what() <<") while executing '" << single_query
+                         << "'";
           } catch (...) {
-            LOG(WARNING) << "Exception while executing '" << single_query
-                         << "', ignoring";
+            LOG(ERROR) << "Unknown exeption while executing" << single_query << "'";
           }
           single_query.clear();
         }

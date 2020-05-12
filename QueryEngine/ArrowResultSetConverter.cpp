@@ -737,7 +737,7 @@ std::shared_ptr<arrow::RecordBatch> ArrowResultSetConverter::getArrowBatch(
 
     values_.resize(col_count);
     is_valid_.resize(col_count);
-    std::vector<std::future<void>> child_threads;
+    std::vector<utils::future<void>> child_threads;
     size_t num_threads =
         std::min(multithreaded ? (size_t)cpu_threads() : (size_t)1, non_lazy_col_count);
 

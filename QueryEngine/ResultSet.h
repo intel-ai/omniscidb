@@ -868,7 +868,7 @@ class ResultSet {
   std::unique_ptr<ResultSetComparator<ColumnWiseTargetAccessor>> column_wise_comparator_;
 
   // Used to lock a result set for exclusive use, e.g. for scan by fetcher
-  std::mutex user_mutex_;
+  std::recursive_mutex user_mutex_;
 
   friend class ResultSetManager;
   friend class ResultSetRowIterator;

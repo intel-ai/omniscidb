@@ -461,7 +461,7 @@ std::shared_ptr<Analyzer::Expr> get_in_values_expr(std::shared_ptr<Analyzer::Exp
   const size_t fetcher_count = cpu_threads();
   std::vector<std::list<std::shared_ptr<Analyzer::Expr>>> expr_set(
       fetcher_count, std::list<std::shared_ptr<Analyzer::Expr>>());
-  std::vector<std::future<void>> fetcher_threads;
+  std::vector<utils::future<void>> fetcher_threads;
   const auto& ti = arg->get_type_info();
   const auto entry_count = val_set.entryCount();
   for (size_t i = 0,
@@ -746,7 +746,7 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::getInIntegerSetExpr(
   std::vector<int64_t> value_exprs;
   const size_t fetcher_count = cpu_threads();
   std::vector<std::vector<int64_t>> expr_set(fetcher_count);
-  std::vector<std::future<void>> fetcher_threads;
+  std::vector<utils::future<void>> fetcher_threads;
   const auto& arg_type = arg->get_type_info();
   const auto entry_count = val_set.entryCount();
   CHECK_EQ(size_t(1), val_set.colCount());

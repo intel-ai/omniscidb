@@ -192,7 +192,7 @@ void OverlapsJoinHashTable::reifyWithLayout(
           << overlaps_hashjoin_bucket_threshold_ << " giving: entry count "
           << entry_count_ << " hash table size " << hash_table_size;
 
-  std::vector<std::future<void>> init_threads;
+  std::vector<utils::future<void>> init_threads;
   for (int device_id = 0; device_id < device_count_; ++device_id) {
     const auto fragments =
         shard_count
@@ -371,7 +371,7 @@ std::pair<size_t, size_t> OverlapsJoinHashTable::approximateTupleCount(
     host_hll_buffer.resize(count_distinct_desc.bitmapPaddedSizeBytes());
   }
   std::vector<size_t> emitted_keys_count_device_threads(device_count_, 0);
-  std::vector<std::future<void>> approximate_distinct_device_threads;
+  std::vector<utils::future<void>> approximate_distinct_device_threads;
   for (int device_id = 0; device_id < device_count; ++device_id) {
     approximate_distinct_device_threads.emplace_back(utils::async(
         std::launch::async,
@@ -514,7 +514,7 @@ int OverlapsJoinHashTable::initHashTableOnCpu(
 
   cpu_hash_table_buff_.reset(new std::vector<int8_t>(hash_table_size));
   int thread_count = cpu_threads();
-  std::vector<std::future<void>> init_cpu_buff_threads;
+  std::vector<utils::future<void>> init_cpu_buff_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     init_cpu_buff_threads.emplace_back(utils::async(
         [this, key_component_count, key_component_width, thread_idx, thread_count] {
@@ -545,7 +545,7 @@ int OverlapsJoinHashTable::initHashTableOnCpu(
   for (auto& child : init_cpu_buff_threads) {
     child.get();
   }
-  std::vector<std::future<int>> fill_cpu_buff_threads;
+  std::vector<utils::future<int>> fill_cpu_buff_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
     fill_cpu_buff_threads.emplace_back(utils::async([this,
                                                      &join_columns,

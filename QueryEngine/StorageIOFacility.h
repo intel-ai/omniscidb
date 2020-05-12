@@ -395,7 +395,7 @@ template <typename EXECUTOR_TRAITS, typename FRAGMENT_UPDATER>
 typename StorageIOFacility<EXECUTOR_TRAITS, FRAGMENT_UPDATER>::UpdateCallback
 StorageIOFacility<EXECUTOR_TRAITS, FRAGMENT_UPDATER>::yieldDeleteCallback(
     DeleteTransactionParameters& delete_parameters) {
-  using RowProcessingFuturesVector = std::vector<std::future<uint64_t>>;
+  using RowProcessingFuturesVector = std::vector<utils::future<uint64_t>>;
 
   if (delete_parameters.tableIsTemporary()) {
     auto callback = [this](FragmentUpdaterType const& update_log) -> void {

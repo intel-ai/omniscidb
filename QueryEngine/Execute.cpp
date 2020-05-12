@@ -1294,7 +1294,6 @@ TemporaryTable Executor::executeWorkUnitImpl(
           get_context_count(device_type, available_cpus, available_gpus.size());
       try {
         if (g_use_tbb_pool) {
-#ifdef HAVE_TBB
           VLOG(1) << "Using TBB thread pool for kernel dispatch.";
           dispatchFragments<threadpool::TbbThreadPool<void>>(dispatch,
                                                              execution_dispatch,
@@ -1308,11 +1307,6 @@ TemporaryTable Executor::executeWorkUnitImpl(
                                                              fragment_descriptor,
                                                              available_gpus,
                                                              available_cpus);
-#else
-          throw std::runtime_error(
-              "This build is not TBB enabled. Restart the server with "
-              "\"enable-modern-thread-pool\" disabled.");
-#endif
         } else {
           dispatchFragments<threadpool::FuturesThreadPool<void>>(
               dispatch,

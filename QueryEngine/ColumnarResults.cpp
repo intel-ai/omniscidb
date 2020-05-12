@@ -161,7 +161,7 @@ void ColumnarResults::materializeAllColumnsThroughIteration(const ResultSet& row
   };
   if (isParallelConversion()) {
     const size_t worker_count = cpu_threads();
-    std::vector<std::future<void>> conversion_threads;
+    std::vector<utils::future<void>> conversion_threads;
     for (auto interval : makeIntervals(size_t(0), rows.entryCount(), worker_count)) {
       conversion_threads.push_back(utils::async(
           [&rows, &do_work, &row_idx](const size_t start, const size_t end) {
@@ -365,7 +365,7 @@ void ColumnarResults::copyAllNonLazyColumns(
 
   if (num_rows_ > 1000000) {
     // parallelized by assigning each column to a thread
-    std::vector<std::future<void>> direct_copy_threads;
+    std::vector<utils::future<void>> direct_copy_threads;
     for (size_t col_idx = 0; col_idx < num_columns; col_idx++) {
       if (rows.isZeroCopyColumnarConversionPossible(col_idx)) {
         CHECK(!column_buffers_[col_idx]);
@@ -437,7 +437,7 @@ void ColumnarResults::materializeAllLazyColumns(
   const bool skip_non_lazy_columns = rows.isPermutationBufferEmpty();
   if (contains_lazy_fetched_column(lazy_fetch_info)) {
     const size_t worker_count = use_parallel_algorithms(rows) ? cpu_threads() : 1;
-    std::vector<std::future<void>> conversion_threads;
+    std::vector<utils::future<void>> conversion_threads;
     std::vector<bool> targets_to_skip;
     if (skip_non_lazy_columns) {
       CHECK_EQ(lazy_fetch_info.size(), size_t(num_columns));
@@ -532,7 +532,7 @@ void ColumnarResults::locateAndCountEntries(const ResultSet& rows,
         non_empty_per_thread[thread_idx] = total_non_empty;
       };
 
-  std::vector<std::future<void>> conversion_threads;
+  std::vector<utils::future<void>> conversion_threads;
   for (size_t thread_idx = 0; thread_idx < num_threads; thread_idx++) {
     const size_t start_entry = thread_idx * size_per_thread;
     const size_t end_entry = std::min(start_entry + size_per_thread, entry_count);
@@ -679,7 +679,7 @@ void ColumnarResults::compactAndCopyEntriesWithTargetSkipping(
     }
   };
 
-  std::vector<std::future<void>> compaction_threads;
+  std::vector<utils::future<void>> compaction_threads;
   for (size_t thread_idx = 0; thread_idx < num_threads; thread_idx++) {
     const size_t start_entry = thread_idx * size_per_thread;
     const size_t end_entry = std::min(start_entry + size_per_thread, entry_count);
@@ -753,7 +753,7 @@ void ColumnarResults::compactAndCopyEntriesWithoutTargetSkipping(
     }
   };
 
-  std::vector<std::future<void>> compaction_threads;
+  std::vector<utils::future<void>> compaction_threads;
   for (size_t thread_idx = 0; thread_idx < num_threads; thread_idx++) {
     const size_t start_entry = thread_idx * size_per_thread;
     const size_t end_entry = std::min(start_entry + size_per_thread, entry_count);
