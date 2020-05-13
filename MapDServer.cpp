@@ -82,6 +82,7 @@ extern size_t g_min_memory_allocation_size;
 extern bool g_enable_experimental_string_functions;
 extern bool g_enable_table_functions;
 extern bool g_enable_fsi;
+extern bool g_enable_lazy_fetch;
 extern bool g_enable_interop;
 extern bool g_enable_union;
 extern bool g_use_tbb_pool;
@@ -220,10 +221,12 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
           }
 
           try {
-            g_warmup_handler->sql_execute(ret, sessionId, single_query, true, "", -1, -1);
+            g_warmup_handler->sql_execute(ret, sessionId, single_query, true, "", 1, -1);
+          } catch (const std::exception &e) {
+            LOG(ERROR) << "Ignoring exception ("<< e.what() <<") while executing '" << single_query
+                         << "'";
           } catch (...) {
-            LOG(WARNING) << "Exception while executing '" << single_query
-                         << "', ignoring";
+            LOG(ERROR) << "Unknown exeption while executing" << single_query << "'";
           }
           single_query.clear();
         }
@@ -798,11 +801,22 @@ void MapDProgramOptions::fillAdvancedOptions() {
       po::value<std::string>(&udf_file_name),
       "Load user defined extension functions from this file at startup. The file is "
       "expected to be a C/C++ file with extension .cpp.");
+  developer_desc.add_options()("enable-lazy-fetch",
+                               po::value<bool>(&g_enable_lazy_fetch)
+                                   ->default_value(g_enable_lazy_fetch)
+                                   ->implicit_value(true),
+                               "Enable lazy fetch columns in ResultSets");
 
   developer_desc.add_options()(
       "udf-compiler-path",
       po::value<std::string>(&udf_compiler_path),
       "Provide absolute path to clang++ used in udf compilation.");
+
+  developer_desc.add_options()("enable-multifrag-rs",
+                               po::value<bool>(&g_enable_multifrag_rs)
+                                   ->default_value(g_enable_multifrag_rs)
+                                   ->implicit_value(true),
+                               "Enable multifragment intermediate result sets");
 
   developer_desc.add_options()(
       "udf-compiler-options",

@@ -30,6 +30,9 @@
 #ifdef HAVE_PROFILER
 #include <gperftools/heap-profiler.h>
 #endif  // HAVE_PROFILER
+#ifdef HAVE_ITT
+#include <ittnotify.h>
+#endif // HAVE_ITT
 
 #include "MapDRelease.h"
 
@@ -578,10 +581,6 @@ void DBHandler::clone_session(TSessionId& session2, const TSessionId& session1) 
         session_it->second->get_currentUser();
     std::shared_ptr<Catalog> cat = session_it->second->get_catalog_ptr();
     auto session2_ptr = create_new_session(session2, cat->name(), user_meta, cat);
-    if (leaf_aggregator_.leafCount() > 0) {
-      leaf_aggregator_.clone_session(session1, session2);
-      return;
-    }
   } catch (std::exception& e) {
     THROW_MAPD_EXCEPTION(e.what());
   }
@@ -936,10 +935,18 @@ void DBHandler::sql_execute(TQueryResult& _return,
                             const std::string& nonce,
                             const int32_t first_n,
                             const int32_t at_most_n) {
+#ifdef HAVE_ITT
+  static __itt_domain* my_dom = __itt_domain_create("Omnisci.sql_execute");
+#endif //HAVE_ITT
   auto session_ptr = get_session_ptr(session);
   auto query_state = create_query_state(session_ptr, query_str);
   auto stdlog = STDLOG(query_state);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
+
+#ifdef HAVE_ITT
+  __itt_frame_begin_v3(my_dom, (__itt_id*)&session_ptr);
+#endif //HAVE_ITT
+
   auto timer = DEBUG_TIMER(__func__);
 
   ScopeGuard reset_was_geo_copy_from = [this, &session_ptr] {
@@ -1017,6 +1024,9 @@ void DBHandler::sql_execute(TQueryResult& _return,
   if (!debug_json.empty()) {
     _return.__set_debug(std::move(debug_json));
   }
+#ifdef HAVE_ITT
+  __itt_frame_end_v3(my_dom, (__itt_id*)&session_ptr);
+#endif
   stdlog.appendNameValuePairs("execution_time_ms",
                               _return.execution_time_ms,
                               "total_time_ms",  // BE-3420 - Redundant with duration field

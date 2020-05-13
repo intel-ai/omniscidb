@@ -23,6 +23,7 @@
 #include "TargetMetaInfo.h"
 #include "TargetValue.h"
 
+#include <sys/ipc.h>
 #include <type_traits>
 
 #include "arrow/api.h"
@@ -35,6 +36,7 @@ static_assert(ARROW_VERSION >= 16000, "Apache Arrow v0.16.0 or above is required
 
 // TODO(wamsi): ValueArray is not optimal. Remove it and inherrit from base vector class.
 using ValueArray = boost::variant<std::vector<bool>,
+                                  std::vector<uint8_t>,
                                   std::vector<int8_t>,
                                   std::vector<int16_t>,
                                   std::vector<int32_t>,
@@ -232,6 +234,9 @@ class ArrowResultSetConverter {
   int32_t device_id_ = 0;
   std::vector<std::string> col_names_;
   int32_t top_n_;
+
+  mutable std::vector<std::unique_ptr<int8_t[]>> values_;
+  mutable std::vector<std::unique_ptr<uint8_t[]>> is_valid_;
 
   friend class ArrowResultSet;
 };

@@ -51,6 +51,7 @@
 #include "Shared/misc.h"
 #include "Shared/scope.h"
 #include "Shared/shard_key.h"
+#include "Utils/Threading.h"
 #include "Shared/threadpool.h"
 
 #include "AggregatedColRange.h"
@@ -103,6 +104,8 @@ bool g_enable_bump_allocator{false};
 double g_bump_allocator_step_reduction{0.75};
 bool g_enable_direct_columnarization{true};
 extern bool g_enable_experimental_string_functions;
+bool g_enable_lazy_fetch{true};
+bool g_enable_multifrag_rs{false};
 bool g_enable_runtime_query_interrupt{false};
 unsigned g_runtime_query_interrupt_frequency{1000};
 
@@ -810,7 +813,7 @@ std::pair<int64_t, int32_t> Executor::reduceResults(const SQLAgg agg,
 
 namespace {
 
-ResultSetPtr get_merged_result(
+TemporaryTable get_merged_result(
     std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device) {
   auto& first = results_per_device.front().first;
   CHECK(first);
@@ -819,12 +822,22 @@ ResultSetPtr get_merged_result(
     CHECK(next);
     first->append(*next);
   }
-  return std::move(first);
+  return TemporaryTable(std::move(first));
+}
+
+TemporaryTable get_separate_results(
+    std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device) {
+  std::vector<ResultSetPtr> results;
+  results.reserve(results_per_device.size());
+  for (auto& r : results_per_device) {
+    results.emplace_back(r.first);
+  }
+  return TemporaryTable(std::move(results));
 }
 
 }  // namespace
 
-ResultSetPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
+TemporaryTable Executor::resultsUnion(ExecutionDispatch& execution_dispatch, bool merge) {
   auto& results_per_device = execution_dispatch.getFragmentResults();
   if (results_per_device.empty()) {
     const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
@@ -838,16 +851,19 @@ ResultSetPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
                                        row_set_mem_owner_,
                                        this);
   }
-  using IndexedResultSet = std::pair<ResultSetPtr, std::vector<size_t>>;
-  std::sort(results_per_device.begin(),
-            results_per_device.end(),
-            [](const IndexedResultSet& lhs, const IndexedResultSet& rhs) {
-              CHECK_GE(lhs.second.size(), size_t(1));
-              CHECK_GE(rhs.second.size(), size_t(1));
-              return lhs.second.front() < rhs.second.front();
-            });
+  if (merge) {
+    using IndexedResultSet = std::pair<ResultSetPtr, std::vector<size_t>>;
+    std::sort(results_per_device.begin(),
+              results_per_device.end(),
+              [](const IndexedResultSet& lhs, const IndexedResultSet& rhs) {
+                CHECK_GE(lhs.second.size(), size_t(1));
+                CHECK_GE(rhs.second.size(), size_t(1));
+                return lhs.second.front() < rhs.second.front();
+              });
 
-  return get_merged_result(results_per_device);
+    return {get_merged_result(results_per_device)};
+  }
+  return get_separate_results(results_per_device);
 }
 
 ResultSetPtr Executor::reduceMultiDeviceResults(
@@ -1124,7 +1140,7 @@ RelAlgExecutionUnit replace_scan_limit(const RelAlgExecutionUnit& ra_exe_unit_in
 
 }  // namespace
 
-ResultSetPtr Executor::executeWorkUnit(
+TemporaryTable Executor::executeWorkUnit(
     size_t& max_groups_buffer_entry_guess,
     const bool is_agg,
     const std::vector<InputTableInfo>& query_infos,
@@ -1165,7 +1181,7 @@ ResultSetPtr Executor::executeWorkUnit(
   }
 }
 
-ResultSetPtr Executor::executeWorkUnitImpl(
+TemporaryTable Executor::executeWorkUnitImpl(
     size_t& max_groups_buffer_entry_guess,
     const bool is_agg,
     const bool allow_single_frag_table_opt,
@@ -1230,7 +1246,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
           new QueryMemoryDescriptor(this, 0, QueryDescriptionType::Projection, false));
     }
     if (eo.just_explain) {
-      return executeExplain(*query_comp_desc_owned);
+      return {executeExplain(*query_comp_desc_owned)};
     }
 
     for (const auto target_expr : ra_exe_unit.target_exprs) {
@@ -1278,7 +1294,6 @@ ResultSetPtr Executor::executeWorkUnitImpl(
           get_context_count(device_type, available_cpus, available_gpus.size());
       try {
         if (g_use_tbb_pool) {
-#ifdef HAVE_TBB
           VLOG(1) << "Using TBB thread pool for kernel dispatch.";
           dispatchFragments<threadpool::TbbThreadPool<void>>(dispatch,
                                                              execution_dispatch,
@@ -1292,11 +1307,6 @@ ResultSetPtr Executor::executeWorkUnitImpl(
                                                              fragment_descriptor,
                                                              available_gpus,
                                                              available_cpus);
-#else
-          throw std::runtime_error(
-              "This build is not TBB enabled. Restart the server with "
-              "\"enable-modern-thread-pool\" disabled.");
-#endif
         } else {
           dispatchFragments<threadpool::FuturesThreadPool<void>>(
               dispatch,
@@ -1346,7 +1356,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
         continue;
       }
     }
-    return resultsUnion(execution_dispatch);
+    return resultsUnion(execution_dispatch, !eo.multifrag_result);
 
   } while (static_cast<size_t>(crt_min_byte_width) <= sizeof(int64_t));
 
@@ -1811,6 +1821,7 @@ void Executor::dispatchFragments(
             const int device_id,
             const FragmentsList& frag_list,
             const int64_t rowid_lookup_key) {
+
           query_threads.append(dispatch,
                                ExecutorDeviceType::GPU,
                                device_id,
@@ -2056,9 +2067,7 @@ bool Executor::needFetchAllFragments(const InputColDescriptor& inner_col_desc,
                                      const FragmentsList& selected_fragments) const {
   const auto& input_descs = ra_exe_unit.input_descs;
   const int nest_level = inner_col_desc.getScanDesc().getNestLevel();
-  if (nest_level < 1 ||
-      inner_col_desc.getScanDesc().getSourceType() != InputSourceType::TABLE ||
-      ra_exe_unit.join_quals.empty() || input_descs.size() < 2 ||
+  if (nest_level < 1 || ra_exe_unit.join_quals.empty() || input_descs.size() < 2 ||
       (ra_exe_unit.join_quals.empty() &&
        plan_state_->isLazyFetchColumn(inner_col_desc))) {
     return false;
@@ -2139,29 +2148,29 @@ FetchResult Executor::fetchChunks(
           plan_state_->columns_to_fetch_.end()) {
         memory_level_for_column = Data_Namespace::CPU_LEVEL;
       }
-      if (col_id->getScanDesc().getSourceType() == InputSourceType::RESULT) {
-        frag_col_buffers[it->second] = column_fetcher.getResultSetColumn(
-            col_id.get(), memory_level_for_column, device_id);
+      // if (col_id->getScanDesc().getSourceType() == InputSourceType::RESULT) {
+      //  frag_col_buffers[it->second] = column_fetcher.getResultSetColumn(
+      //      col_id.get(), memory_level_for_column, device_id);
+      //} else {
+      if (needFetchAllFragments(*col_id, ra_exe_unit, selected_fragments)) {
+        frag_col_buffers[it->second] =
+            column_fetcher.getAllTableColumnFragments(table_id,
+                                                      col_id->getColId(),
+                                                      all_tables_fragments,
+                                                      memory_level_for_column,
+                                                      device_id);
       } else {
-        if (needFetchAllFragments(*col_id, ra_exe_unit, selected_fragments)) {
-          frag_col_buffers[it->second] =
-              column_fetcher.getAllTableColumnFragments(table_id,
-                                                        col_id->getColId(),
-                                                        all_tables_fragments,
-                                                        memory_level_for_column,
-                                                        device_id);
-        } else {
-          frag_col_buffers[it->second] =
-              column_fetcher.getOneTableColumnFragment(table_id,
-                                                       frag_id,
-                                                       col_id->getColId(),
-                                                       all_tables_fragments,
-                                                       chunks,
-                                                       chunk_iterators,
-                                                       memory_level_for_column,
-                                                       device_id);
-        }
+        frag_col_buffers[it->second] =
+            column_fetcher.getOneTableColumnFragment(table_id,
+                                                     frag_id,
+                                                     col_id->getColId(),
+                                                     all_tables_fragments,
+                                                     chunks,
+                                                     chunk_iterators,
+                                                     memory_level_for_column,
+                                                     device_id);
       }
+      //}
     }
     all_frag_col_buffers.push_back(frag_col_buffers);
   }
@@ -2267,33 +2276,33 @@ FetchResult Executor::fetchUnionChunks(
             plan_state_->columns_to_fetch_.end()) {
           memory_level_for_column = Data_Namespace::CPU_LEVEL;
         }
-        if (col_id->getScanDesc().getSourceType() == InputSourceType::RESULT) {
-          VLOG(2) << "it->second="
-                  << it->second  // 1 1, 3 3, 5 5, 7 7, 0 0, 2 2, 4 4, 6 6
-                  << " col_id->getScanDesc().getTableId()="
-                  << col_id->getScanDesc().getTableId();
-          frag_col_buffers[it->second] = column_fetcher.getResultSetColumn(
-              col_id.get(), memory_level_for_column, device_id);
+        // if (col_id->getScanDesc().getSourceType() == InputSourceType::RESULT) {
+        //  VLOG(2) << "it->second="
+        //          << it->second  // 1 1, 3 3, 5 5, 7 7, 0 0, 2 2, 4 4, 6 6
+        //          << " col_id->getScanDesc().getTableId()="
+        //          << col_id->getScanDesc().getTableId();
+        //  frag_col_buffers[it->second] = column_fetcher.getResultSetColumn(
+        //      col_id.get(), memory_level_for_column, device_id);
+        //} else {
+        if (needFetchAllFragments(*col_id, ra_exe_unit, selected_fragments)) {
+          frag_col_buffers[it->second] =
+              column_fetcher.getAllTableColumnFragments(table_id,
+                                                        col_id->getColId(),
+                                                        all_tables_fragments,
+                                                        memory_level_for_column,
+                                                        device_id);
         } else {
-          if (needFetchAllFragments(*col_id, ra_exe_unit, selected_fragments)) {
-            frag_col_buffers[it->second] =
-                column_fetcher.getAllTableColumnFragments(table_id,
-                                                          col_id->getColId(),
-                                                          all_tables_fragments,
-                                                          memory_level_for_column,
-                                                          device_id);
-          } else {
-            frag_col_buffers[it->second] =
-                column_fetcher.getOneTableColumnFragment(table_id,
-                                                         frag_id,
-                                                         col_id->getColId(),
-                                                         all_tables_fragments,
-                                                         chunks,
-                                                         chunk_iterators,
-                                                         memory_level_for_column,
-                                                         device_id);
-          }
+          frag_col_buffers[it->second] =
+              column_fetcher.getOneTableColumnFragment(table_id,
+                                                       frag_id,
+                                                       col_id->getColId(),
+                                                       all_tables_fragments,
+                                                       chunks,
+                                                       chunk_iterators,
+                                                       memory_level_for_column,
+                                                       device_id);
         }
+        //}
       }
       all_frag_col_buffers.push_back(frag_col_buffers);
     }

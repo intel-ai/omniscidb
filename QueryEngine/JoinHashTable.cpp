@@ -28,6 +28,8 @@
 #include <numeric>
 #include <thread>
 
+#include "Shared/ArrowUtil.h"
+#include "Utils/Threading.h"
 namespace {
 
 class NeedsOneToManyHash : public HashJoinFail {
@@ -49,7 +51,8 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
       throw HashJoinFail("Equijoin types must be identical, found: " +
                          lhs_ti.get_type_name() + ", " + rhs_ti.get_type_name());
     }
-    if (!lhs_ti.is_integer() && !lhs_ti.is_time() && !lhs_ti.is_string()) {
+    if (!lhs_ti.is_integer() && !lhs_ti.is_time() && !lhs_ti.is_string() &&
+        !lhs_ti.is_decimal()) {
       throw HashJoinFail("Cannot apply hash join to inner column type " +
                          lhs_ti.get_type_name());
     }
@@ -132,6 +135,7 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
     }
   } else {
     if (!(inner_col_real_ti.is_integer() || inner_col_real_ti.is_time() ||
+          inner_col_real_ti.is_decimal() ||
           (inner_col_real_ti.is_string() &&
            inner_col_real_ti.get_compression() == kENCODING_DICT))) {
       throw HashJoinFail(
@@ -378,6 +382,17 @@ std::shared_ptr<JoinHashTable> JoinHashTable::getInstance(
     throw TooManyHashEntries();
   }
 
+  // We don't want to build huge and very sparse tables
+  // to consume lots of memory.
+  if (bucketized_entry_count > 1000000) {
+    const auto& query_info =
+        get_inner_query_info(inner_col->get_table_id(), query_infos).info;
+    if (query_info.getNumTuplesUpperBound() * 100 <
+        huge_join_hash_min_load_ * bucketized_entry_count) {
+      throw TooManyHashEntries();
+    }
+  }
+
   if (qual_bin_oper->get_optype() == kBW_EQ &&
       col_range.getIntMax() >= std::numeric_limits<int64_t>::max()) {
     throw HashJoinFail("Cannot translate null value for kBW_EQ");
@@ -492,7 +507,7 @@ void JoinHashTable::reify() {
   gpu_hash_table_buff_.resize(device_count_);
   gpu_hash_table_err_buff_.resize(device_count_);
 #endif  // HAVE_CUDA
-  std::vector<std::future<void>> init_threads;
+  std::vector<utils::future<void>> init_threads;
   const int shard_count = shardCount();
 
   try {
@@ -502,7 +517,7 @@ void JoinHashTable::reify() {
               ? only_shards_for_device(query_info.fragments, device_id, device_count_)
               : query_info.fragments;
       init_threads.push_back(
-          std::async(std::launch::async,
+          utils::async(
                      hash_type_ == JoinHashTableInterface::HashType::OneToOne
                          ? &JoinHashTable::reifyOneToOneForDevice
                          : &JoinHashTable::reifyOneToManyForDevice,
@@ -513,9 +528,6 @@ void JoinHashTable::reify() {
     }
     for (auto& init_thread : init_threads) {
       init_thread.wait();
-    }
-    for (auto& init_thread : init_threads) {
-      init_thread.get();
     }
 
   } catch (const NeedsOneToManyHash& e) {
@@ -528,7 +540,7 @@ void JoinHashTable::reify() {
               ? only_shards_for_device(query_info.fragments, device_id, device_count_)
               : query_info.fragments;
 
-      init_threads.push_back(std::async(std::launch::async,
+      init_threads.push_back(utils::async(
                                         &JoinHashTable::reifyOneToManyForDevice,
                                         this,
                                         fragments,
@@ -718,24 +730,26 @@ void JoinHashTable::initOneToOneHashTableOnCpu(
       CHECK(sd_outer_proxy);
     }
     int thread_count = cpu_threads();
-    std::vector<std::thread> init_cpu_buff_threads;
+    std::vector<utils::future<void>> init_cpu_buff_threads;
     for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-      init_cpu_buff_threads.emplace_back(
+      init_cpu_buff_threads.emplace_back(utils::async(
           [this, hash_entry_info, hash_join_invalid_val, thread_idx, thread_count] {
             init_hash_join_buff(&(*cpu_hash_table_buff_)[0],
                                 hash_entry_info.getNormalizedHashEntryCount(),
                                 hash_join_invalid_val,
                                 thread_idx,
                                 thread_count);
-          });
+          }));
     }
     for (auto& t : init_cpu_buff_threads) {
-      t.join();
+      t.wait();
     }
     init_cpu_buff_threads.clear();
+    
     int err{0};
+
     for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-      init_cpu_buff_threads.emplace_back([this,
+      init_cpu_buff_threads.emplace_back(utils::async([this,
                                           hash_join_invalid_val,
                                           &join_column,
                                           sd_inner_proxy,
@@ -762,11 +776,12 @@ void JoinHashTable::initOneToOneHashTableOnCpu(
                                            thread_count,
                                            hash_entry_info.bucket_normalization);
         __sync_val_compare_and_swap(&err, 0, partial_err);
-      });
+      }));
     }
     for (auto& t : init_cpu_buff_threads) {
-      t.join();
+      t.wait();
     }
+
     if (err) {
       cpu_hash_table_buff_.reset();
       // Too many hash entries, need to retry with a 1:many table
@@ -808,15 +823,14 @@ void JoinHashTable::initOneToManyHashTableOnCpu(
     CHECK(sd_outer_proxy);
   }
   int thread_count = cpu_threads();
-  std::vector<std::future<void>> init_threads;
+  std::vector<utils::future<void>> init_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-    init_threads.emplace_back(std::async(std::launch::async,
-                                         init_hash_join_buff,
-                                         &(*cpu_hash_table_buff_)[0],
-                                         hash_entry_info.getNormalizedHashEntryCount(),
-                                         hash_join_invalid_val,
-                                         thread_idx,
-                                         thread_count));
+    init_threads.emplace_back(utils::async(init_hash_join_buff,
+                                           &(*cpu_hash_table_buff_)[0],
+                                           hash_entry_info.getNormalizedHashEntryCount(),
+                                           hash_join_invalid_val,
+                                           thread_idx,
+                                           thread_count));
   }
   for (auto& child : init_threads) {
     child.wait();

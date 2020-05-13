@@ -19,9 +19,11 @@
 #include "../Utils/Regexp.h"
 #include "../Utils/StringLike.h"
 #include "LeafHostInfo.h"
+#include "Shared/ArrowUtil.h"
 #include "Shared/Logger.h"
 #include "Shared/thread_count.h"
 #include "StringDictionaryClient.h"
+#include "Utils/Threading.h"
 
 #include <sys/fcntl.h>
 #include <sys/mman.h>
@@ -173,11 +175,11 @@ StringDictionary::StringDictionary(const std::string& folder,
       const auto thread_count = std::thread::hardware_concurrency();
       const uint32_t items_per_thread = std::max<uint32_t>(
           2000, std::min<uint32_t>(200000, (str_count / thread_count) + 1));
-      std::vector<std::future<std::vector<std::pair<uint32_t, unsigned int>>>>
+      std::vector<utils::future<std::vector<std::pair<uint32_t, unsigned int>>>>
           dictionary_futures;
       for (string_id = 0; string_id < str_count; string_id += items_per_thread) {
-        dictionary_futures.emplace_back(std::async(
-            std::launch::async, [string_id, str_count, items_per_thread, this] {
+        dictionary_futures.emplace_back(
+            utils::async([string_id, str_count, items_per_thread, this] {
               std::vector<std::pair<uint32_t, unsigned int>> hashVec;
               for (uint32_t curr_id = string_id;
                    curr_id < string_id + items_per_thread && curr_id < str_count;
@@ -207,7 +209,7 @@ StringDictionary::StringDictionary(const std::string& folder,
 }
 
 void StringDictionary::processDictionaryFutures(
-    std::vector<std::future<std::vector<std::pair<uint32_t, unsigned int>>>>&
+    std::vector<utils::future<std::vector<std::pair<uint32_t, unsigned int>>>>&
         dictionary_futures) {
   for (auto& dictionary_future : dictionary_futures) {
     dictionary_future.wait();
@@ -299,28 +301,16 @@ template <class String>
 void StringDictionary::hashStrings(const std::vector<String>& string_vec,
                                    std::vector<uint32_t>& hashes) const noexcept {
   CHECK_EQ(string_vec.size(), hashes.size());
-  const size_t min_target_strings_per_thread{2000};
-  const size_t str_count = string_vec.size();
-  const size_t max_thread_count = std::thread::hardware_concurrency();
-  const size_t items_per_thread =
-      std::max<size_t>(min_target_strings_per_thread, str_count / max_thread_count + 1);
 
-  std::vector<std::thread> workers;
-  for (size_t string_id = 0; string_id < str_count; string_id += items_per_thread) {
-    workers.emplace_back(
-        [&string_vec, &hashes, string_id, str_count, items_per_thread]() {
-          const size_t end_id = std::min(string_id + items_per_thread, str_count);
-          for (size_t curr_id = string_id; curr_id < end_id; ++curr_id) {
-            if (string_vec[curr_id].empty()) {
-              continue;
-            }
-            hashes[curr_id] = rk_hash(string_vec[curr_id]);
-          }
-        });
-  }
-  for (auto& worker : workers) {
-    worker.join();
-  }
+  utils::parallel_for(utils::blocked_range<size_t>(0, string_vec.size()),
+                      [&string_vec, &hashes](const utils::blocked_range<size_t>& r) {
+                        for (size_t curr_id = r.begin(); curr_id != r.end(); ++curr_id) {
+                          if (string_vec[curr_id].empty()) {
+                            continue;
+                          }
+                          hashes[curr_id] = rk_hash(string_vec[curr_id]);
+                        }
+                      });
 }
 
 template <class T, class String>
@@ -606,21 +596,22 @@ std::vector<int32_t> StringDictionary::getLike(const std::string& pattern,
     return it->second;
   }
   std::vector<int32_t> result;
-  std::vector<std::thread> workers;
+  std::vector<utils::future<void>> workers;
+
   int worker_count = cpu_threads();
   CHECK_GT(worker_count, 0);
   std::vector<std::vector<int32_t>> worker_results(worker_count);
   CHECK_LE(generation, str_count_);
   for (int worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
-    workers.emplace_back([&worker_results,
-                          &pattern,
-                          generation,
-                          icase,
-                          is_simple,
-                          escape,
-                          worker_idx,
-                          worker_count,
-                          this]() {
+    workers.push_back(utils::async([&worker_results,
+                                    &pattern,
+                                    generation,
+                                    icase,
+                                    is_simple,
+                                    escape,
+                                    worker_idx,
+                                    worker_count,
+                                    this]() {
       for (size_t string_id = worker_idx; string_id < generation;
            string_id += worker_count) {
         const auto str = getStringUnlocked(string_id);
@@ -628,10 +619,10 @@ std::vector<int32_t> StringDictionary::getLike(const std::string& pattern,
           worker_results[worker_idx].push_back(string_id);
         }
       }
-    });
+    }));
   }
-  for (auto& worker : workers) {
-    worker.join();
+  for (auto& thread : workers) {
+    thread.wait();
   }
   for (const auto& worker_result : worker_results) {
     result.insert(result.end(), worker_result.begin(), worker_result.end());
@@ -664,13 +655,13 @@ std::vector<int32_t> StringDictionary::getEquals(std::string pattern,
       }
     }
   } else {
-    std::vector<std::thread> workers;
+    std::vector<utils::future<void>> workers;
     int worker_count = cpu_threads();
     CHECK_GT(worker_count, 0);
     std::vector<std::vector<int32_t>> worker_results(worker_count);
     CHECK_LE(generation, str_count_);
     for (int worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
-      workers.emplace_back(
+      workers.push_back(utils::async(
           [&worker_results, &pattern, generation, worker_idx, worker_count, this]() {
             for (size_t string_id = worker_idx; string_id < generation;
                  string_id += worker_count) {
@@ -679,10 +670,10 @@ std::vector<int32_t> StringDictionary::getEquals(std::string pattern,
                 worker_results[worker_idx].push_back(string_id);
               }
             }
-          });
+          }));
     }
-    for (auto& worker : workers) {
-      worker.join();
+    for (auto& thread : workers) {
+      thread.wait();
     }
     for (const auto& worker_result : worker_results) {
       result.insert(result.end(), worker_result.begin(), worker_result.end());
@@ -878,19 +869,19 @@ std::vector<int32_t> StringDictionary::getRegexpLike(const std::string& pattern,
     return it->second;
   }
   std::vector<int32_t> result;
-  std::vector<std::thread> workers;
+  std::vector<utils::future<void>> workers;
   int worker_count = cpu_threads();
   CHECK_GT(worker_count, 0);
   std::vector<std::vector<int32_t>> worker_results(worker_count);
   CHECK_LE(generation, str_count_);
   for (int worker_idx = 0; worker_idx < worker_count; ++worker_idx) {
-    workers.emplace_back([&worker_results,
-                          &pattern,
-                          generation,
-                          escape,
-                          worker_idx,
-                          worker_count,
-                          this]() {
+    workers.push_back(utils::async([&worker_results,
+                                    &pattern,
+                                    generation,
+                                    escape,
+                                    worker_idx,
+                                    worker_count,
+                                    this]() {
       for (size_t string_id = worker_idx; string_id < generation;
            string_id += worker_count) {
         const auto str = getStringUnlocked(string_id);
@@ -898,11 +889,12 @@ std::vector<int32_t> StringDictionary::getRegexpLike(const std::string& pattern,
           worker_results[worker_idx].push_back(string_id);
         }
       }
-    });
+    }));
   }
-  for (auto& worker : workers) {
-    worker.join();
+  for (auto& thread : workers) {
+    thread.wait();
   }
+
   for (const auto& worker_result : worker_results) {
     result.insert(result.end(), worker_result.begin(), worker_result.end());
   }
@@ -941,13 +933,13 @@ std::shared_ptr<const std::vector<std::string>> StringDictionary::copyStrings() 
     }
   };
   if (multithreaded) {
-    std::vector<std::future<void>> workers;
+    std::vector<utils::future<void>> workers;
     const auto stride = (str_count_ + (worker_count - 1)) / worker_count;
     for (size_t worker_idx = 0, start = 0, end = std::min(start + stride, str_count_);
          worker_idx < worker_count && start < str_count_;
          ++worker_idx, start += stride, end = std::min(start + stride, str_count_)) {
-      workers.push_back(std::async(
-          std::launch::async, copy, std::ref(worker_results[worker_idx]), start, end));
+      workers.push_back(
+          utils::async(copy, std::ref(worker_results[worker_idx]), start, end));
     }
     for (auto& worker : workers) {
       worker.get();
@@ -1460,9 +1452,9 @@ void StringDictionary::populate_string_array_ids(
   const int num_worker_threads = std::thread::hardware_concurrency();
 
   if (source_array_ids.size() / num_worker_threads > 10) {
-    std::vector<std::future<void>> worker_threads;
+    std::vector<utils::future<void>> worker_threads;
     for (int i = 0; i < num_worker_threads; ++i) {
-      worker_threads.push_back(std::async(std::launch::async, processor, i));
+      worker_threads.push_back(utils::async(processor, i));
     }
 
     for (auto& child : worker_threads) {

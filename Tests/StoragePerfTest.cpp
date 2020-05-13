@@ -155,10 +155,8 @@ TEST(DataLoad, Numbers_Parallel_Load) {
   for (int i = 1; i <= numThreads; i++) {
     int num_table_rows = num_rows * (numThreads - i + 1);
     db_table.push_back(table_name + to_string(i));
-    threads.push_back(std::async(std::launch::async,
-                                 load_data_for_thread_test_2,
-                                 num_table_rows,
-                                 db_table[i - 1]));
+    threads.push_back(
+        utils::async(load_data_for_thread_test_2, num_table_rows, db_table[i - 1]));
   }
 
   for (auto& p : threads) {
@@ -210,7 +208,7 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropTable) {
    * thread. It's enough to load just 1 row of data in the table numbers_4 to make sure it
    * exists in the storage layer.
    *
-   * threads.push_back(std::async(std::launch::async, load_data_for_thread_test_4, 1,
+   * threads.push_back(utils::async(load_data_for_thread_test_4, 1,
    * table_name_temp));
    */
   string table_name("numbers_");
@@ -228,10 +226,8 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropTable) {
     if (i == 4) {
       continue;  // table numbers_4 has been loaded already
     }
-    threads.push_back(std::async(std::launch::async,
-                                 load_data_for_thread_test_2,
-                                 num_table_rows,
-                                 db_table[i - 1]));
+    threads.push_back(
+        utils::async(load_data_for_thread_test_2, num_table_rows, db_table[i - 1]));
   }
 
   /* drop table numbers_4  while loading other tables in independent threads */
@@ -244,8 +240,8 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropTable) {
           "double, f float);"););
   int num_table_rows = SMALL;
   db_table.push_back(table_name + to_string(6));
-  threads.push_back(std::async(
-      std::launch::async, load_data_for_thread_test_2, num_table_rows, db_table[5]));
+  threads.push_back(
+      utils::async(load_data_for_thread_test_2, num_table_rows, db_table[5]));
 
   for (auto& p : threads) {
     int num_columns_inserted = (int)p.get();
@@ -295,7 +291,7 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropCreateTable_InsertRows) {
    * thread. It's enough to load just 1 row of data in the table numbers_2 to make sure it
    * exists in the storage layer.
    *
-   * threads.push_back(std::async(std::launch::async, load_data_for_thread_test_2, 1,
+   * threads.push_back(utils::async(load_data_for_thread_test_2, 1,
    * table_name_temp));
    */
   string table_name("numbers_");
@@ -314,10 +310,8 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropCreateTable_InsertRows) {
     if (i == 2) {
       continue;  // table numbers_2  has been loaded already
     }
-    threads.push_back(std::async(std::launch::async,
-                                 load_data_for_thread_test_2,
-                                 num_table_rows,
-                                 db_table[i - 1]));
+    threads.push_back(
+        utils::async(load_data_for_thread_test_2, num_table_rows, db_table[i - 1]));
   }
 
   /* drop table numbers_2 while loading other tables in independent threads */
@@ -330,8 +324,8 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropCreateTable_InsertRows) {
           "double, f float);"););
   int num_table_rows = SMALL;
   db_table.push_back(table_name + to_string(6));
-  threads.push_back(std::async(
-      std::launch::async, load_data_for_thread_test_2, num_table_rows, db_table[5]));
+  threads.push_back(
+      utils::async(load_data_for_thread_test_2, num_table_rows, db_table[5]));
 
   /* recreate table numbers_2, this table will have new tb_id which will be different from
    * the tb_id of dropped table numbers_2;
@@ -344,10 +338,8 @@ TEST(DataLoad, NumbersTable_Parallel_CreateDropCreateTable_InsertRows) {
   /* insert rows in table numbers_2, this table have been dropped and recreated, so data
    * can be loaded */
   int num_rows_for_dropped_table = SMALL * 2;
-  threads.push_back(std::async(std::launch::async,
-                               load_data_for_thread_test_2,
-                               num_rows_for_dropped_table,
-                               table_name_temp));
+  threads.push_back(utils::async(
+      load_data_for_thread_test_2, num_rows_for_dropped_table, table_name_temp));
 
   for (auto& p : threads) {
     int num_columns_inserted = (int)p.get();

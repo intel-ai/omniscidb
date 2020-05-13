@@ -39,6 +39,8 @@
 #include "Shared/File.h"
 #include "Shared/measure.h"
 
+#include "Utils/Threading.h"
+
 #define EPOCH_FILENAME "epoch"
 #define DB_META_FILENAME "dbmeta"
 
@@ -182,8 +184,8 @@ void FileMgr::init(const size_t num_reader_threads) {
           VLOG(4) << "File id: " << fileId << " Page size: " << pageSize
                   << " Num pages: " << numPages;
 
-          file_futures.emplace_back(std::async(
-              std::launch::async, [filePath, fileId, pageSize, numPages, this] {
+          file_futures.emplace_back(
+              std::async(std::launch::async, [filePath, fileId, pageSize, numPages, this] {
                 std::vector<HeaderInfo> tempHeaderVec;
                 openExistingFile(filePath, fileId, pageSize, numPages, tempHeaderVec);
                 return tempHeaderVec;
@@ -345,8 +347,8 @@ void FileMgr::init(const std::string dataPathToConvertFrom) {
           CHECK(fileSize % pageSize == 0);  // should be no partial pages
           size_t numPages = fileSize / pageSize;
 
-          file_futures.emplace_back(std::async(
-              std::launch::async, [filePath, fileId, pageSize, numPages, this] {
+          file_futures.emplace_back(
+              std::async(std::launch::async, [filePath, fileId, pageSize, numPages, this] {
                 std::vector<HeaderInfo> tempHeaderVec;
                 openExistingFile(filePath, fileId, pageSize, numPages, tempHeaderVec);
                 return tempHeaderVec;

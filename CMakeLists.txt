@@ -152,6 +152,7 @@ find_package(OpenSSL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
 find_package(Thrift REQUIRED)
+message(STATUS "Thrift: ${Thrift_LIBRARIES} ${Thrift_INCLUDE_DIRS}" )
 include_directories(${Thrift_INCLUDE_DIRS})
 if("${Thrift_VERSION}" VERSION_LESS "0.11.0")
   add_definitions("-DHAVE_THRIFT_BOOST_SHAREDPTR")
@@ -392,12 +393,14 @@ if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
 endif()
 
 # TBB
-set(TBB_LIBS "") 
-find_package(TBB)
-if(TBB_FOUND) 
-  message(STATUS "Building with TBB support")
-  add_definitions("-DHAVE_TBB")
-  list(APPEND TBB_LIBS ${TBB_LIBRARIES})
+find_package(TBB REQUIRED)
+set(TBB_LIBS ${TBB_LIBRARIES})
+message(STATUS "TBB found: ${TBB_LIBS}" )
+add_definitions("-DTBB_PREVIEW_ISOLATED_TASK_GROUP=1")
+option(ENABLE_TBB "Enable TBB backend" OFF)
+if(ENABLE_TBB)
+  message(STATUS "Building with TBB threading on" )
+  add_definitions("-DENABLE_TBB")
 endif()
 
 add_custom_command(
@@ -544,6 +547,17 @@ endif()
 
 if(ENABLE_LICENSING_AWS)
   list(APPEND MAPD_LIBRARIES AWSMarketplace)
+endif()
+
+find_path(
+  ITT_NOTIFY_LIB_DIR
+  NAMES "libittnotify.a"
+  PATHS "$ENV{LIBRARY_PATH}"
+)
+if(EXISTS "${ITT_NOTIFY_LIB_DIR}/libittnotify.a")
+  message(STATUS "ITT found: ${ITT_NOTIFY_LIB_DIR}")
+  add_definitions("-DHAVE_ITT")
+  list(APPEND MAPD_LIBRARIES ittnotify)
 endif()
 
 list(APPEND MAPD_LIBRARIES ${TBB_LIBS})

@@ -44,6 +44,8 @@
 #include <cmath>
 #include <numeric>
 
+#include "Utils/Threading.h"
+
 #ifndef __CUDACC__
 namespace {
 
@@ -1240,12 +1242,11 @@ void inclusive_scan(InputIterator first,
   OffsetType start_off = 0;
   OffsetType end_off = std::min(step, elem_count);
   std::vector<ElementType> partial_sums(thread_count);
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t thread_idx = 0; thread_idx < thread_count; ++thread_idx,
               start_off = std::min(start_off + step, elem_count),
               end_off = std::min(start_off + step, elem_count)) {
-    counter_threads.push_back(std::async(
-        std::launch::async,
+    counter_threads.push_back(utils::async(
         [first, out](
             ElementType& partial_sum, const OffsetType start, const OffsetType end) {
           ElementType sum = 0;
@@ -1276,8 +1277,7 @@ void inclusive_scan(InputIterator first,
   for (size_t thread_idx = 0; thread_idx < thread_count - 1; ++thread_idx,
               start_off = std::min(start_off + step, elem_count),
               end_off = std::min(start_off + step, elem_count)) {
-    counter_threads.push_back(std::async(
-        std::launch::async,
+    counter_threads.push_back(utils::async(
         [out](const ElementType prev_sum, const OffsetType start, const OffsetType end) {
           for (auto iter = out + start; iter != (out + end); ++iter) {
             *iter += prev_sum;
@@ -1306,10 +1306,10 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (unsigned cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    counter_threads.push_back(std::async(
-        std::launch::async, count_matches_func, cpu_thread_idx, cpu_thread_count));
+    counter_threads.push_back(
+        utils::async(count_matches_func, cpu_thread_idx, cpu_thread_count));
   }
 
   for (auto& child : counter_threads) {
@@ -1325,10 +1325,9 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
 #endif
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    pos_threads.push_back(std::async(
-        std::launch::async,
+    pos_threads.push_back(utils::async(
         [&](size_t thread_idx) {
           for (size_t i = thread_idx; i < static_cast<size_t>(hash_entry_count);
                i += cpu_thread_count) {
@@ -1344,10 +1343,10 @@ void fill_one_to_many_hash_table_impl(int32_t* buff,
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    rowid_threads.push_back(std::async(
-        std::launch::async, fill_row_ids_func, cpu_thread_idx, cpu_thread_count));
+    rowid_threads.push_back(
+        utils::async(fill_row_ids_func, cpu_thread_idx, cpu_thread_count));
   }
 
   for (auto& child : rowid_threads) {
@@ -1491,10 +1490,10 @@ void fill_one_to_many_hash_table_sharded_impl(
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    counter_threads.push_back(std::async(
-        std::launch::async, count_matches_launcher, cpu_thread_idx, cpu_thread_count));
+    counter_threads.push_back(
+        utils::async(count_matches_launcher, cpu_thread_idx, cpu_thread_count));
   }
 
   for (auto& child : counter_threads) {
@@ -1506,10 +1505,9 @@ void fill_one_to_many_hash_table_sharded_impl(
   memcpy(&count_copy[1], count_buff, (hash_entry_count - 1) * sizeof(int32_t));
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    pos_threads.push_back(std::async(
-        std::launch::async,
+    pos_threads.push_back(utils::async(
         [&](const unsigned thread_idx) {
           for (size_t i = thread_idx; i < static_cast<size_t>(hash_entry_count);
                i += cpu_thread_count) {
@@ -1525,10 +1523,10 @@ void fill_one_to_many_hash_table_sharded_impl(
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    rowid_threads.push_back(std::async(
-        std::launch::async, fill_row_ids_launcher, cpu_thread_idx, cpu_thread_count));
+    rowid_threads.push_back(
+        utils::async(fill_row_ids_launcher, cpu_thread_idx, cpu_thread_count));
   }
 
   for (auto& child : rowid_threads) {
@@ -1744,57 +1742,53 @@ void fill_one_to_many_baseline_hash_table(
   int32_t* pos_buff = buff;
   int32_t* count_buff = buff + hash_entry_count;
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> counter_threads;
+  std::vector<utils::future<void>> counter_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     if (join_buckets_per_key.size() > 0) {
-      counter_threads.push_back(
-          std::async(std::launch::async,
-                     [count_buff,
-                      composite_key_dict,
-                      &hash_entry_count,
-                      &join_buckets_per_key,
-                      &join_column_per_key,
-                      cpu_thread_idx,
-                      cpu_thread_count] {
-                       const auto key_handler = OverlapsKeyHandler(
-                           join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
-                           &join_column_per_key[0],
-                           join_buckets_per_key[0].bucket_sizes_for_dimension.data());
-                       count_matches_baseline(count_buff,
+      counter_threads.push_back(utils::async([count_buff,
                                               composite_key_dict,
-                                              hash_entry_count,
-                                              &key_handler,
-                                              join_column_per_key[0].num_elems,
+                                              &hash_entry_count,
+                                              &join_buckets_per_key,
+                                              &join_column_per_key,
                                               cpu_thread_idx,
-                                              cpu_thread_count);
-                     }));
+                                              cpu_thread_count] {
+        const auto key_handler =
+            OverlapsKeyHandler(join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
+                               &join_column_per_key[0],
+                               join_buckets_per_key[0].bucket_sizes_for_dimension.data());
+        count_matches_baseline(count_buff,
+                               composite_key_dict,
+                               hash_entry_count,
+                               &key_handler,
+                               join_column_per_key[0].num_elems,
+                               cpu_thread_idx,
+                               cpu_thread_count);
+      }));
     } else {
-      counter_threads.push_back(std::async(
-          std::launch::async,
-          [count_buff,
-           composite_key_dict,
-           &key_component_count,
-           &hash_entry_count,
-           &join_column_per_key,
-           &type_info_per_key,
-           &sd_inner_proxy_per_key,
-           &sd_outer_proxy_per_key,
-           cpu_thread_idx,
-           cpu_thread_count] {
-            const auto key_handler = GenericKeyHandler(key_component_count,
-                                                       true,
-                                                       &join_column_per_key[0],
-                                                       &type_info_per_key[0],
-                                                       &sd_inner_proxy_per_key[0],
-                                                       &sd_outer_proxy_per_key[0]);
-            count_matches_baseline(count_buff,
-                                   composite_key_dict,
-                                   hash_entry_count,
-                                   &key_handler,
-                                   join_column_per_key[0].num_elems,
-                                   cpu_thread_idx,
-                                   cpu_thread_count);
-          }));
+      counter_threads.push_back(utils::async([count_buff,
+                                              composite_key_dict,
+                                              &key_component_count,
+                                              &hash_entry_count,
+                                              &join_column_per_key,
+                                              &type_info_per_key,
+                                              &sd_inner_proxy_per_key,
+                                              &sd_outer_proxy_per_key,
+                                              cpu_thread_idx,
+                                              cpu_thread_count] {
+        const auto key_handler = GenericKeyHandler(key_component_count,
+                                                   true,
+                                                   &join_column_per_key[0],
+                                                   &type_info_per_key[0],
+                                                   &sd_inner_proxy_per_key[0],
+                                                   &sd_outer_proxy_per_key[0]);
+        count_matches_baseline(count_buff,
+                               composite_key_dict,
+                               hash_entry_count,
+                               &key_handler,
+                               join_column_per_key[0].num_elems,
+                               cpu_thread_idx,
+                               cpu_thread_count);
+      }));
     }
   }
 
@@ -1807,10 +1801,9 @@ void fill_one_to_many_baseline_hash_table(
   memcpy(&count_copy[1], count_buff, (hash_entry_count - 1) * sizeof(int32_t));
   ::inclusive_scan(
       count_copy.begin(), count_copy.end(), count_copy.begin(), cpu_thread_count);
-  std::vector<std::future<void>> pos_threads;
+  std::vector<utils::future<void>> pos_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
-    pos_threads.push_back(std::async(
-        std::launch::async,
+    pos_threads.push_back(utils::async(
         [&](const int thread_idx) {
           for (size_t i = thread_idx; i < hash_entry_count; i += cpu_thread_count) {
             if (count_buff[i]) {
@@ -1825,63 +1818,59 @@ void fill_one_to_many_baseline_hash_table(
   }
 
   memset(count_buff, 0, hash_entry_count * sizeof(int32_t));
-  std::vector<std::future<void>> rowid_threads;
+  std::vector<utils::future<void>> rowid_threads;
   for (size_t cpu_thread_idx = 0; cpu_thread_idx < cpu_thread_count; ++cpu_thread_idx) {
     if (join_buckets_per_key.size() > 0) {
-      rowid_threads.push_back(
-          std::async(std::launch::async,
-                     [buff,
-                      composite_key_dict,
-                      hash_entry_count,
-                      invalid_slot_val,
-                      &join_column_per_key,
-                      &join_buckets_per_key,
-                      cpu_thread_idx,
-                      cpu_thread_count] {
-                       const auto key_handler = OverlapsKeyHandler(
-                           join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
-                           &join_column_per_key[0],
-                           join_buckets_per_key[0].bucket_sizes_for_dimension.data());
-                       SUFFIX(fill_row_ids_baseline)
-                       (buff,
-                        composite_key_dict,
-                        hash_entry_count,
-                        invalid_slot_val,
-                        &key_handler,
-                        join_column_per_key[0].num_elems,
-                        cpu_thread_idx,
-                        cpu_thread_count);
-                     }));
-    } else {
-      rowid_threads.push_back(std::async(std::launch::async,
-                                         [buff,
-                                          composite_key_dict,
-                                          hash_entry_count,
-                                          invalid_slot_val,
-                                          key_component_count,
-                                          &join_column_per_key,
-                                          &type_info_per_key,
-                                          &sd_inner_proxy_per_key,
-                                          &sd_outer_proxy_per_key,
-                                          cpu_thread_idx,
-                                          cpu_thread_count] {
-                                           const auto key_handler = GenericKeyHandler(
-                                               key_component_count,
-                                               true,
-                                               &join_column_per_key[0],
-                                               &type_info_per_key[0],
-                                               &sd_inner_proxy_per_key[0],
-                                               &sd_outer_proxy_per_key[0]);
-                                           SUFFIX(fill_row_ids_baseline)
-                                           (buff,
+      rowid_threads.push_back(utils::async([buff,
                                             composite_key_dict,
                                             hash_entry_count,
                                             invalid_slot_val,
-                                            &key_handler,
-                                            join_column_per_key[0].num_elems,
+                                            &join_column_per_key,
+                                            &join_buckets_per_key,
                                             cpu_thread_idx,
-                                            cpu_thread_count);
-                                         }));
+                                            cpu_thread_count] {
+        const auto key_handler =
+            OverlapsKeyHandler(join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
+                               &join_column_per_key[0],
+                               join_buckets_per_key[0].bucket_sizes_for_dimension.data());
+        SUFFIX(fill_row_ids_baseline)
+        (buff,
+         composite_key_dict,
+         hash_entry_count,
+         invalid_slot_val,
+         &key_handler,
+         join_column_per_key[0].num_elems,
+         cpu_thread_idx,
+         cpu_thread_count);
+      }));
+    } else {
+      rowid_threads.push_back(utils::async([buff,
+                                            composite_key_dict,
+                                            hash_entry_count,
+                                            invalid_slot_val,
+                                            key_component_count,
+                                            &join_column_per_key,
+                                            &type_info_per_key,
+                                            &sd_inner_proxy_per_key,
+                                            &sd_outer_proxy_per_key,
+                                            cpu_thread_idx,
+                                            cpu_thread_count] {
+        const auto key_handler = GenericKeyHandler(key_component_count,
+                                                   true,
+                                                   &join_column_per_key[0],
+                                                   &type_info_per_key[0],
+                                                   &sd_inner_proxy_per_key[0],
+                                                   &sd_outer_proxy_per_key[0]);
+        SUFFIX(fill_row_ids_baseline)
+        (buff,
+         composite_key_dict,
+         hash_entry_count,
+         invalid_slot_val,
+         &key_handler,
+         join_column_per_key[0].num_elems,
+         cpu_thread_idx,
+         cpu_thread_count);
+      }));
     }
   }
 
@@ -1949,33 +1938,31 @@ void approximate_distinct_tuples(uint8_t* hll_buffer_all_cpus,
   CHECK_EQ(join_column_per_key.size(), type_info_per_key.size());
   CHECK(!join_column_per_key.empty());
 
-  std::vector<std::future<void>> approx_distinct_threads;
+  std::vector<utils::future<void>> approx_distinct_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-    approx_distinct_threads.push_back(std::async(
-        std::launch::async,
-        [&join_column_per_key,
-         &type_info_per_key,
-         b,
-         hll_buffer_all_cpus,
-         padded_size_bytes,
-         thread_idx,
-         thread_count] {
-          auto hll_buffer = hll_buffer_all_cpus + thread_idx * padded_size_bytes;
+    approx_distinct_threads.push_back(utils::async([&join_column_per_key,
+                                                    &type_info_per_key,
+                                                    b,
+                                                    hll_buffer_all_cpus,
+                                                    padded_size_bytes,
+                                                    thread_idx,
+                                                    thread_count] {
+      auto hll_buffer = hll_buffer_all_cpus + thread_idx * padded_size_bytes;
 
-          const auto key_handler = GenericKeyHandler(join_column_per_key.size(),
-                                                     false,
-                                                     &join_column_per_key[0],
-                                                     &type_info_per_key[0],
-                                                     nullptr,
-                                                     nullptr);
-          approximate_distinct_tuples_impl(hll_buffer,
-                                           nullptr,
-                                           b,
-                                           join_column_per_key[0].num_elems,
-                                           &key_handler,
-                                           thread_idx,
-                                           thread_count);
-        }));
+      const auto key_handler = GenericKeyHandler(join_column_per_key.size(),
+                                                 false,
+                                                 &join_column_per_key[0],
+                                                 &type_info_per_key[0],
+                                                 nullptr,
+                                                 nullptr);
+      approximate_distinct_tuples_impl(hll_buffer,
+                                       nullptr,
+                                       b,
+                                       join_column_per_key[0].num_elems,
+                                       &key_handler,
+                                       thread_idx,
+                                       thread_count);
+    }));
   }
   for (auto& child : approx_distinct_threads) {
     child.get();
@@ -1995,32 +1982,30 @@ void approximate_distinct_tuples_overlaps(
   CHECK_EQ(join_column_per_key.size(), type_info_per_key.size());
   CHECK(!join_column_per_key.empty());
 
-  std::vector<std::future<void>> approx_distinct_threads;
+  std::vector<utils::future<void>> approx_distinct_threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-    approx_distinct_threads.push_back(std::async(
-        std::launch::async,
-        [&join_column_per_key,
-         &join_buckets_per_key,
-         &row_counts,
-         b,
-         hll_buffer_all_cpus,
-         padded_size_bytes,
-         thread_idx,
-         thread_count] {
-          auto hll_buffer = hll_buffer_all_cpus + thread_idx * padded_size_bytes;
+    approx_distinct_threads.push_back(utils::async([&join_column_per_key,
+                                                    &join_buckets_per_key,
+                                                    &row_counts,
+                                                    b,
+                                                    hll_buffer_all_cpus,
+                                                    padded_size_bytes,
+                                                    thread_idx,
+                                                    thread_count] {
+      auto hll_buffer = hll_buffer_all_cpus + thread_idx * padded_size_bytes;
 
-          const auto key_handler = OverlapsKeyHandler(
-              join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
-              &join_column_per_key[0],
-              join_buckets_per_key[0].bucket_sizes_for_dimension.data());
-          approximate_distinct_tuples_impl(hll_buffer,
-                                           row_counts.data(),
-                                           b,
-                                           join_column_per_key[0].num_elems,
-                                           &key_handler,
-                                           thread_idx,
-                                           thread_count);
-        }));
+      const auto key_handler =
+          OverlapsKeyHandler(join_buckets_per_key[0].bucket_sizes_for_dimension.size(),
+                             &join_column_per_key[0],
+                             join_buckets_per_key[0].bucket_sizes_for_dimension.data());
+      approximate_distinct_tuples_impl(hll_buffer,
+                                       row_counts.data(),
+                                       b,
+                                       join_column_per_key[0].num_elems,
+                                       &key_handler,
+                                       thread_idx,
+                                       thread_count);
+    }));
   }
   for (auto& child : approx_distinct_threads) {
     child.get();
@@ -2040,9 +2025,9 @@ void compute_bucket_sizes(std::vector<double>& bucket_sizes_for_dimension,
     bucket_sizes_for_threads.emplace_back(bucket_sizes_for_dimension.size(),
                                           std::numeric_limits<double>::max());
   }
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   for (int thread_idx = 0; thread_idx < thread_count; ++thread_idx) {
-    threads.push_back(std::async(std::launch::async,
+    threads.push_back(utils::async(
                                  compute_bucket_sizes_impl<2>,
                                  bucket_sizes_for_threads[thread_idx].data(),
                                  &join_column,

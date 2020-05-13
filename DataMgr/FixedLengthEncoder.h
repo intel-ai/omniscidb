@@ -25,6 +25,8 @@
 #include "Encoder.h"
 
 #include <Shared/DatumFetchers.h>
+#include <Utils/Threading.h>
+#include <tuple>
 
 template <typename T, typename V>
 class FixedLengthEncoder : public Encoder {
@@ -117,8 +119,32 @@ class FixedLengthEncoder : public Encoder {
     }
   }
 
-  void updateStats(const int8_t* const dst, const size_t numBytes) override {
-    CHECK(false);
+  void updateStats(const int8_t* const dst, const size_t numElements) override {
+    const V* data = reinterpret_cast<const V*>(dst);
+
+    std::tie(dataMin, dataMax, has_nulls) = utils::parallel_reduce(
+        utils::blocked_range(0UL, numElements),
+        std::tuple(static_cast<V>(dataMin), static_cast<V>(dataMax), has_nulls),
+        [&](const auto& range, auto init) {
+          auto [min, max, nulls] = init;
+          for (size_t i = range.begin(); i < range.end(); i++) {
+            if (data[i] != std::numeric_limits<V>::min()) {
+              decimal_overflow_validator_.validate(data[i]);
+              min = std::min(min, data[i]);
+              max = std::max(max, data[i]);
+            } else {
+              nulls = true;
+            }
+          }
+          return std::tuple(min, max, nulls);
+        },
+        [&](auto lhs, auto rhs) {
+          const auto [lhs_min, lhs_max, lhs_nulls] = lhs;
+          const auto [rhs_min, rhs_max, rhs_nulls] = rhs;
+          return std::tuple(std::min(lhs_min, rhs_min),
+                            std::max(lhs_max, rhs_max),
+                            lhs_nulls || rhs_nulls);
+        });
   }
 
   // Only called from the executor for synthesized meta-information.

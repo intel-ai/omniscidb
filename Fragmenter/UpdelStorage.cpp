@@ -34,11 +34,13 @@
 #include "Shared/thread_count.h"
 #include "TargetValueConvertersFactories.h"
 
+#include "Utils/Threading.h"
+
 extern bool g_enable_experimental_string_functions;
 
 namespace Fragmenter_Namespace {
 
-inline void wait_cleanup_threads(std::vector<std::future<void>>& threads) {
+inline void wait_cleanup_threads(std::vector<utils::future<void>>& threads) {
   for (auto& t : threads) {
     t.get();
   }
@@ -535,15 +537,14 @@ void InsertOrderFragmenter::updateColumns(
 
   if (can_go_parallel) {
     const size_t num_worker_threads = cpu_threads();
-    std::vector<std::future<void>> worker_threads;
+    std::vector<utils::future<void>> worker_threads;
     for (size_t i = 0,
                 start_entry = 0,
                 stride = (num_entries + num_worker_threads - 1) / num_worker_threads;
          i < num_worker_threads && start_entry < num_entries;
          ++i, start_entry += stride) {
       const auto end_entry = std::min(start_entry + stride, num_rows);
-      worker_threads.push_back(std::async(
-          std::launch::async,
+      worker_threads.push_back(utils::async(
           [&row_converter](const size_t start, const size_t end) {
             for (size_t indexOfRow = start; indexOfRow < end; ++indexOfRow) {
               row_converter(indexOfRow);
@@ -641,7 +642,7 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
   std::vector<int64_t> min_int64t_per_thread(ncore, std::numeric_limits<int64_t>::max());
 
   // parallel update elements
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
 
   const auto segsz = (nrow + ncore - 1) / ncore;
   auto dbuf = chunk->get_buffer();
@@ -660,232 +661,229 @@ void InsertOrderFragmenter::updateColumn(const Catalog_Namespace::Catalog* catal
     updel_roll.dirtyChunkeys.insert(chunkey);
   }
   for (size_t rbegin = 0, c = 0; rbegin < nrow; ++c, rbegin += segsz) {
-    threads.emplace_back(std::async(
-        std::launch::async,
-        [=,
-         &has_null_per_thread,
-         &min_int64t_per_thread,
-         &max_int64t_per_thread,
-         &min_double_per_thread,
-         &max_double_per_thread,
-         &frag_offsets,
-         &rhs_values] {
-          SQLTypeInfo lhs_type = cd->columnType;
+    threads.emplace_back(utils::async([=,
+                                       &has_null_per_thread,
+                                       &min_int64t_per_thread,
+                                       &max_int64t_per_thread,
+                                       &min_double_per_thread,
+                                       &max_double_per_thread,
+                                       &frag_offsets,
+                                       &rhs_values] {
+      SQLTypeInfo lhs_type = cd->columnType;
 
-          // !! not sure if this is a undocumented convention or a bug, but for a sharded
-          // table the dictionary id of a encoded string column is not specified by
-          // comp_param in physical table but somehow in logical table :) comp_param in
-          // physical table is always 0, so need to adapt accordingly...
-          auto cdl = (shard_ < 0)
-                         ? cd
-                         : catalog->getMetadataForColumn(
-                               catalog->getLogicalTableId(td->tableId), cd->columnId);
-          CHECK(cdl);
-          DecimalOverflowValidator decimalOverflowValidator(lhs_type);
-          NullAwareValidator<DecimalOverflowValidator> nullAwareDecimalOverflowValidator(
-              lhs_type, &decimalOverflowValidator);
-          DateDaysOverflowValidator dateDaysOverflowValidator(lhs_type);
-          NullAwareValidator<DateDaysOverflowValidator> nullAwareDateOverflowValidator(
-              lhs_type, &dateDaysOverflowValidator);
+      // !! not sure if this is a undocumented convention or a bug, but for a sharded
+      // table the dictionary id of a encoded string column is not specified by
+      // comp_param in physical table but somehow in logical table :) comp_param in
+      // physical table is always 0, so need to adapt accordingly...
+      auto cdl = (shard_ < 0)
+                     ? cd
+                     : catalog->getMetadataForColumn(
+                           catalog->getLogicalTableId(td->tableId), cd->columnId);
+      CHECK(cdl);
+      DecimalOverflowValidator decimalOverflowValidator(lhs_type);
+      NullAwareValidator<DecimalOverflowValidator> nullAwareDecimalOverflowValidator(
+          lhs_type, &decimalOverflowValidator);
+      DateDaysOverflowValidator dateDaysOverflowValidator(lhs_type);
+      NullAwareValidator<DateDaysOverflowValidator> nullAwareDateOverflowValidator(
+          lhs_type, &dateDaysOverflowValidator);
 
-          StringDictionary* stringDict{nullptr};
-          if (lhs_type.is_string()) {
-            CHECK(kENCODING_DICT == lhs_type.get_compression());
+      StringDictionary* stringDict{nullptr};
+      if (lhs_type.is_string()) {
+        CHECK(kENCODING_DICT == lhs_type.get_compression());
+        auto dictDesc = const_cast<DictDescriptor*>(
+            catalog->getMetadataForDict(cdl->columnType.get_comp_param()));
+        CHECK(dictDesc);
+        stringDict = dictDesc->stringDict.get();
+        CHECK(stringDict);
+      }
+
+      for (size_t r = rbegin; r < std::min(rbegin + segsz, nrow); r++) {
+        const auto roffs = frag_offsets[r];
+        auto data_ptr = dbuf_addr + roffs * get_element_size(lhs_type);
+        auto sv = &rhs_values[1 == n_rhs_values ? 0 : r];
+        ScalarTargetValue sv2;
+
+        // Subtle here is on the two cases of string-to-string assignments, when
+        // upstream passes RHS string as a string index instead of a preferred "real
+        // string".
+        //   case #1. For "SET str_col = str_literal", it is hard to resolve temp str
+        //   index
+        //            in this layer, so if upstream passes a str idx here, an
+        //            exception is thrown.
+        //   case #2. For "SET str_col1 = str_col2", RHS str idx is converted to LHS
+        //   str idx.
+        if (rhs_type.is_string()) {
+          if (const auto vp = boost::get<int64_t>(sv)) {
             auto dictDesc = const_cast<DictDescriptor*>(
-                catalog->getMetadataForDict(cdl->columnType.get_comp_param()));
-            CHECK(dictDesc);
-            stringDict = dictDesc->stringDict.get();
+                catalog->getMetadataForDict(rhs_type.get_comp_param()));
+            if (nullptr == dictDesc) {
+              throw std::runtime_error(
+                  "UPDATE does not support cast from string literal to string "
+                  "column.");
+            }
+            auto stringDict = dictDesc->stringDict.get();
             CHECK(stringDict);
+            sv2 = NullableString(stringDict->getString(*vp));
+            sv = &sv2;
           }
+        }
 
-          for (size_t r = rbegin; r < std::min(rbegin + segsz, nrow); r++) {
-            const auto roffs = frag_offsets[r];
-            auto data_ptr = dbuf_addr + roffs * get_element_size(lhs_type);
-            auto sv = &rhs_values[1 == n_rhs_values ? 0 : r];
-            ScalarTargetValue sv2;
-
-            // Subtle here is on the two cases of string-to-string assignments, when
-            // upstream passes RHS string as a string index instead of a preferred "real
-            // string".
-            //   case #1. For "SET str_col = str_literal", it is hard to resolve temp str
-            //   index
-            //            in this layer, so if upstream passes a str idx here, an
-            //            exception is thrown.
-            //   case #2. For "SET str_col1 = str_col2", RHS str idx is converted to LHS
-            //   str idx.
-            if (rhs_type.is_string()) {
-              if (const auto vp = boost::get<int64_t>(sv)) {
-                auto dictDesc = const_cast<DictDescriptor*>(
-                    catalog->getMetadataForDict(rhs_type.get_comp_param()));
-                if (nullptr == dictDesc) {
-                  throw std::runtime_error(
-                      "UPDATE does not support cast from string literal to string "
-                      "column.");
-                }
-                auto stringDict = dictDesc->stringDict.get();
-                CHECK(stringDict);
-                sv2 = NullableString(stringDict->getString(*vp));
-                sv = &sv2;
-              }
+        if (const auto vp = boost::get<int64_t>(sv)) {
+          auto v = *vp;
+          if (lhs_type.is_string()) {
+            throw std::runtime_error("UPDATE does not support cast to string.");
+          }
+          put_scalar<int64_t>(data_ptr, lhs_type, v, cd->columnName, &rhs_type);
+          if (lhs_type.is_decimal()) {
+            nullAwareDecimalOverflowValidator.validate<int64_t>(v);
+            int64_t decimal_val;
+            get_scalar<int64_t>(data_ptr, lhs_type, decimal_val);
+            tabulate_metadata(
+                lhs_type,
+                min_int64t_per_thread[c],
+                max_int64t_per_thread[c],
+                has_null_per_thread[c],
+                (v == inline_int_null_value<int64_t>() && lhs_type.get_notnull() == false)
+                    ? v
+                    : decimal_val);
+            auto const positive_v_and_negative_d = (v >= 0) && (decimal_val < 0);
+            auto const negative_v_and_positive_d = (v < 0) && (decimal_val >= 0);
+            if (positive_v_and_negative_d || negative_v_and_positive_d) {
+              throw std::runtime_error("Data conversion overflow on " +
+                                       std::to_string(v) + " from DECIMAL(" +
+                                       std::to_string(rhs_type.get_dimension()) + ", " +
+                                       std::to_string(rhs_type.get_scale()) + ") to (" +
+                                       std::to_string(lhs_type.get_dimension()) + ", " +
+                                       std::to_string(lhs_type.get_scale()) + ")");
             }
-
-            if (const auto vp = boost::get<int64_t>(sv)) {
-              auto v = *vp;
-              if (lhs_type.is_string()) {
-                throw std::runtime_error("UPDATE does not support cast to string.");
-              }
-              put_scalar<int64_t>(data_ptr, lhs_type, v, cd->columnName, &rhs_type);
-              if (lhs_type.is_decimal()) {
-                nullAwareDecimalOverflowValidator.validate<int64_t>(v);
-                int64_t decimal_val;
-                get_scalar<int64_t>(data_ptr, lhs_type, decimal_val);
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  (v == inline_int_null_value<int64_t>() &&
-                                   lhs_type.get_notnull() == false)
-                                      ? v
-                                      : decimal_val);
-                auto const positive_v_and_negative_d = (v >= 0) && (decimal_val < 0);
-                auto const negative_v_and_positive_d = (v < 0) && (decimal_val >= 0);
-                if (positive_v_and_negative_d || negative_v_and_positive_d) {
-                  throw std::runtime_error(
-                      "Data conversion overflow on " + std::to_string(v) +
-                      " from DECIMAL(" + std::to_string(rhs_type.get_dimension()) + ", " +
-                      std::to_string(rhs_type.get_scale()) + ") to (" +
-                      std::to_string(lhs_type.get_dimension()) + ", " +
-                      std::to_string(lhs_type.get_scale()) + ")");
-                }
-              } else if (is_integral(lhs_type)) {
-                if (lhs_type.is_date_in_days()) {
-                  // Store meta values in seconds
-                  if (lhs_type.get_size() == 2) {
-                    nullAwareDateOverflowValidator.validate<int16_t>(v);
-                  } else {
-                    nullAwareDateOverflowValidator.validate<int32_t>(v);
-                  }
-                  int64_t days;
-                  get_scalar<int64_t>(data_ptr, lhs_type, days);
-                  const auto seconds = DateConverters::get_epoch_seconds_from_days(days);
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    (v == inline_int_null_value<int64_t>() &&
-                                     lhs_type.get_notnull() == false)
-                                        ? NullSentinelSupplier()(lhs_type, v)
-                                        : seconds);
-                } else {
-                  int64_t target_value;
-                  if (rhs_type.is_decimal()) {
-                    target_value = round(decimal_to_double(rhs_type, v));
-                  } else {
-                    target_value = v;
-                  }
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    target_value);
-                }
+          } else if (is_integral(lhs_type)) {
+            if (lhs_type.is_date_in_days()) {
+              // Store meta values in seconds
+              if (lhs_type.get_size() == 2) {
+                nullAwareDateOverflowValidator.validate<int16_t>(v);
               } else {
-                tabulate_metadata(
-                    lhs_type,
-                    min_double_per_thread[c],
-                    max_double_per_thread[c],
-                    has_null_per_thread[c],
-                    rhs_type.is_decimal() ? decimal_to_double(rhs_type, v) : v);
+                nullAwareDateOverflowValidator.validate<int32_t>(v);
               }
-            } else if (const auto vp = boost::get<double>(sv)) {
-              auto v = *vp;
-              if (lhs_type.is_string()) {
-                throw std::runtime_error("UPDATE does not support cast to string.");
-              }
-              put_scalar<double>(data_ptr, lhs_type, v, cd->columnName);
-              if (lhs_type.is_integer()) {
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(v));
-              } else if (lhs_type.is_fp()) {
-                tabulate_metadata(lhs_type,
-                                  min_double_per_thread[c],
-                                  max_double_per_thread[c],
-                                  has_null_per_thread[c],
-                                  double(v));
-              } else {
-                UNREACHABLE() << "Unexpected combination of a non-floating or integer "
-                                 "LHS with a floating RHS.";
-              }
-            } else if (const auto vp = boost::get<float>(sv)) {
-              auto v = *vp;
-              if (lhs_type.is_string()) {
-                throw std::runtime_error("UPDATE does not support cast to string.");
-              }
-              put_scalar<float>(data_ptr, lhs_type, v, cd->columnName);
-              if (lhs_type.is_integer()) {
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(v));
-              } else {
-                tabulate_metadata(lhs_type,
-                                  min_double_per_thread[c],
-                                  max_double_per_thread[c],
-                                  has_null_per_thread[c],
-                                  double(v));
-              }
-            } else if (const auto vp = boost::get<NullableString>(sv)) {
-              const auto s = boost::get<std::string>(vp);
-              const auto sval = s ? *s : std::string("");
-              if (lhs_type.is_string()) {
-                decltype(stringDict->getOrAdd(sval)) sidx;
-                {
-                  std::unique_lock<std::mutex> lock(temp_mutex_);
-                  sidx = stringDict->getOrAdd(sval);
-                }
-                put_scalar<int64_t>(data_ptr, lhs_type, sidx, cd->columnName);
-                tabulate_metadata(lhs_type,
-                                  min_int64t_per_thread[c],
-                                  max_int64t_per_thread[c],
-                                  has_null_per_thread[c],
-                                  int64_t(sidx));
-              } else if (sval.size() > 0) {
-                auto dval = std::atof(sval.data());
-                if (lhs_type.is_boolean()) {
-                  dval = sval == "t" || sval == "true" || sval == "T" || sval == "True";
-                } else if (lhs_type.is_time()) {
-                  throw std::runtime_error(
-                      "Date/Time/Timestamp update not supported through translated "
-                      "string path.");
-                }
-                if (lhs_type.is_fp() || lhs_type.is_decimal()) {
-                  put_scalar<double>(data_ptr, lhs_type, dval, cd->columnName);
-                  tabulate_metadata(lhs_type,
-                                    min_double_per_thread[c],
-                                    max_double_per_thread[c],
-                                    has_null_per_thread[c],
-                                    double(dval));
-                } else {
-                  put_scalar<int64_t>(data_ptr, lhs_type, dval, cd->columnName);
-                  tabulate_metadata(lhs_type,
-                                    min_int64t_per_thread[c],
-                                    max_int64t_per_thread[c],
-                                    has_null_per_thread[c],
-                                    int64_t(dval));
-                }
-              } else {
-                put_null(data_ptr, lhs_type, cd->columnName);
-                has_null_per_thread[c] = true;
-              }
+              int64_t days;
+              get_scalar<int64_t>(data_ptr, lhs_type, days);
+              const auto seconds = DateConverters::get_epoch_seconds_from_days(days);
+              tabulate_metadata(lhs_type,
+                                min_int64t_per_thread[c],
+                                max_int64t_per_thread[c],
+                                has_null_per_thread[c],
+                                (v == inline_int_null_value<int64_t>() &&
+                                 lhs_type.get_notnull() == false)
+                                    ? NullSentinelSupplier()(lhs_type, v)
+                                    : seconds);
             } else {
-              CHECK(false);
+              int64_t target_value;
+              if (rhs_type.is_decimal()) {
+                target_value = round(decimal_to_double(rhs_type, v));
+              } else {
+                target_value = v;
+              }
+              tabulate_metadata(lhs_type,
+                                min_int64t_per_thread[c],
+                                max_int64t_per_thread[c],
+                                has_null_per_thread[c],
+                                target_value);
             }
+          } else {
+            tabulate_metadata(lhs_type,
+                              min_double_per_thread[c],
+                              max_double_per_thread[c],
+                              has_null_per_thread[c],
+                              rhs_type.is_decimal() ? decimal_to_double(rhs_type, v) : v);
           }
-        }));
+        } else if (const auto vp = boost::get<double>(sv)) {
+          auto v = *vp;
+          if (lhs_type.is_string()) {
+            throw std::runtime_error("UPDATE does not support cast to string.");
+          }
+          put_scalar<double>(data_ptr, lhs_type, v, cd->columnName);
+          if (lhs_type.is_integer()) {
+            tabulate_metadata(lhs_type,
+                              min_int64t_per_thread[c],
+                              max_int64t_per_thread[c],
+                              has_null_per_thread[c],
+                              int64_t(v));
+          } else if (lhs_type.is_fp()) {
+            tabulate_metadata(lhs_type,
+                              min_double_per_thread[c],
+                              max_double_per_thread[c],
+                              has_null_per_thread[c],
+                              double(v));
+          } else {
+            UNREACHABLE() << "Unexpected combination of a non-floating or integer "
+                             "LHS with a floating RHS.";
+          }
+        } else if (const auto vp = boost::get<float>(sv)) {
+          auto v = *vp;
+          if (lhs_type.is_string()) {
+            throw std::runtime_error("UPDATE does not support cast to string.");
+          }
+          put_scalar<float>(data_ptr, lhs_type, v, cd->columnName);
+          if (lhs_type.is_integer()) {
+            tabulate_metadata(lhs_type,
+                              min_int64t_per_thread[c],
+                              max_int64t_per_thread[c],
+                              has_null_per_thread[c],
+                              int64_t(v));
+          } else {
+            tabulate_metadata(lhs_type,
+                              min_double_per_thread[c],
+                              max_double_per_thread[c],
+                              has_null_per_thread[c],
+                              double(v));
+          }
+        } else if (const auto vp = boost::get<NullableString>(sv)) {
+          const auto s = boost::get<std::string>(vp);
+          const auto sval = s ? *s : std::string("");
+          if (lhs_type.is_string()) {
+            decltype(stringDict->getOrAdd(sval)) sidx;
+            {
+              std::unique_lock<std::mutex> lock(temp_mutex_);
+              sidx = stringDict->getOrAdd(sval);
+            }
+            put_scalar<int32_t>(data_ptr, lhs_type, sidx, cd->columnName);
+            tabulate_metadata(lhs_type,
+                              min_int64t_per_thread[c],
+                              max_int64t_per_thread[c],
+                              has_null_per_thread[c],
+                              int64_t(sidx));
+          } else if (sval.size() > 0) {
+            auto dval = std::atof(sval.data());
+            if (lhs_type.is_boolean()) {
+              dval = sval == "t" || sval == "true" || sval == "T" || sval == "True";
+            } else if (lhs_type.is_time()) {
+              throw std::runtime_error(
+                  "Date/Time/Timestamp update not supported through translated "
+                  "string path.");
+            }
+            if (lhs_type.is_fp() || lhs_type.is_decimal()) {
+              put_scalar<double>(data_ptr, lhs_type, dval, cd->columnName);
+              tabulate_metadata(lhs_type,
+                                min_double_per_thread[c],
+                                max_double_per_thread[c],
+                                has_null_per_thread[c],
+                                double(dval));
+            } else {
+              put_scalar<int64_t>(data_ptr, lhs_type, dval, cd->columnName);
+              tabulate_metadata(lhs_type,
+                                min_int64t_per_thread[c],
+                                max_int64t_per_thread[c],
+                                has_null_per_thread[c],
+                                int64_t(dval));
+            }
+          } else {
+            put_null(data_ptr, lhs_type, cd->columnName);
+            has_null_per_thread[c] = true;
+          }
+        } else {
+          CHECK(false);
+        }
+      }
+    }));
     if (threads.size() >= (size_t)cpu_threads()) {
       wait_cleanup_threads(threads);
     }
@@ -1047,9 +1045,9 @@ const std::vector<uint64_t> InsertOrderFragmenter::getVacuumOffsets(
   const size_t segsz = (nrows_in_chunk + ncore - 1) / ncore;
   std::vector<std::vector<uint64_t>> deleted_offsets;
   deleted_offsets.resize(ncore);
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   for (size_t rbegin = 0; rbegin < nrows_in_chunk; rbegin += segsz) {
-    threads.emplace_back(std::async(std::launch::async, [=, &deleted_offsets] {
+    threads.emplace_back(utils::async([=, &deleted_offsets] {
       const auto rend = std::min<size_t>(rbegin + segsz, nrows_in_chunk);
       const auto ithread = rbegin / segsz;
       CHECK(ithread < deleted_offsets.size());
@@ -1217,7 +1215,7 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
   std::vector<int64_t> min_int64t_per_thread(ncol, std::numeric_limits<uint64_t>::max());
 
   // parallel delete columns
-  std::vector<std::future<void>> threads;
+  std::vector<utils::future<void>> threads;
   auto nrows_to_vacuum = frag_offsets.size();
   auto nrows_in_fragment = fragment.getPhysicalNumTuples();
   auto nrows_to_keep = nrows_in_fragment - nrows_to_vacuum;
@@ -1293,9 +1291,9 @@ void InsertOrderFragmenter::compactRows(const Catalog_Namespace::Catalog* catalo
     };
 
     if (is_varlen) {
-      threads.emplace_back(std::async(std::launch::async, varlen_vacuum));
+      threads.emplace_back(utils::async(varlen_vacuum));
     } else {
-      threads.emplace_back(std::async(std::launch::async, fixlen_vacuum));
+      threads.emplace_back(utils::async(fixlen_vacuum));
     }
     if (threads.size() >= (size_t)cpu_threads()) {
       wait_cleanup_threads(threads);
