@@ -174,7 +174,7 @@ llvm::Function* mapped_function(
     const Function* function,
     const std::unordered_map<const Function*, llvm::Function*>& f) {
   const auto it = f.find(function);
-  CHECK(it != f.end());
+  CHECK(it != f.end()) << function->name() << " not found.";
   return it->second;
 }
 
@@ -261,9 +261,9 @@ void translate_body(const std::vector<std::unique_ptr<Instruction>>& body,
           alloca->label());
     } else if (auto memcpy = dynamic_cast<const MemCpy*>(instr_ptr)) {
       cgen_state->ir_builder_.CreateMemCpy(mapped_value(memcpy->dest(), m),
-                                           0,
+                                           LLVM_MAYBE_ALIGN(0),
                                            mapped_value(memcpy->source(), m),
-                                           0,
+                                           LLVM_MAYBE_ALIGN(0),
                                            mapped_value(memcpy->size(), m));
     } else if (auto ret_early = dynamic_cast<const ReturnEarly*>(instr_ptr)) {
       return_early(mapped_value(ret_early->cond(), m),

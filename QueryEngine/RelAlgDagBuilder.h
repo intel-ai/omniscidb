@@ -24,13 +24,10 @@
 #include <boost/core/noncopyable.hpp>
 
 #include "Catalog/Catalog.h"
-#include "Shared/ConfigResolve.h"
-#include "Shared/sql_window_function_to_string.h"
-
 #include "QueryEngine/Rendering/RenderInfo.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "QueryEngine/TypePunning.h"
-
+#include "Shared/sql_window_function_to_string.h"
 #include "Utils/FsiUtils.h"
 
 using ColumnNameList = std::vector<std::string>;
@@ -756,7 +753,6 @@ class ModifyManipulationTarget {
   auto const isDeleteViaSelect() const { return is_delete_via_select_; }
   auto const isVarlenUpdateRequired() const { return varlen_update_required_; }
 
-  int getTargetColumnCount() const { return target_columns_.size(); }
   void setTargetColumns(ColumnNameList const& target_columns) const {
     target_columns_ = target_columns;
   }
@@ -1345,19 +1341,11 @@ class RelModify : public RelAlgNode {
         }
 
         // Check for valid types
-        if (is_feature_enabled<VarlenUpdates>()) {
-          if (column_desc->columnType.is_varlen()) {
-            varlen_update_required = true;
-          }
-
-          if (column_desc->columnType.is_geometry()) {
-            throw std::runtime_error("UPDATE of a geo column is unsupported.");
-          }
-        } else {
-          if (column_desc->columnType.is_varlen()) {
-            throw std::runtime_error(
-                "UPDATE of a none-encoded string, geo, or array column is unsupported.");
-          }
+        if (column_desc->columnType.is_varlen()) {
+          varlen_update_required = true;
+        }
+        if (column_desc->columnType.is_geometry()) {
+          throw std::runtime_error("UPDATE of a geo column is unsupported.");
         }
       }
     };
@@ -1572,6 +1560,8 @@ class RelAlgDagBuilder : public boost::noncopyable {
                    const rapidjson::Value& query_ast,
                    const Catalog_Namespace::Catalog& cat,
                    const RenderInfo* render_opts);
+
+  void eachNode(std::function<void(RelAlgNode const*)> const&) const;
 
   /**
    * Returns the root node of the DAG.

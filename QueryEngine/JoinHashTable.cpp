@@ -56,6 +56,11 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
       throw HashJoinFail("Cannot apply hash join to inner column type " +
                          lhs_ti.get_type_name());
     }
+    // Decimal types should be identical.
+    if (lhs_ti.is_decimal() && (lhs_ti.get_scale() != rhs_ti.get_scale() ||
+                                lhs_ti.get_precision() != rhs_ti.get_precision())) {
+      throw HashJoinFail("Equijoin with different decimal types");
+    }
   }
 
   const auto lhs_cast = dynamic_cast<const Analyzer::UOper*>(lhs);
@@ -63,6 +68,10 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
   if (lhs_ti.is_string() && (static_cast<bool>(lhs_cast) != static_cast<bool>(rhs_cast) ||
                              (lhs_cast && lhs_cast->get_optype() != kCAST) ||
                              (rhs_cast && rhs_cast->get_optype() != kCAST))) {
+    throw HashJoinFail("Cannot use hash join for given expression");
+  }
+  // Casts to decimal are not suported.
+  if (lhs_ti.is_decimal() && (lhs_cast || rhs_cast)) {
     throw HashJoinFail("Cannot use hash join for given expression");
   }
   const auto lhs_col =
@@ -116,6 +125,11 @@ InnerOuter normalize_column_pair(const Analyzer::Expr* lhs,
       !(dynamic_cast<const Analyzer::FunctionOper*>(lhs)) && outer_col
           ? outer_col->get_type_info()
           : outer_ti;
+  // Casts from decimal are not supported.
+  if ((inner_col_real_ti.is_decimal() || outer_col_ti.is_decimal()) &&
+      (lhs_cast || rhs_cast)) {
+    throw HashJoinFail("Cannot use hash join for given expression");
+  }
   if (is_overlaps_join) {
     if (!inner_col_real_ti.is_array()) {
       throw HashJoinFail(
@@ -474,11 +488,11 @@ bool needs_dictionary_translation(const Analyzer::ColumnVar* inner_col,
   return outer_ti.get_comp_param() != inner_ti.get_comp_param();
 }
 
-std::deque<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+std::vector<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const int device_count) {
-  std::deque<Fragmenter_Namespace::FragmentInfo> shards_for_device;
+  std::vector<Fragmenter_Namespace::FragmentInfo> shards_for_device;
   for (const auto& fragment : fragments) {
     CHECK_GE(fragment.shard, 0);
     if (fragment.shard % device_count == device_id) {
@@ -557,7 +571,7 @@ void JoinHashTable::reify() {
 }
 
 ChunkKey JoinHashTable::genHashTableKey(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const Analyzer::Expr* outer_col_expr,
     const Analyzer::ColumnVar* inner_col) const {
   ChunkKey hash_table_key{executor_->getCatalog()->getCurrentDB().dbId,
@@ -582,7 +596,7 @@ ChunkKey JoinHashTable::genHashTableKey(
 }
 
 void JoinHashTable::reifyOneToOneForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const logger::ThreadId parent_thread_id) {
   DEBUG_TIMER_NEW_THREAD(parent_thread_id);
@@ -637,7 +651,7 @@ void JoinHashTable::reifyOneToOneForDevice(
 }
 
 void JoinHashTable::reifyOneToManyForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const logger::ThreadId parent_thread_id) {
   DEBUG_TIMER_NEW_THREAD(parent_thread_id);
@@ -1158,6 +1172,11 @@ void JoinHashTable::initHashTableOnCpuFromCache(
     const size_t num_elements,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols) {
   auto timer = DEBUG_TIMER(__func__);
+  CHECK_GE(chunk_key.size(), size_t(2));
+  if (chunk_key[1] < 0) {
+    // Do not cache hash tables over intermediate results
+    return;
+  }
   const auto outer_col = dynamic_cast<const Analyzer::ColumnVar*>(cols.second);
   JoinHashTableCacheKey cache_key{col_range_,
                                   *cols.first,
@@ -1179,6 +1198,11 @@ void JoinHashTable::putHashTableOnCpuToCache(
     const ChunkKey& chunk_key,
     const size_t num_elements,
     const std::pair<const Analyzer::ColumnVar*, const Analyzer::Expr*>& cols) {
+  CHECK_GE(chunk_key.size(), size_t(2));
+  if (chunk_key[1] < 0) {
+    // Do not cache hash tables over intermediate results
+    return;
+  }
   const auto outer_col = dynamic_cast<const Analyzer::ColumnVar*>(cols.second);
   JoinHashTableCacheKey cache_key{col_range_,
                                   *cols.first,

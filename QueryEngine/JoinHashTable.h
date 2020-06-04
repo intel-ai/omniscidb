@@ -24,11 +24,11 @@
 #ifndef QUERYENGINE_JOINHASHTABLE_H
 #define QUERYENGINE_JOINHASHTABLE_H
 
-#include "../Analyzer/Analyzer.h"
-#include "../Catalog/Catalog.h"
-#include "../Chunk/Chunk.h"
 #include "Allocators/ThrustAllocator.h"
+#include "Analyzer/Analyzer.h"
+#include "Catalog/Catalog.h"
 #include "ColumnarResults.h"
+#include "DataMgr/Chunk/Chunk.h"
 #include "Descriptors/InputDescriptors.h"
 #include "Descriptors/RowSetMemoryOwner.h"
 #include "ExpressionRange.h"
@@ -165,17 +165,17 @@ class JoinHashTable : public JoinHashTableInterface {
   }
 
   ChunkKey genHashTableKey(
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+      const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
       const Analyzer::Expr* outer_col,
       const Analyzer::ColumnVar* inner_col) const;
 
   void reify();
   void reifyOneToOneForDevice(
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+      const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
       const int device_id,
       const logger::ThreadId parent_thread_id);
   void reifyOneToManyForDevice(
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+      const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
       const int device_id,
       const logger::ThreadId parent_thread_id);
   void checkHashJoinReplicationConstraint(const int table_id) const;
@@ -298,8 +298,8 @@ std::vector<InnerOuter> normalize_column_pairs(const Analyzer::BinOper* conditio
                                                const Catalog_Namespace::Catalog& cat,
                                                const TemporaryTables* temporary_tables);
 
-std::deque<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+std::vector<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     const int device_count);
 

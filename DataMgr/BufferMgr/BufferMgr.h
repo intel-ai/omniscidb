@@ -166,17 +166,18 @@ class BufferMgr : public AbstractBufferMgr {  // implements
 
   BufferList::iterator reserveBuffer(BufferList::iterator& seg_it,
                                      const size_t num_bytes);
-  void getChunkMetadataVec(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec) override;
-  void getChunkMetadataVecForKeyPrefix(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec,
-      const ChunkKey& key_prefix) override;
+  void getChunkMetadataVec(ChunkMetadataVector& chunk_metadata_vec) override;
+  void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunk_metadata_vec,
+                                       const ChunkKey& key_prefix) override;
 
  protected:
   std::vector<int8_t*> slabs_;  /// vector of beginning memory addresses for each
                                 /// allocation of the buffer pool
   std::vector<BufferList> slab_segments_;
   size_t page_size_;
+
+  size_t max_slab_size_;  /// size of the individual memory allocations that compose the
+                          /// buffer pool (up to maxBufferSize_)
 
  private:
   BufferMgr(const BufferMgr&);             // private copy constructor
@@ -202,8 +203,6 @@ class BufferMgr : public AbstractBufferMgr {  // implements
   size_t num_pages_allocated_;
   size_t max_num_pages_per_slab_;
   size_t current_max_slab_page_size_;
-  size_t max_slab_size_;  /// size of the individual memory allocations that compose the
-                          /// buffer pool (up to maxBufferSize_)
   bool allocations_capped_;
   AbstractBufferMgr* parent_mgr_;
   int max_buffer_id_;

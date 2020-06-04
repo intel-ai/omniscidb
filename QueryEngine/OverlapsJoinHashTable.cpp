@@ -139,6 +139,16 @@ void OverlapsJoinHashTable::reifyWithLayout(
   columns_per_device.clear();
   bucket_sizes_for_dimension_.clear();
 
+  auto cache_key_contains_intermediate_table = [](const auto cache_key) {
+    for (auto key : cache_key.chunk_keys) {
+      CHECK_GE(key.size(), size_t(2));
+      if (key[1] < 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   // Auto-tuner: Pre-calculate some possible hash table sizes.
   std::lock_guard<std::mutex> guard(auto_tuner_cache_mutex_);
   auto atc = auto_tuner_cache_.find(cache_key);
@@ -176,7 +186,9 @@ void OverlapsJoinHashTable::reifyWithLayout(
       }
     }
     overlaps_hashjoin_bucket_threshold_ = good_threshold;
-    auto_tuner_cache_[cache_key] = overlaps_hashjoin_bucket_threshold_;
+    if (!cache_key_contains_intermediate_table(cache_key)) {
+      auto_tuner_cache_[cache_key] = overlaps_hashjoin_bucket_threshold_;
+    }
   }
 
   // Calculate the final size of the hash table.
@@ -258,7 +270,7 @@ size_t OverlapsJoinHashTable::calculateHashTableSize(size_t number_of_dimensions
 }
 
 BaselineJoinHashTable::ColumnsForDevice OverlapsJoinHashTable::fetchColumnsForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     ThrustAllocator& dev_buff_owner) {
   const auto& catalog = *executor_->getCatalog();
@@ -936,7 +948,7 @@ HashJoinMatchingSet OverlapsJoinHashTable::codegenMatchingSet(
             LL_INT(key_component_count),            // key_component_count
             composite_key_dict,                     // ptr to hash table
             LL_INT(entry_count_),                   // entry_count
-            LL_INT(composite_key_dict_size),        // offset_buffer_off
+            LL_INT(composite_key_dict_size),        // offset_buffer_ptr_offset
             LL_INT(entry_count_ * sizeof(int32_t))  // sub_buff_size
         });
 

@@ -87,7 +87,6 @@ RelAlgExecutionUnit QueryRewriter::rewriteOverlapsJoin(
           ra_exe_unit_in.estimator,
           ra_exe_unit_in.sort_info,
           ra_exe_unit_in.scan_limit,
-          ra_exe_unit_in.query_features,
           ra_exe_unit_in.use_bump_allocator};
 }
 
@@ -114,7 +113,7 @@ RelAlgExecutionUnit QueryRewriter::rewriteConstrainedByIn(
   if (!in_vals || in_vals->get_value_list().empty()) {
     return ra_exe_unit_in;
   }
-  for (const auto in_val : in_vals->get_value_list()) {
+  for (const auto& in_val : in_vals->get_value_list()) {
     if (!std::dynamic_pointer_cast<Analyzer::Constant>(in_val)) {
       break;
     }
@@ -135,7 +134,7 @@ RelAlgExecutionUnit QueryRewriter::rewriteConstrainedByInImpl(
   bool rewrite{false};
   size_t groupby_idx{0};
   auto it = ra_exe_unit_in.groupby_exprs.begin();
-  for (const auto group_expr : ra_exe_unit_in.groupby_exprs) {
+  for (const auto& group_expr : ra_exe_unit_in.groupby_exprs) {
     CHECK(group_expr);
     ++groupby_idx;
     if (*group_expr == *in_vals->get_arg()) {
@@ -187,7 +186,7 @@ std::shared_ptr<Analyzer::CaseExpr> QueryRewriter::generateCaseForDomainValues(
   std::list<std::pair<std::shared_ptr<Analyzer::Expr>, std::shared_ptr<Analyzer::Expr>>>
       case_expr_list;
   auto in_val_arg = in_vals->get_arg()->deep_copy();
-  for (const auto in_val : in_vals->get_value_list()) {
+  for (const auto& in_val : in_vals->get_value_list()) {
     auto case_cond = makeExpr<Analyzer::BinOper>(
         SQLTypeInfo(kBOOLEAN, true), false, kEQ, kONE, in_val_arg, in_val);
     auto in_val_copy = in_val->deep_copy();
@@ -378,7 +377,6 @@ RelAlgExecutionUnit QueryRewriter::rewriteColumnarUpdate(
                                          ra_exe_unit_in.estimator,
                                          ra_exe_unit_in.sort_info,
                                          ra_exe_unit_in.scan_limit,
-                                         ra_exe_unit_in.query_features,
                                          ra_exe_unit_in.use_bump_allocator,
                                          ra_exe_unit_in.union_all,
                                          ra_exe_unit_in.query_state};
@@ -478,7 +476,6 @@ RelAlgExecutionUnit QueryRewriter::rewriteColumnarDelete(
                                          ra_exe_unit_in.estimator,
                                          ra_exe_unit_in.sort_info,
                                          ra_exe_unit_in.scan_limit,
-                                         ra_exe_unit_in.query_features,
                                          ra_exe_unit_in.use_bump_allocator,
                                          ra_exe_unit_in.union_all,
                                          ra_exe_unit_in.query_state};

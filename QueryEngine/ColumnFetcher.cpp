@@ -56,11 +56,11 @@ std::pair<const int8_t*, size_t> ColumnFetcher::getOneColumnFragment(
         chunk_key,
         effective_mem_lvl,
         effective_mem_lvl == Data_Namespace::CPU_LEVEL ? 0 : device_id,
-        chunk_meta_it->second.numBytes,
-        chunk_meta_it->second.numElements);
+        chunk_meta_it->second->numBytes,
+        chunk_meta_it->second->numElements);
     chunks_owner.push_back(chunk);
     CHECK(chunk);
-    auto ab = chunk->get_buffer();
+    auto ab = chunk->getBuffer();
     CHECK(ab->getMemoryPtr());
     col_buff = reinterpret_cast<int8_t*>(ab->getMemoryPtr());
   } else {  // temporary table
@@ -112,7 +112,7 @@ std::pair<const int8_t*, size_t> ColumnFetcher::getOneColumnFragment(
 JoinColumn ColumnFetcher::makeJoinColumn(
     Executor* executor,
     const Analyzer::ColumnVar& hash_col,
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const Data_Namespace::MemoryLevel effective_mem_lvl,
     const int device_id,
     std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner,
@@ -121,6 +121,7 @@ JoinColumn ColumnFetcher::makeJoinColumn(
   CHECK(!fragments.empty());
 
   size_t col_chunks_buff_sz = sizeof(struct JoinChunk) * fragments.size();
+  // TODO: needs an allocator owner
   auto col_chunks_buff = reinterpret_cast<int8_t*>(
       malloc_owner.emplace_back(checked_malloc(col_chunks_buff_sz), free).get());
   auto join_chunk_array = reinterpret_cast<struct JoinChunk*>(col_chunks_buff);
@@ -204,8 +205,8 @@ const int8_t* ColumnFetcher::getOneTableColumnFragment(
         chunk_key,
         memory_level,
         memory_level == Data_Namespace::CPU_LEVEL ? 0 : device_id,
-        chunk_meta_it->second.numBytes,
-        chunk_meta_it->second.numElements);
+        chunk_meta_it->second->numBytes,
+        chunk_meta_it->second->numElements);
     std::lock_guard<std::mutex> chunk_list_lock(chunk_list_mutex);
     chunk_holder.push_back(chunk);
   }
@@ -217,7 +218,7 @@ const int8_t* ColumnFetcher::getOneTableColumnFragment(
     if (memory_level == Data_Namespace::CPU_LEVEL) {
       return reinterpret_cast<int8_t*>(&chunk_iter);
     } else {
-      auto ab = chunk->get_buffer();
+      auto ab = chunk->getBuffer();
       ab->pin();
       auto& row_set_mem_owner = executor_->getRowSetMemoryOwner();
       row_set_mem_owner->addVarlenInputBuffer(ab);
@@ -232,7 +233,7 @@ const int8_t* ColumnFetcher::getOneTableColumnFragment(
       return chunk_iter_gpu;
     }
   } else {
-    auto ab = chunk->get_buffer();
+    auto ab = chunk->getBuffer();
     CHECK(ab->getMemoryPtr());
     return ab->getMemoryPtr();  // @TODO(alex) change to use ChunkIter
   }
@@ -277,7 +278,7 @@ const int8_t* ColumnFetcher::getAllTableColumnFragments(
             std::make_unique<ColumnarResults>(executor_->row_set_mem_owner_,
                                               col_buffer,
                                               fragment.getNumTuples(),
-                                              chunk_meta_it->second.sqlType));
+                                              chunk_meta_it->second->sqlType));
       }
       auto merged_results =
           ColumnarResults::mergeResults(executor_->row_set_mem_owner_, column_frags);

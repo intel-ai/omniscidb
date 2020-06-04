@@ -133,7 +133,8 @@ void TableOptimizer::recomputeMetadata() const {
 
   for (const auto td : table_descriptors) {
     ScopeGuard row_set_holder = [this] { executor_->row_set_mem_owner_ = nullptr; };
-    executor_->row_set_mem_owner_ = std::make_shared<RowSetMemoryOwner>();
+    // We can use a smaller block size here, since we won't be running projection queries
+    executor_->row_set_mem_owner_ = std::make_shared<RowSetMemoryOwner>(1000000000);
     executor_->catalog_ = &cat_;
     const auto table_id = td->tableId;
 
@@ -183,8 +184,8 @@ void TableOptimizer::recomputeMetadata() const {
 
             const auto& ti = cd->columnType;
 
-            ChunkMetadata chunk_metadata;
-            chunk_metadata.sqlType = get_logical_type_info(ti);
+            auto chunk_metadata = std::make_shared<ChunkMetadata>();
+            chunk_metadata->sqlType = get_logical_type_info(ti);
 
             const auto count_val = read_scalar_target_value<int64_t>(row[0]);
             if (count_val == 0) {
@@ -221,14 +222,14 @@ void TableOptimizer::recomputeMetadata() const {
             }
 
             // place manufacture min and max in fake row to use common infra
-            if (!set_metadata_from_results(chunk_metadata, fakerow, ti, false)) {
+            if (!set_metadata_from_results(*chunk_metadata, fakerow, ti, false)) {
               LOG(WARNING) << "Unable to process new metadata values for column "
                            << cd->columnName;
               return;
             }
 
             stats_map.emplace(
-                std::make_pair(fragment_info.fragmentId, chunk_metadata.chunkStats));
+                std::make_pair(fragment_info.fragmentId, chunk_metadata->chunkStats));
             tuple_count_map.emplace(std::make_pair(fragment_info.fragmentId, num_tuples));
           };
 
@@ -295,8 +296,8 @@ void TableOptimizer::recomputeMetadata() const {
 
             const auto& ti = cd->columnType;
 
-            ChunkMetadata chunk_metadata;
-            chunk_metadata.sqlType = get_logical_type_info(ti);
+            auto chunk_metadata = std::make_shared<ChunkMetadata>();
+            chunk_metadata->sqlType = get_logical_type_info(ti);
 
             const auto count_val = read_scalar_target_value<int64_t>(row[2]);
             if (count_val == 0) {
@@ -314,14 +315,14 @@ void TableOptimizer::recomputeMetadata() const {
                             fragment_info.getPhysicalNumTuples());
             }
 
-            if (!set_metadata_from_results(chunk_metadata, row, ti, has_nulls)) {
+            if (!set_metadata_from_results(*chunk_metadata, row, ti, has_nulls)) {
               LOG(WARNING) << "Unable to process new metadata values for column "
                            << cd->columnName;
               return;
             }
 
             stats_map.emplace(
-                std::make_pair(fragment_info.fragmentId, chunk_metadata.chunkStats));
+                std::make_pair(fragment_info.fragmentId, chunk_metadata->chunkStats));
           };
 
       executor_->executeWorkUnitPerFragment(

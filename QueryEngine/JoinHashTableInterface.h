@@ -134,7 +134,7 @@ class JoinHashTableInterface {
 
   JoinColumn fetchJoinColumn(
       const Analyzer::ColumnVar* hash_col,
-      const std::deque<Fragmenter_Namespace::FragmentInfo>& fragment_info,
+      const std::vector<Fragmenter_Namespace::FragmentInfo>& fragment_info,
       const Data_Namespace::MemoryLevel effective_memory_level,
       const int device_id,
       std::vector<std::shared_ptr<Chunk_NS::Chunk>>& chunks_owner,
@@ -142,13 +142,6 @@ class JoinHashTableInterface {
       std::vector<std::shared_ptr<void>>& malloc_owner,
       Executor* executor,
       ColumnCacheMap* column_cache);
-
- protected:
-  using LinearizedColumn = std::pair<const int8_t*, size_t>;
-  using LinearizedColumnCacheKey = std::pair<int, int>;
-  std::map<LinearizedColumnCacheKey, LinearizedColumn> linearized_multifrag_columns_;
-  std::mutex linearized_multifrag_column_mutex_;
-  RowSetMemoryOwner linearized_multifrag_column_owner_;
 
  public:
   //! Decode hash table into a std::set for easy inspection and validation.

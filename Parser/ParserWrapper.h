@@ -28,26 +28,6 @@
 #include <string>
 #include <vector>
 
-#include "Shared/ConfigResolve.h"
-
-enum class CalciteDMLPathSelection : int {
-  Unsupported = 0,
-  OnlyUpdates = 1,
-  OnlyDeletes = 2,
-  UpdatesAndDeletes = 3,
-};
-
-constexpr inline CalciteDMLPathSelection yield_dml_path_selector() {
-  int selector = 0;
-  if (std::is_same<CalciteDeletePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x02;
-  }
-  if (std::is_same<CalciteUpdatePathSelector, PreprocessorTrue>::value) {
-    selector |= 0x01;
-  }
-  return static_cast<CalciteDMLPathSelection>(selector);
-}
-
 struct ExplainInfo {
   bool explain;
   bool explain_optimized;
@@ -68,6 +48,8 @@ class ParserWrapper {
 
   enum class ExplainType { None, IR, OptimizedIR, Calcite, ExecutionPlan, Other };
 
+  enum class QueryType { Unknown, Read, Write, SchemaRead, SchemaWrite };
+
   ParserWrapper(std::string query_string);
   std::string process(std::string user,
                       std::string passwd,
@@ -86,6 +68,7 @@ class ParserWrapper {
   bool is_copy_to = false;
   bool is_optimize = false;
   bool is_validate = false;
+  bool is_exec_ra = false;
   std::string actual_query;
 
   DMLType getDMLType() const { return dml_type_; }
@@ -93,6 +76,8 @@ class ParserWrapper {
   ExplainInfo getExplainInfo() const;
 
   ExplainType getExplainType() const { return explain_type_; }
+
+  QueryType getQueryType() const { return query_type_; }
 
   bool isCalciteExplain() const { return explain_type_ == ExplainType::Calcite; }
 
@@ -118,22 +103,10 @@ class ParserWrapper {
 
   bool isCalcitePermissableDml(bool read_only_mode) {
     if (read_only_mode) {
-      return !is_update_dml;  // If we're read-only, no DML is permissable
+      return !is_update_dml;  // If we're read-only, no update/delete DML is permissable
     }
-
-    // TODO: A good place for if-constexpr
-    switch (yield_dml_path_selector()) {
-      case CalciteDMLPathSelection::OnlyUpdates:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::OnlyDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete);
-      case CalciteDMLPathSelection::UpdatesAndDeletes:
-        return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete) ||
-               (getDMLType() == ParserWrapper::DMLType::Update);
-      case CalciteDMLPathSelection::Unsupported:
-      default:
-        return false;
-    }
+    return !is_update_dml || (getDMLType() == ParserWrapper::DMLType::Delete) ||
+           (getDMLType() == ParserWrapper::DMLType::Update);
   }
 
   bool isCalciteDdl() const { return is_calcite_ddl_; }
@@ -141,6 +114,7 @@ class ParserWrapper {
  private:
   DMLType dml_type_ = DMLType::NotDML;
   ExplainType explain_type_ = ExplainType::None;
+  QueryType query_type_ = QueryType::Unknown;
 
   static const std::vector<std::string> ddl_cmd;
   static const std::vector<std::string> update_dml_cmd;
@@ -150,6 +124,7 @@ class ParserWrapper {
   static const std::string plan_explain_str;
   static const std::string optimize_str;
   static const std::string validate_str;
+  static const std::string exec_ra_str;
 
   bool is_legacy_ddl_ = false;
   bool is_calcite_ddl_ = false;

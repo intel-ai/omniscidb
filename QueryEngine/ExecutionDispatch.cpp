@@ -40,14 +40,14 @@ bool needs_skip_result(const ResultSetPtr& res) {
 // column is part of the target expressions, result set iteration needs it alive.
 bool need_to_hold_chunk(const Chunk_NS::Chunk* chunk,
                         const RelAlgExecutionUnit& ra_exe_unit) {
-  CHECK(chunk->get_column_desc());
-  const auto chunk_ti = chunk->get_column_desc()->columnType;
+  CHECK(chunk->getColumnDesc());
+  const auto chunk_ti = chunk->getColumnDesc()->columnType;
   if (chunk_ti.is_array() ||
       (chunk_ti.is_string() && chunk_ti.get_compression() == kENCODING_NONE)) {
     for (const auto target_expr : ra_exe_unit.target_exprs) {
       const auto col_var = dynamic_cast<const Analyzer::ColumnVar*>(target_expr);
-      if (col_var && col_var->get_column_id() == chunk->get_column_desc()->columnId &&
-          col_var->get_table_id() == chunk->get_column_desc()->tableId) {
+      if (col_var && col_var->get_column_id() == chunk->getColumnDesc()->columnId &&
+          col_var->get_table_id() == chunk->getColumnDesc()->tableId) {
         return true;
       }
     }
@@ -85,8 +85,6 @@ void Executor::ExecutionDispatch::runImpl(
                                  : ra_exe_unit_.input_descs[0].getTableId();
   CHECK_EQ(frag_list[0].table_id, outer_table_id);
   const auto& outer_tab_frag_ids = frag_list[0].fragment_ids;
-  VLOG(1) << "outer_table_id=" << outer_table_id
-          << " frag_list=" << shared::printContainer(frag_list);
 
   CHECK_GE(chosen_device_id, 0);
   CHECK_LT(chosen_device_id, max_gpu_count);
@@ -123,7 +121,6 @@ void Executor::ExecutionDispatch::runImpl(
                                                 cat_,
                                                 *chunk_iterators_ptr,
                                                 chunks);
-    VLOG(1) << "fetch_result=" << fetch_result;
     if (fetch_result.num_rows.empty()) {
       return;
     }
@@ -166,7 +163,6 @@ void Executor::ExecutionDispatch::runImpl(
             target_exprs_to_infos(ra_exe_unit_.target_exprs, *query_mem_desc),
             executor_});
     std::lock_guard<std::mutex> lock(reduce_mutex_);
-    VLOG(2) << "device_results->rowCount()=" << device_results->rowCount();
     all_fragment_results_.emplace_back(std::move(device_results), outer_tab_frag_ids);
     return;
   }
@@ -270,9 +266,8 @@ void Executor::ExecutionDispatch::runImpl(
                                             do_render ? render_info_ : nullptr);
   }
   if (device_results) {
-    VLOG(2) << "device_results->rowCount()=" << device_results->rowCount();
     std::list<std::shared_ptr<Chunk_NS::Chunk>> chunks_to_hold;
-    for (const auto chunk : chunks) {
+    for (const auto& chunk : chunks) {
       if (need_to_hold_chunk(chunk.get(), ra_exe_unit_)) {
         chunks_to_hold.push_back(chunk);
       }
@@ -288,6 +283,7 @@ void Executor::ExecutionDispatch::runImpl(
   {
     std::lock_guard<std::mutex> lock(reduce_mutex_);
     if (!needs_skip_result(device_results)) {
+      device_results->setOuterTableId(outer_table_id);
       all_fragment_results_.emplace_back(std::move(device_results), outer_tab_frag_ids);
     }
   }
@@ -372,9 +368,9 @@ void Executor::ExecutionDispatch::run(const ExecutorDeviceType chosen_device_typ
             frag_list,
             kernel_dispatch_mode,
             rowid_lookup_key);
-  } catch (const std::bad_alloc& e) {
-    throw QueryExecutionError(ERR_OUT_OF_CPU_MEM, e.what());
   } catch (const OutOfHostMemory& e) {
+    throw QueryExecutionError(ERR_OUT_OF_CPU_MEM, e.what());
+  } catch (const std::bad_alloc& e) {
     throw QueryExecutionError(ERR_OUT_OF_CPU_MEM, e.what());
   } catch (const OutOfRenderMemory& e) {
     throw QueryExecutionError(ERR_OUT_OF_RENDER_MEM, e.what());

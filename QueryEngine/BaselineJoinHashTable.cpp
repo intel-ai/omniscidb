@@ -512,7 +512,7 @@ std::pair<size_t, size_t> BaselineJoinHashTable::approximateTupleCount(
 }
 
 BaselineJoinHashTable::ColumnsForDevice BaselineJoinHashTable::fetchColumnsForDevice(
-    const std::deque<Fragmenter_Namespace::FragmentInfo>& fragments,
+    const std::vector<Fragmenter_Namespace::FragmentInfo>& fragments,
     const int device_id,
     ThrustAllocator& dev_buff_owner) {
   const auto effective_memory_level = getEffectiveMemoryLevel(inner_outer_pairs_);
@@ -1230,6 +1230,13 @@ void BaselineJoinHashTable::initHashTableOnCpuFromCache(const HashTableCacheKey&
 }
 
 void BaselineJoinHashTable::putHashTableOnCpuToCache(const HashTableCacheKey& key) {
+  for (auto chunk_key : key.chunk_keys) {
+    CHECK_GE(chunk_key.size(), size_t(2));
+    if (chunk_key[1] < 0) {
+      return;
+    }
+  }
+
   std::lock_guard<std::mutex> hash_table_cache_lock(hash_table_cache_mutex_);
   VLOG(1) << "Storing hash table in cache.";
   for (const auto& kv : hash_table_cache_) {
@@ -1245,6 +1252,14 @@ void BaselineJoinHashTable::putHashTableOnCpuToCache(const HashTableCacheKey& ke
 
 std::pair<ssize_t, size_t> BaselineJoinHashTable::getApproximateTupleCountFromCache(
     const HashTableCacheKey& key) const {
+  for (auto chunk_key : key.chunk_keys) {
+    CHECK_GE(chunk_key.size(), size_t(2));
+    if (chunk_key[1] < 0) {
+      return std::make_pair(-1, 0);
+      ;
+    }
+  }
+
   std::lock_guard<std::mutex> hash_table_cache_lock(hash_table_cache_mutex_);
   for (const auto& kv : hash_table_cache_) {
     if (kv.first == key) {
@@ -1289,6 +1304,12 @@ std::mutex HashTypeCache::hash_type_cache_mutex_;
 
 void HashTypeCache::set(const std::vector<ChunkKey>& key,
                         const JoinHashTableInterface::HashType hash_type) {
+  for (auto chunk_key : key) {
+    CHECK_GE(chunk_key.size(), size_t(2));
+    if (chunk_key[1] < 0) {
+      return;
+    }
+  }
   std::lock_guard<std::mutex> hash_type_cache_lock(hash_type_cache_mutex_);
   hash_type_cache_[key] = hash_type;
 }

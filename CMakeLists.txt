@@ -84,7 +84,7 @@ if(PREFER_STATIC_LIBS)
 else()
   add_definitions("-DBOOST_LOG_DYN_LINK")
 endif()
-
+link_libraries(z)
 # Required for macOS with Boost 1.71.0+
 # See https://gitlab.kitware.com/cmake/cmake/issues/19714
 set(Boost_NO_BOOST_CMAKE 1)
@@ -92,21 +92,6 @@ set(Boost_NO_BOOST_CMAKE 1)
 option(ENABLE_JAVA_REMOTE_DEBUG "Enable Java Remote Debug" OFF )
 if(ENABLE_JAVA_REMOTE_DEBUG)
   add_definitions("-DENABLE_JAVA_REMOTE_DEBUG")
-endif()
-
-option(ENABLE_VARLEN_UPDATE "Enable varlen updates" ON )
-if( ENABLE_VARLEN_UPDATE )
-  add_definitions("-DENABLE_VARLEN_UPDATE")
-endif()
-
-option(ENABLE_CALCITE_UPDATE_PATH "Enable Calcite Update Path" ON)
-if( ENABLE_CALCITE_UPDATE_PATH )
-  add_definitions("-DCALCITE_UPDATE_ENABLED")
-endif()
-
-option(ENABLE_CALCITE_DELETE_PATH "Enable Calcite Delete Path" ON)
-if( ENABLE_CALCITE_DELETE_PATH )
-  add_definitions("-DCALCITE_DELETE_ENABLED")
 endif()
 
 option(ENABLE_CUDA "Enable CUDA support" ON)
@@ -193,14 +178,8 @@ if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
 endif()
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/bin)
-if(APPLE OR ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
-    AND (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 3.6 OR CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL 3.6))
-    OR ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 4.9))
-  find_package( Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale REQUIRED )
-else()
-  message(FATAL_ERROR, "GCC v4.9 or clang v3.6 (or newer) is required")
-endif()
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4=1 -D__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8=1 -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
 endif()
@@ -213,23 +192,11 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
 endif()
 
-option(ENABLE_LLVM_DBG "switch to local debug version of llvm" OFF)
-if(ENABLE_LLVM_DBG)
-  # NOTE: specify LLVM_BIN_DIR to use your local llvm
-  if(XCODE)
-    set(LLVM_BIN_DIR ${CMAKE_SOURCE_DIR}/../llvm/build/xcode/Release/bin)
-  elseif(APPLE)
-    set(LLVM_BIN_DIR ${CMAKE_SOURCE_DIR}/../llvm/build/unix/bin)
-  endif()
-  set(llvm_config_cmd "${LLVM_BIN_DIR}/llvm-config")
-else()
-  set(llvm_config_cmd llvm-config)
-endif()
-
 # address and thread sanitizer
 option(ENABLE_STANDALONE_CALCITE "Require standalone Calcite server" OFF)
 option(ENABLE_ASAN "Enable address sanitizer" OFF)
 option(ENABLE_TSAN "Enable thread sanitizer" OFF)
+option(ENABLE_UBSAN "Enable undefined behavior sanitizer" OFF)
 if(ENABLE_ASAN)
   set(SAN_FLAGS "-fsanitize=address -O1 -fno-omit-frame-pointer")
   add_definitions("-DWITH_DECODERS_BOUNDS_CHECKING")
@@ -240,11 +207,22 @@ elseif(ENABLE_TSAN)
   set(SAN_FLAGS "-fsanitize=thread -fPIC -O1 -fno-omit-frame-pointer")
   # required for older GCC, see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=64354
   add_definitions("-D__SANITIZE_THREAD__")
+elseif(ENABLE_UBSAN)
+  set(SAN_FLAGS "-fsanitize=undefined -fPIC -O1 -fno-omit-frame-pointer")
 endif()
-if(ENABLE_ASAN OR ENABLE_TSAN)
+if(ENABLE_ASAN OR ENABLE_TSAN OR ENABLE_UBSAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SAN_FLAGS}")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SAN_FLAGS}")
   set(ENABLE_STANDALONE_CALCITE ON)
+endif()
+
+# Embedded database
+option(ENABLE_DBE "Enable embedded database" OFF)
+if(ENABLE_DBE)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+  set(ENABLE_STANDALONE_CALCITE ON)
+  add_definitions("-DENABLE_EMBEDDED_DATABASE")
 endif()
 
 # Code coverage
@@ -266,36 +244,38 @@ if(ENABLE_STANDALONE_CALCITE)
   add_definitions("-DSTANDALONE_CALCITE")
 endif()
 
-set(llvm_config_inc_arg "--includedir")
-set(llvm_config_ld_arg "--ldflags")
-set(llvm_config_lib_arg "--libs")
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_inc_arg}
-    OUTPUT_VARIABLE LLVM_INC_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_lib_arg}
-    OUTPUT_VARIABLE LLVM_LIB_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_ld_arg}
-    OUTPUT_VARIABLE LLVM_LD_FLAGS)
-if(ENABLE_LLVM_DBG)
-  set(llvm_config_obj_arg "--obj-root")
-  execute_process(COMMAND ${llvm_config_cmd} ${llvm_config_obj_arg}
-    OUTPUT_VARIABLE LLVM_BUILD_DIR)
-  string(REPLACE "\n" "" LLVM_BUILD_DIR "${LLVM_BUILD_DIR}")
-  list(APPEND LLVM_INC_FLAGS "${LLVM_BUILD_DIR}/include")
-endif()
-
-if(NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")  # work around linker on centos
-  string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
-else()
-  string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS}")
-endif()
-string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
-include_directories(${Boost_INCLUDE_DIR}
-                    "/usr/local/include"
-                    ${CMAKE_SOURCE_DIR}
+include_directories(${CMAKE_SOURCE_DIR}
                     ${CMAKE_SOURCE_DIR}/Parser
-                    ${CMAKE_CURRENT_BINARY_DIR}
-                    ${LLVM_INC_FLAGS}
-                    "/usr/local/cuda/include/")
+                    ${CMAKE_CURRENT_BINARY_DIR})
+
+## Dependencies
+
+# LLVM
+set(llvm_config_cmd llvm-config)
+
+execute_process(COMMAND ${llvm_config_cmd} "--includedir" OUTPUT_VARIABLE LLVM_INC_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--libs" OUTPUT_VARIABLE LLVM_LIB_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--ldflags" OUTPUT_VARIABLE LLVM_LD_FLAGS)
+execute_process(COMMAND ${llvm_config_cmd} "--version" OUTPUT_VARIABLE LLVM_VERSION_STR)
+string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR ${LLVM_VERSION_STR})
+
+string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
+string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
+
+include_directories(${LLVM_INC_FLAGS})
+
+# Boost
+find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale REQUIRED)
+include_directories(${Boost_INCLUDE_DIR})
+
+# CUDA architecture flags 
+set (CUDA_COMPILATION_ARCH
+  -gencode=arch=compute_35,code=compute_35
+  -gencode=arch=compute_50,code=compute_50
+  -gencode=arch=compute_60,code=compute_60
+  -gencode=arch=compute_70,code=compute_70
+  -gencode=arch=compute_75,code=compute_75
+)
 
 # EGL
 include_directories(ThirdParty/egl)
@@ -341,7 +321,6 @@ include_directories(ThirdParty/rapidjson)
 add_definitions(-DRAPIDJSON_HAS_STDSTRING)
 
 # Linenoise
-include_directories(ThirdParty/linenoise)
 add_subdirectory(ThirdParty/linenoise)
 
 # SQLite
@@ -404,37 +383,43 @@ if(ENABLE_TBB)
 endif()
 
 add_custom_command(
-    DEPENDS ${CMAKE_SOURCE_DIR}/omnisci.thrift
-    DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
-    DEPENDS ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
-    OUTPUT
-        ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
-        ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
-        ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
-    COMMAND ${Thrift_EXECUTABLE}
-    ARGS -gen cpp -r -o ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/omnisci.thrift)
-list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/gen-cpp/)
-
-add_library(mapd_thrift
+  DEPENDS
+    ${CMAKE_SOURCE_DIR}/omnisci.thrift
+    ${CMAKE_SOURCE_DIR}/common.thrift
+    ${CMAKE_SOURCE_DIR}/completion_hints.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/serialized_result_set.thrift
+    ${CMAKE_SOURCE_DIR}/QueryEngine/extension_functions.thrift
+  OUTPUT
     ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
     ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
     ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
-    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp)
+    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
+    ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
+  COMMAND ${Thrift_EXECUTABLE}
+  ARGS -gen cpp -r -o ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/omnisci.thrift)
+list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/gen-cpp/)
+
+add_library(mapd_thrift
+  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/OmniSci.h
+  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/omnisci_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/common_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/common_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/completion_hints_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/serialized_result_set_types.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_constants.cpp
+  ${CMAKE_BINARY_DIR}/gen-cpp/extension_functions_types.cpp
+)
 
 target_compile_options(mapd_thrift PRIVATE -fPIC)
 target_link_libraries(mapd_thrift ${Thrift_LIBRARIES})
@@ -508,7 +493,6 @@ add_subdirectory(CudaMgr)
 add_subdirectory(LockMgr)
 add_subdirectory(MigrationMgr)
 add_subdirectory(Fragmenter)
-add_subdirectory(Chunk)
 add_subdirectory(Shared)
 add_subdirectory(Utils)
 add_subdirectory(QueryRunner)
@@ -518,12 +502,16 @@ add_subdirectory(ThriftHandler)
 
 add_subdirectory(Distributed)
 
+if(ENABLE_DBE)
+  add_subdirectory(Embedded)
+endif()
+
 option(ENABLE_ODBC "Build ODBC driver" OFF)
 if(ENABLE_ODBC)
   add_subdirectory(ODBC)
 endif()
 
-set(MAPD_LIBRARIES Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer CsvImport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter Chunk)
+set(MAPD_LIBRARIES Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer CsvImport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter)
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   list(APPEND MAPD_LIBRARIES Distributed)
@@ -577,7 +565,7 @@ endif()
 set(initdb_source_files initdb.cpp)
 add_executable(initdb ${initdb_source_files})
 
-set(omnisci_server_source_files MapDServer.cpp ${CMAKE_BINARY_DIR}/MapDRelease.h ${CMAKE_SOURCE_DIR}/Shared/ConfigResolve.h)
+set(omnisci_server_source_files MapDServer.cpp ${CMAKE_BINARY_DIR}/MapDRelease.h)
 
 add_executable(omnisci_server ${omnisci_server_source_files})
 set_target_properties(omnisci_server PROPERTIES COMPILE_DEFINITIONS "${TIME_LIMITED_DEFINITIONS}")
@@ -644,9 +632,9 @@ add_custom_target(rerun_cmake ALL
   )
 add_dependencies(omnisci_server rerun_cmake)
 
-target_link_libraries(omnisci_server mapd_thrift thrift_handler ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${PROFILER_LIBS} ${CURSES_LIBRARIES} ${ZLIB_LIBRARIES} ${LOCALE_LINK_FLAG})
+target_link_libraries(omnisci_server mapd_thrift thrift_handler ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${PROFILER_LIBS} ${ZLIB_LIBRARIES} ${LOCALE_LINK_FLAG})
 
-target_link_libraries(initdb mapd_thrift DataMgr ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${CURSES_LIBRARIES} ${ZLIB_LIBRARIES})
+target_link_libraries(initdb mapd_thrift DataMgr ${MAPD_LIBRARIES} ${Boost_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${ZLIB_LIBRARIES})
 
 macro(set_dpkg_arch arch_in arch_out)
   if("${arch_in}" STREQUAL "x86_64")
@@ -729,11 +717,11 @@ if(MAPD_IMMERSE_DOWNLOAD)
   install(DIRECTORY ${source_dir}/ DESTINATION "frontend/" PATTERN .git EXCLUDE PATTERN node_modules EXCLUDE)
   add_custom_command(TARGET frontend COMMAND ${CMAKE_COMMAND} -E copy_directory ${source_dir} frontend)
   list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_BINARY_DIR}/frontend)
-endif()
 
-## Go web server
-if("${MAPD_EDITION_LOWER}" STREQUAL "ee" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Immerse")
-  add_subdirectory(Immerse)
+  ## Go web server
+  if("${MAPD_EDITION_LOWER}" STREQUAL "ee" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Immerse")
+    add_subdirectory(Immerse)
+  endif()
 endif()
 
 add_subdirectory(ThirdParty/generate_cert)
@@ -821,7 +809,7 @@ set_directory_properties(PROPERTIES ADDITIONAL_MAKE_CLEAN_FILES "${ADDITIONAL_MA
 install(TARGETS initdb omnisci_server DESTINATION bin)
 install(FILES ${CMAKE_BINARY_DIR}/MAPD_GIT_HASH.txt DESTINATION ".")
 if(ENABLE_CUDA)
-  install(FILES ${CMAKE_BINARY_DIR}/QueryEngine/cuda_mapd_rt.a DESTINATION QueryEngine)
+  install(FILES ${CMAKE_BINARY_DIR}/QueryEngine/cuda_mapd_rt.fatbin DESTINATION QueryEngine)
 endif()
 install(FILES completion_hints.thrift DESTINATION ".")
 install(FILES omnisci.thrift DESTINATION ".")
@@ -852,7 +840,12 @@ install(PROGRAMS insert_sample_data DESTINATION ".")
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   install(DIRECTORY docker/sds DESTINATION "docker")
 endif()
-install(FILES docker/Dockerfile docker/Dockerfile.mapd docker/README.md DESTINATION "docker")
+install(FILES docker/README.md DESTINATION "docker")
+if(ENABLE_CUDA)
+  install(FILES docker/Dockerfile.cuda RENAME Dockerfile DESTINATION "docker")
+else()
+  install(FILES docker/Dockerfile.cpu RENAME Dockerfile DESTINATION "docker")
+endif()
 
 execute_process(
   COMMAND ln -sf omnisql mapdql

@@ -1,12 +1,29 @@
 #include <cuda.h>
 #include <float.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <limits>
 #include "BufferCompaction.h"
 #include "ExtensionFunctions.hpp"
 #include "GpuRtConstants.h"
 #include "HyperLogLogRank.h"
 #include "TableFunctions/TableFunctions.hpp"
+
+#if CUDA_VERSION < 10000
+static_assert(false, "CUDA v10.0 or later is required.");
+#endif
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 350)
+static_assert(false, "CUDA Compute Capability of 3.5 or greater is required.");
+#endif
+
+extern "C" __device__ int64_t get_thread_index() {
+  return threadIdx.x;
+}
+
+extern "C" __device__ int64_t get_block_index() {
+  return blockIdx.x;
+}
 
 extern "C" __device__ int32_t pos_start_impl(const int32_t* row_index_resume) {
   return blockIdx.x * blockDim.x + threadIdx.x;
@@ -33,117 +50,34 @@ extern "C" __device__ const int64_t* init_shared_mem_nop(
 extern "C" __device__ void write_back_nop(int64_t* dest, int64_t* src, const int32_t sz) {
 }
 
-extern "C" __device__ const int64_t* init_shared_mem(const int64_t* groups_buffer,
+/*
+ * Just declares and returns a dynamic shared memory pointer. Total size should be
+ * properly set during kernel launch
+ */
+extern "C" __device__ int64_t* declare_dynamic_shared_memory() {
+  extern __shared__ int64_t shared_mem_buffer[];
+  return shared_mem_buffer;
+}
+
+/**
+ * Initializes the shared memory buffer for perfect hash group by.
+ * In this function, we simply copy the global group by buffer (already initialized on the
+ * host and transferred) to all shared memory group by buffers.
+ */
+extern "C" __device__ const int64_t* init_shared_mem(const int64_t* global_groups_buffer,
                                                      const int32_t groups_buffer_size) {
-  extern __shared__ int64_t fast_bins[];
-  if (threadIdx.x == 0) {
-    memcpy(fast_bins, groups_buffer, groups_buffer_size);
+  // dynamic shared memory declaration
+  extern __shared__ int64_t shared_groups_buffer[];
+
+  // it is assumed that buffer size is aligned with 64-bit units
+  // so it is safe to assign 64-bit to each thread
+  const int32_t buffer_units = groups_buffer_size >> 3;
+
+  for (int32_t pos = threadIdx.x; pos < buffer_units; pos += blockDim.x) {
+    shared_groups_buffer[pos] = global_groups_buffer[pos];
   }
   __syncthreads();
-  return fast_bins;
-}
-
-/**
- * Dynamically allocates shared memory per block.
- * The amount of shared memory allocated is defined at kernel launch time.
- * Returns a pointer to the beginning of allocated shared memory
- */
-extern "C" __device__ int64_t* alloc_shared_mem_dynamic() {
-  extern __shared__ int64_t groups_buffer_smem[];
-  return groups_buffer_smem;
-}
-
-/**
- * Set the allocated shared memory elements to be equal to the 'identity_element'.
- * groups_buffer_size: number of 64-bit elements in shared memory per thread-block
- * NOTE: groups_buffer_size is in units of 64-bit elements.
- */
-extern "C" __device__ void set_shared_mem_to_identity(
-    int64_t* groups_buffer_smem,
-    const int32_t groups_buffer_size,
-    const int64_t identity_element = 0) {
-#pragma unroll
-  for (int i = threadIdx.x; i < groups_buffer_size; i += blockDim.x) {
-    groups_buffer_smem[i] = identity_element;
-  }
-  __syncthreads();
-}
-
-/**
- * Initialize dynamic shared memory:
- * 1. Allocates dynamic shared memory
- * 2. Set every allocated element to be equal to the 'identity element', by default zero.
- */
-extern "C" __device__ const int64_t* init_shared_mem_dynamic(
-    const int64_t* groups_buffer,
-    const int32_t groups_buffer_size) {
-  int64_t* groups_buffer_smem = alloc_shared_mem_dynamic();
-  set_shared_mem_to_identity(groups_buffer_smem, groups_buffer_size);
-  return groups_buffer_smem;
-}
-
-extern "C" __device__ void write_back(int64_t* dest, int64_t* src, const int32_t sz) {
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    memcpy(dest, src, sz);
-  }
-}
-
-extern "C" __device__ void write_back_smem_nop(int64_t* dest,
-                                               int64_t* src,
-                                               const int32_t sz) {}
-
-extern "C" __device__ void agg_from_smem_to_gmem_nop(int64_t* gmem_dest,
-                                                     int64_t* smem_src,
-                                                     const int32_t num_elements) {}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the stored bin ID, to be written back][32..63: the count result, to be
- * aggregated]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_binId_count(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t bin_id = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t count_result = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1,
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *reinterpret_cast<unsigned int*>(gmem_dest + i) = static_cast<int32_t>(bin_id);
-    }
-  }
-}
-
-/**
- * Aggregate the result stored into shared memory back into global memory.
- * It also writes back the stored binId, if any, back into global memory.
- * Memory layout assumption: each 64-bit shared memory unit of data is as follows:
- * [0..31: the count result, to be aggregated][32..63: the stored bin ID, to be written
- * back]
- */
-extern "C" __device__ void agg_from_smem_to_gmem_count_binId(int64_t* gmem_dest,
-                                                             int64_t* smem_src,
-                                                             const int32_t num_elements) {
-  __syncthreads();
-#pragma unroll
-  for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    int32_t count_result = *reinterpret_cast<int32_t*>(smem_src + i);
-    int32_t bin_id = *(reinterpret_cast<int32_t*>(smem_src + i) + 1);
-    if (count_result) {  // non-zero count
-      atomicAdd(reinterpret_cast<unsigned int*>(gmem_dest + i),
-                static_cast<int32_t>(count_result));
-      // writing back the binId, only if count_result is non-zero
-      *(reinterpret_cast<unsigned int*>(gmem_dest + i) + 1) =
-          static_cast<int32_t>(bin_id);
-    }
-  }
+  return shared_groups_buffer;
 }
 
 #define init_group_by_buffer_gpu_impl init_group_by_buffer_gpu
@@ -419,9 +353,7 @@ __device__ int64_t atomicMin64(int64_t* address, int64_t val) {
   return old;
 }
 
-// As of 20160418, CUDA 8.0EA only defines `atomicAdd(double*, double)` for compute
-// capability >= 6.0.
-#if CUDA_VERSION < 8000 || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600)
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600)
 __device__ double atomicAdd(double* address, double val) {
   unsigned long long int* address_as_ull = (unsigned long long int*)address;
   unsigned long long int old = *address_as_ull, assumed;
@@ -553,8 +485,21 @@ extern "C" __device__ void agg_min_int32_shared(int32_t* agg, const int32_t val)
   atomicMin(agg, val);
 }
 
-// TODO(Saman): use 16-bit atomicCAS for Turing
-extern "C" __device__ void atomicMax16(int16_t* agg, const int16_t val) {
+#if CUDA_VERSION > 10000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+__device__ void atomicMax16(int16_t* agg, const int16_t val) {
+  unsigned short int* address_as_us = reinterpret_cast<unsigned short int*>(agg);
+  unsigned short int old = *address_as_us, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(address_as_us,
+                    assumed,
+                    static_cast<unsigned short>(max(static_cast<short int>(val),
+                                                    static_cast<short int>(assumed))));
+  } while (assumed != old);
+}
+#else
+__device__ void atomicMax16(int16_t* agg, const int16_t val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -574,8 +519,9 @@ extern "C" __device__ void atomicMax16(int16_t* agg, const int16_t val) {
     old_value = atomicCAS(base_address_u32, compare_value, swap_value);
   } while (old_value != compare_value);
 }
+#endif
 
-extern "C" __device__ void atomicMax8(int8_t* agg, const int8_t val) {
+__device__ void atomicMax8(int8_t* agg, const int8_t val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -601,7 +547,21 @@ extern "C" __device__ void atomicMax8(int8_t* agg, const int8_t val) {
   } while (compare_value != old_value);
 }
 
-extern "C" __device__ void atomicMin16(int16_t* agg, const int16_t val) {
+#if CUDA_VERSION > 10000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+__device__ void atomicMin16(int16_t* agg, const int16_t val) {
+  unsigned short int* address_as_us = reinterpret_cast<unsigned short int*>(agg);
+  unsigned short int old = *address_as_us, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(address_as_us,
+                    assumed,
+                    static_cast<unsigned short>(min(static_cast<short int>(val),
+                                                    static_cast<short int>(assumed))));
+  } while (assumed != old);
+}
+#else
+__device__ void atomicMin16(int16_t* agg, const int16_t val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -621,10 +581,11 @@ extern "C" __device__ void atomicMin16(int16_t* agg, const int16_t val) {
     old_value = atomicCAS(base_address_u32, compare_value, swap_value);
   } while (old_value != compare_value);
 }
+#endif
 
-extern "C" __device__ void atomicMin16SkipVal(int16_t* agg,
-                                              const int16_t val,
-                                              const int16_t skip_val) {
+__device__ void atomicMin16SkipVal(int16_t* agg,
+                                   const int16_t val,
+                                   const int16_t skip_val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -650,7 +611,7 @@ extern "C" __device__ void atomicMin16SkipVal(int16_t* agg,
   } while (old_value != compare_value);
 }
 
-extern "C" __device__ void atomicMin8(int8_t* agg, const int8_t val) {
+__device__ void atomicMin8(int8_t* agg, const int8_t val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -670,9 +631,7 @@ extern "C" __device__ void atomicMin8(int8_t* agg, const int8_t val) {
   } while (compare_value != old_value);
 }
 
-extern "C" __device__ void atomicMin8SkipVal(int8_t* agg,
-                                             const int8_t val,
-                                             const int8_t skip_val) {
+__device__ void atomicMin8SkipVal(int8_t* agg, const int8_t val, const int8_t skip_val) {
   // properly align the input pointer:
   unsigned int* base_address_u32 =
       reinterpret_cast<unsigned int*>(reinterpret_cast<size_t>(agg) & ~0x3);
@@ -1129,31 +1088,16 @@ extern "C" __device__ void agg_min_double_skip_val_shared(int64_t* agg,
   }
 }
 
-__device__ double atomicMaxDblSkipVal(double* address,
-                                      double val,
-                                      const double skip_val) {
-  unsigned long long int* address_as_ull = (unsigned long long int*)address;
-  unsigned long long int old = *address_as_ull;
-  unsigned long long int skip_val_as_ull = *((unsigned long long int*)&skip_val);
-  unsigned long long int assumed;
-
-  do {
-    assumed = old;
-    old = atomicCAS(address_as_ull,
-                    assumed,
-                    assumed == skip_val_as_ull
-                        ? *((unsigned long long int*)&val)
-                        : __double_as_longlong(max(val, __longlong_as_double(assumed))));
-  } while (assumed != old);
-
-  return __longlong_as_double(old);
-}
-
 extern "C" __device__ void agg_max_double_skip_val_shared(int64_t* agg,
                                                           const double val,
                                                           const double skip_val) {
-  if (val != skip_val) {
-    atomicMaxDblSkipVal(reinterpret_cast<double*>(agg), val, skip_val);
+  if (__double_as_longlong(val) != __double_as_longlong(skip_val)) {
+    double old = __longlong_as_double(atomicExch(
+        reinterpret_cast<unsigned long long int*>(agg), __double_as_longlong(-DBL_MAX)));
+    atomicMax(reinterpret_cast<double*>(agg),
+              __double_as_longlong(old) == __double_as_longlong(skip_val)
+                  ? val
+                  : fmax(old, val));
   }
 }
 
@@ -1186,7 +1130,7 @@ extern "C" __device__ bool slotEmptyKeyCAS_int32(int32_t* slot,
   const unsigned int old_value = atomicCAS(slot_address, compare_value, swap_value);
   return old_value == compare_value;
 }
-#include <stdio.h>
+
 extern "C" __device__ bool slotEmptyKeyCAS_int16(int16_t* slot,
                                                  int16_t new_val,
                                                  int16_t init_val) {
@@ -1334,24 +1278,40 @@ extern "C" __device__ void force_sync() {
 }
 
 extern "C" __device__ void sync_warp() {
-#if (CUDA_VERSION >= 9000)
   __syncwarp();
-#endif
 }
 
 /**
  * Protected warp synchornization to make sure all (or none) threads within a warp go
  * through a synchronization barrier. thread_pos: the current thread position to be used
  * for a memory access row_count: maximum number of rows to be processed The function
- * performs warp sync iff all 32 threads within that warp will process valid data NOTE: it
- * currently assumes that warp size is 32.
+ * performs warp sync iff all 32 threads within that warp will process valid data NOTE:
+ * it currently assumes that warp size is 32.
  */
 extern "C" __device__ void sync_warp_protected(int64_t thread_pos, int64_t row_count) {
-#if (CUDA_VERSION >= 9000)
   // only syncing if NOT within the same warp as those threads experiencing the critical
   // edge
   if ((((row_count - 1) | 0x1F) - thread_pos) >= 32) {
     __syncwarp();
   }
-#endif
+}
+
+extern "C" __device__ void sync_threadblock() {
+  __syncthreads();
+}
+
+/*
+ * Currently, we just use this function for handling non-grouped aggregates
+ * with COUNT queries (with GPU shared memory used). Later, we should generate code for
+ * this depending on the type of aggregate functions.
+ * TODO: we should use one contiguous global memory buffer, rather than current default
+ * behaviour of multiple buffers, each for one aggregate. Once that's resolved, we can
+ * do much cleaner than this function
+ */
+extern "C" __device__ void write_back_non_grouped_agg(int64_t* input_buffer,
+                                                      int64_t* output_buffer,
+                                                      const int32_t agg_idx) {
+  if (threadIdx.x == agg_idx) {
+    agg_sum_shared(output_buffer, input_buffer[agg_idx]);
+  }
 }

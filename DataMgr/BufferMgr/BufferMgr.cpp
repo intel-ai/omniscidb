@@ -51,9 +51,9 @@ BufferMgr::BufferMgr(const int device_id,
                      AbstractBufferMgr* parent_mgr)
     : AbstractBufferMgr(device_id)
     , page_size_(page_size)
+    , max_slab_size_(max_slab_size)
     , max_buffer_size_(max_buffer_size)
     , num_pages_allocated_(0)
-    , max_slab_size_(max_slab_size)
     , allocations_capped_(false)
     , parent_mgr_(parent_mgr)
     , max_buffer_id_(0)
@@ -864,14 +864,12 @@ size_t BufferMgr::getMaxSlabSize() {
   return max_slab_size_;
 }
 
-void BufferMgr::getChunkMetadataVec(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec) {
+void BufferMgr::getChunkMetadataVec(ChunkMetadataVector& chunk_metadata_vec) {
   LOG(FATAL) << "getChunkMetadataVec not supported for BufferMgr.";
 }
 
-void BufferMgr::getChunkMetadataVecForKeyPrefix(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vec,
-    const ChunkKey& key_prefix) {
+void BufferMgr::getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunk_metadata_vec,
+                                                const ChunkKey& key_prefix) {
   LOG(FATAL) << "getChunkMetadataVecForPrefix not supported for BufferMgr.";
 }
 

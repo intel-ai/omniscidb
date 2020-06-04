@@ -61,7 +61,7 @@ std::shared_ptr<Analyzer::Expr> ColumnVar::deep_copy() const {
 }
 
 void ExpressionTuple::collect_rte_idx(std::set<int>& rte_idx_set) const {
-  for (const auto column : tuple_) {
+  for (const auto& column : tuple_) {
     column->collect_rte_idx(rte_idx_set);
   }
 }
@@ -202,7 +202,7 @@ std::shared_ptr<Analyzer::Expr> WindowFunction::deep_copy() const {
 
 ExpressionPtr ArrayExpr::deep_copy() const {
   return makeExpr<Analyzer::ArrayExpr>(
-      type_info, contained_expressions_, expr_index_, is_null_, local_alloc_);
+      type_info, contained_expressions_, is_null_, local_alloc_);
 }
 
 std::shared_ptr<Analyzer::Expr> GeoExpr::deep_copy() const {
@@ -3015,7 +3015,7 @@ bool FunctionOper::operator==(const Expr& rhs) const {
 
 std::string FunctionOper::toString() const {
   std::string str{"(" + name_ + " "};
-  for (const auto arg : args_) {
+  for (const auto& arg : args_) {
     str += arg->toString();
   }
   str += ")";

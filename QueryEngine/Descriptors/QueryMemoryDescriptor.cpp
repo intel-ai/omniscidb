@@ -23,6 +23,8 @@
 #include "../UsedColumnsVisitor.h"
 #include "ColSlotContext.h"
 
+#include "Shared/sql_type_to_string.h"
+
 bool g_enable_smem_group_by{true};
 extern bool g_enable_columnar_output;
 
@@ -131,7 +133,7 @@ int8_t pick_baseline_key_width(const RelAlgExecutionUnit& ra_exe_unit,
                                const std::vector<InputTableInfo>& query_infos,
                                const Executor* executor) {
   int8_t compact_width{4};
-  for (const auto groupby_expr : ra_exe_unit.groupby_exprs) {
+  for (const auto& groupby_expr : ra_exe_unit.groupby_exprs) {
     const auto expr_range = getExpressionRange(groupby_expr.get(), query_infos, executor);
     compact_width = std::max(compact_width,
                              pick_baseline_key_component_width(
@@ -227,8 +229,6 @@ std::unique_ptr<QueryMemoryDescriptor> QueryMemoryDescriptor::init(
         /*group_col_compact_width=*/0,
         std::vector<ssize_t>{},
         /*entry_count=*/1,
-        GroupByMemSharing::Shared,
-        false,
         count_distinct_descriptors,
         false,
         output_columnar_hint,
@@ -239,10 +239,8 @@ std::unique_ptr<QueryMemoryDescriptor> QueryMemoryDescriptor::init(
 
   size_t entry_count = 1;
   auto actual_col_range_info = col_range_info;
-  auto sharing = GroupByMemSharing::Shared;
   bool interleaved_bins_on_gpu = false;
   bool keyless_hash = false;
-  bool shared_mem_for_group_by = false;
   bool streaming_top_n = false;
   int8_t group_col_compact_width = 0;
   int32_t idx_target_as_key = -1;
@@ -276,44 +274,12 @@ std::unique_ptr<QueryMemoryDescriptor> QueryMemoryDescriptor::init(
             GroupByAndAggregate::getBucketedCardinality(col_range_info), int64_t(1));
         const size_t interleaved_max_threshold{512};
 
-        size_t gpu_smem_max_threshold{0};
-        if (device_type == ExecutorDeviceType::GPU) {
-          const auto cuda_mgr = executor->getCatalog()->getDataMgr().getCudaMgr();
-          CHECK(cuda_mgr);
-          /*
-           *  We only use shared memory strategy if GPU hardware provides native shared
-           *memory atomics support. From CUDA Toolkit documentation:
-           *https://docs.nvidia.com/cuda/pascal-tuning-guide/index.html#atomic-ops "Like
-           *Maxwell, Pascal [and Volta] provides native shared memory atomic operations
-           *for 32-bit integer arithmetic, along with native 32 or 64-bit compare-and-swap
-           *(CAS)."
-           *
-           **/
-          if (cuda_mgr->isArchMaxwellOrLaterForAll()) {
-            // TODO(Saman): threshold should be eventually set as an optimized policy per
-            // architecture.
-            gpu_smem_max_threshold =
-                std::min((cuda_mgr->isArchVoltaForAll()) ? 4095LU : 2047LU,
-                         (cuda_mgr->getMaxSharedMemoryForAll() / sizeof(int64_t) - 1));
-          }
-        }
-
         if (must_use_baseline_sort) {
           target_groupby_indices = target_expr_group_by_indices(ra_exe_unit.groupby_exprs,
                                                                 ra_exe_unit.target_exprs);
           col_slot_context =
               ColSlotContext(ra_exe_unit.target_exprs, target_groupby_indices);
         }
-
-        const auto group_expr = ra_exe_unit.groupby_exprs.front().get();
-        shared_mem_for_group_by =
-            g_enable_smem_group_by && keyless_hash && keyless_info.shared_mem_support &&
-            (entry_count <= gpu_smem_max_threshold) &&
-            (GroupByAndAggregate::supportedExprForGpuSharedMemUsage(group_expr)) &&
-            QueryMemoryDescriptor::countDescriptorsLogicallyEmpty(
-                count_distinct_descriptors) &&
-            !output_columnar;  // TODO(Saman): add columnar support with the new smem
-                               // support.
 
         bool has_varlen_sample_agg = false;
         for (const auto& target_expr : ra_exe_unit.target_exprs) {
@@ -400,8 +366,6 @@ std::unique_ptr<QueryMemoryDescriptor> QueryMemoryDescriptor::init(
       group_col_compact_width,
       target_groupby_indices,
       entry_count,
-      sharing,
-      shared_mem_for_group_by,
       count_distinct_descriptors,
       sort_on_gpu_hint,
       output_columnar,
@@ -424,8 +388,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     const int8_t group_col_compact_width,
     const std::vector<ssize_t>& target_groupby_indices,
     const size_t entry_count,
-    const GroupByMemSharing sharing,
-    const bool shared_mem_for_group_by,
     const CountDistinctDescriptors count_distinct_descriptors,
     const bool sort_on_gpu_hint,
     const bool output_columnar_hint,
@@ -446,7 +408,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     , max_val_(col_range_info.max)
     , bucket_(col_range_info.bucket)
     , has_nulls_(col_range_info.has_nulls)
-    , sharing_(sharing)
     , count_distinct_descriptors_(count_distinct_descriptors)
     , output_columnar_(false)
     , render_output_(render_output)
@@ -457,21 +418,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     , col_slot_context_(col_slot_context) {
   col_slot_context_.setAllUnsetSlotsPaddedSize(8);
   col_slot_context_.validate();
-
-  // TODO(Saman): should remove this after implementing shared memory path
-  // completely through codegen We should not use the current shared memory path if
-  // more than 8 bytes per group is required
-  if (query_desc_type_ == QueryDescriptionType::GroupByPerfectHash &&
-      shared_mem_for_group_by && (getRowSize() <= sizeof(int64_t))) {
-    // TODO(adb / saman): Move this into a different enum so we can remove
-    // GroupByMemSharing
-    sharing_ = GroupByMemSharing::SharedForKeylessOneColumnKnownRange;
-    interleaved_bins_on_gpu_ = false;
-  }
-
-  // Note that output_columnar_ currently defaults to false to avoid issues with
-  // getRowSize above. If output columnar is enable then shared_mem_for_group_by is not,
-  // and the above condition would never be true.
 
   sort_on_gpu_ = sort_on_gpu_hint && canOutputColumnar() && !keyless_hash_;
 
@@ -536,7 +482,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor()
     , max_val_(0)
     , bucket_(0)
     , has_nulls_(false)
-    , sharing_(GroupByMemSharing::Shared)
     , sort_on_gpu_(false)
     , output_columnar_(false)
     , render_output_(false)
@@ -561,7 +506,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(const Executor* executor,
     , max_val_(0)
     , bucket_(0)
     , has_nulls_(false)
-    , sharing_(GroupByMemSharing::Shared)
     , sort_on_gpu_(false)
     , output_columnar_(false)
     , render_output_(false)
@@ -588,7 +532,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(const QueryDescriptionType query_de
     , max_val_(max_val)
     , bucket_(0)
     , has_nulls_(false)
-    , sharing_(GroupByMemSharing::Shared)
     , sort_on_gpu_(false)
     , output_columnar_(false)
     , render_output_(false)
@@ -634,9 +577,6 @@ bool QueryMemoryDescriptor::operator==(const QueryMemoryDescriptor& other) const
     return false;
   }
   if (has_nulls_ != other.has_nulls_) {
-    return false;
-  }
-  if (sharing_ != other.sharing_) {
     return false;
   }
   if (count_distinct_descriptors_.size() != count_distinct_descriptors_.size()) {
@@ -707,7 +647,7 @@ int8_t QueryMemoryDescriptor::pick_target_compact_width(
   int8_t compact_width{0};
   auto col_it = ra_exe_unit.input_col_descs.begin();
   int unnest_array_col_id{std::numeric_limits<int>::min()};
-  for (const auto groupby_expr : ra_exe_unit.groupby_exprs) {
+  for (const auto& groupby_expr : ra_exe_unit.groupby_exprs) {
     const auto uoper = dynamic_cast<Analyzer::UOper*>(groupby_expr.get());
     if (uoper && uoper->get_optype() == kUNNEST) {
       const auto& arg_ti = uoper->get_operand()->get_type_info();
@@ -1066,7 +1006,6 @@ bool QueryMemoryDescriptor::blocksShareMemory() const {
     return true;
   }
   return query_desc_type_ == QueryDescriptionType::GroupByPerfectHash &&
-         !sharedMemBytes(ExecutorDeviceType::GPU) &&
          many_entries(max_val_, min_val_, bucket_);
 }
 
@@ -1079,24 +1018,7 @@ bool QueryMemoryDescriptor::interleavedBins(const ExecutorDeviceType device_type
   return interleaved_bins_on_gpu_ && device_type == ExecutorDeviceType::GPU;
 }
 
-size_t QueryMemoryDescriptor::sharedMemBytes(const ExecutorDeviceType device_type) const {
-  CHECK(device_type == ExecutorDeviceType::CPU || device_type == ExecutorDeviceType::GPU);
-  if (device_type == ExecutorDeviceType::CPU) {
-    return 0;
-  }
-  // if performing keyless aggregate query with a single column group-by:
-  if (sharing_ == GroupByMemSharing::SharedForKeylessOneColumnKnownRange) {
-    CHECK_EQ(getRowSize(),
-             sizeof(int64_t));  // Currently just designed for this scenario
-    size_t shared_mem_size =
-        (/*bin_count=*/entry_count_ + 1) * sizeof(int64_t);  // one extra for NULL values
-    CHECK(shared_mem_size <=
-          executor_->getCatalog()->getDataMgr().getCudaMgr()->getMaxSharedMemoryForAll());
-    return shared_mem_size;
-  }
-  return 0;
-}
-
+// TODO(Saman): an implementation detail, so move this out of QMD
 bool QueryMemoryDescriptor::isWarpSyncRequired(
     const ExecutorDeviceType device_type) const {
   if (device_type != ExecutorDeviceType::GPU) {
@@ -1165,14 +1087,8 @@ bool QueryMemoryDescriptor::canOutputColumnar() const {
          countDescriptorsLogicallyEmpty(count_distinct_descriptors_);
 }
 
-namespace {
-
-inline std::string boolToString(const bool val) {
-  return val ? "True" : "False";
-}
-
-inline std::string queryDescTypeToString(const QueryDescriptionType val) {
-  switch (val) {
+std::string QueryMemoryDescriptor::queryDescTypeToString() const {
+  switch (query_desc_type_) {
     case QueryDescriptionType::GroupByPerfectHash:
       return "Perfect Hash";
     case QueryDescriptionType::GroupByBaselineHash:
@@ -1189,35 +1105,33 @@ inline std::string queryDescTypeToString(const QueryDescriptionType val) {
   return "";
 }
 
-}  // namespace
-
 std::string QueryMemoryDescriptor::toString() const {
   auto str = reductionKey();
-  str += "\tAllow Multifrag: " + boolToString(allow_multifrag_) + "\n";
-  str += "\tInterleaved Bins on GPU: " + boolToString(interleaved_bins_on_gpu_) + "\n";
-  str += "\tBlocks Share Memory: " + boolToString(blocksShareMemory()) + "\n";
-  str += "\tThreads Share Memory: " + boolToString(threadsShareMemory()) + "\n";
-  str += "\tUses Fast Group Values: " + boolToString(usesGetGroupValueFast()) + "\n";
+  str += "\tAllow Multifrag: " + bool_to_string(allow_multifrag_) + "\n";
+  str += "\tInterleaved Bins on GPU: " + bool_to_string(interleaved_bins_on_gpu_) + "\n";
+  str += "\tBlocks Share Memory: " + bool_to_string(blocksShareMemory()) + "\n";
+  str += "\tThreads Share Memory: " + bool_to_string(threadsShareMemory()) + "\n";
+  str += "\tUses Fast Group Values: " + bool_to_string(usesGetGroupValueFast()) + "\n";
   str += "\tLazy Init Groups (GPU): " +
-         boolToString(lazyInitGroups(ExecutorDeviceType::GPU)) + "\n";
+         bool_to_string(lazyInitGroups(ExecutorDeviceType::GPU)) + "\n";
   str += "\tEntry Count: " + std::to_string(entry_count_) + "\n";
   str += "\tMin Val (perfect hash only): " + std::to_string(min_val_) + "\n";
   str += "\tMax Val (perfect hash only): " + std::to_string(max_val_) + "\n";
   str += "\tBucket Val (perfect hash only): " + std::to_string(bucket_) + "\n";
-  str += "\tSort on GPU: " + boolToString(sort_on_gpu_) + "\n";
-  str += "\tUse Streaming Top N: " + boolToString(use_streaming_top_n_) + "\n";
-  str += "\tOutput Columnar: " + boolToString(output_columnar_) + "\n";
-  str += "\tRender Output: " + boolToString(render_output_) + "\n";
-  str += "\tUse Baseline Sort: " + boolToString(must_use_baseline_sort_) + "\n";
+  str += "\tSort on GPU: " + bool_to_string(sort_on_gpu_) + "\n";
+  str += "\tUse Streaming Top N: " + bool_to_string(use_streaming_top_n_) + "\n";
+  str += "\tOutput Columnar: " + bool_to_string(output_columnar_) + "\n";
+  str += "\tRender Output: " + bool_to_string(render_output_) + "\n";
+  str += "\tUse Baseline Sort: " + bool_to_string(must_use_baseline_sort_) + "\n";
   return str;
 }
 
 std::string QueryMemoryDescriptor::reductionKey() const {
   std::string str;
   str += "Query Memory Descriptor State\n";
-  str += "\tQuery Type: " + queryDescTypeToString(query_desc_type_) + "\n";
+  str += "\tQuery Type: " + queryDescTypeToString() + "\n";
   str +=
-      "\tKeyless Hash: " + boolToString(keyless_hash_) +
+      "\tKeyless Hash: " + bool_to_string(keyless_hash_) +
       (keyless_hash_ ? ", target index for key: " + std::to_string(getTargetIdxForKey())
                      : "") +
       "\n";

@@ -45,6 +45,35 @@
 
 extern bool g_use_tbb_pool;
 
+std::vector<int64_t> initialize_target_values_for_storage(
+    const std::vector<TargetInfo>& targets) {
+  std::vector<int64_t> target_init_vals;
+  for (const auto& target_info : targets) {
+    if (target_info.agg_kind == kCOUNT ||
+        target_info.agg_kind == kAPPROX_COUNT_DISTINCT) {
+      target_init_vals.push_back(0);
+      continue;
+    }
+    if (!target_info.sql_type.get_notnull()) {
+      int64_t init_val =
+          null_val_bit_pattern(target_info.sql_type, takes_float_argument(target_info));
+      target_init_vals.push_back(target_info.is_agg ? init_val : 0);
+    } else {
+      target_init_vals.push_back(target_info.is_agg ? 0xdeadbeef : 0);
+    }
+    if (target_info.agg_kind == kAVG) {
+      target_init_vals.push_back(0);
+    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_geometry()) {
+      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
+        target_init_vals.push_back(0);
+      }
+    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_varlen()) {
+      target_init_vals.push_back(0);
+    }
+  }
+  return target_init_vals;
+}
+
 ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
                                    const QueryMemoryDescriptor& query_mem_desc,
                                    int8_t* buff,
@@ -52,31 +81,8 @@ ResultSetStorage::ResultSetStorage(const std::vector<TargetInfo>& targets,
     : targets_(targets)
     , query_mem_desc_(query_mem_desc)
     , buff_(buff)
-    , buff_is_provided_(buff_is_provided) {
-  for (const auto& target_info : targets_) {
-    if (target_info.agg_kind == kCOUNT ||
-        target_info.agg_kind == kAPPROX_COUNT_DISTINCT) {
-      target_init_vals_.push_back(0);
-      continue;
-    }
-    if (!target_info.sql_type.get_notnull()) {
-      int64_t init_val =
-          null_val_bit_pattern(target_info.sql_type, takes_float_argument(target_info));
-      target_init_vals_.push_back(target_info.is_agg ? init_val : 0);
-    } else {
-      target_init_vals_.push_back(target_info.is_agg ? 0xdeadbeef : 0);
-    }
-    if (target_info.agg_kind == kAVG) {
-      target_init_vals_.push_back(0);
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_geometry()) {
-      for (int i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); i++) {
-        target_init_vals_.push_back(0);
-      }
-    } else if (target_info.agg_kind == kSAMPLE && target_info.sql_type.is_varlen()) {
-      target_init_vals_.push_back(0);
-    }
-  }
-}
+    , buff_is_provided_(buff_is_provided)
+    , target_init_vals_(initialize_target_values_for_storage(targets)) {}
 
 int8_t* ResultSetStorage::getUnderlyingBuffer() const {
   return buff_;
@@ -210,8 +216,8 @@ ResultSet::ResultSet(int64_t queue_time_ms,
 
 ResultSet::~ResultSet() {
   if (storage_) {
-    CHECK(storage_->getUnderlyingBuffer());
     if (!storage_->buff_is_provided_) {
+      CHECK(storage_->getUnderlyingBuffer());
       free(storage_->getUnderlyingBuffer());
     }
   }
@@ -232,9 +238,11 @@ ExecutorDeviceType ResultSet::getDeviceType() const {
 
 const ResultSetStorage* ResultSet::allocateStorage() const {
   CHECK(!storage_);
-  auto buff = static_cast<int8_t*>(
-      checked_malloc(query_mem_desc_.getBufferSizeBytes(device_type_)));
-  storage_.reset(new ResultSetStorage(targets_, query_mem_desc_, buff, false));
+  CHECK(row_set_mem_owner_);
+  auto buff =
+      row_set_mem_owner_->allocate(query_mem_desc_.getBufferSizeBytes(device_type_));
+  storage_.reset(
+      new ResultSetStorage(targets_, query_mem_desc_, buff, /*buff_is_provided=*/true));
   return storage_.get();
 }
 
@@ -251,9 +259,11 @@ const ResultSetStorage* ResultSet::allocateStorage(
 const ResultSetStorage* ResultSet::allocateStorage(
     const std::vector<int64_t>& target_init_vals) const {
   CHECK(!storage_);
-  auto buff = static_cast<int8_t*>(
-      checked_malloc(query_mem_desc_.getBufferSizeBytes(device_type_)));
-  storage_.reset(new ResultSetStorage(targets_, query_mem_desc_, buff, false));
+  CHECK(row_set_mem_owner_);
+  auto buff =
+      row_set_mem_owner_->allocate(query_mem_desc_.getBufferSizeBytes(device_type_));
+  storage_.reset(
+      new ResultSetStorage(targets_, query_mem_desc_, buff, /*buff_is_provided=*/true));
   storage_->target_init_vals_ = target_init_vals;
   return storage_.get();
 }
@@ -318,7 +328,9 @@ size_t ResultSet::rowCount(const bool force_parallel) const {
     return 1;
   }
   if (!permutation_.empty()) {
-    return permutation_.size();
+    const auto limited_row_count = keep_first_ + drop_first_;
+    return limited_row_count ? std::min(limited_row_count, permutation_.size())
+                             : permutation_.size();
   }
   if (cached_row_count_ != -1) {
     CHECK_GE(cached_row_count_, 0);
@@ -655,7 +667,7 @@ bool ResultSet::ResultSetComparator<BUFFER_ITERATOR_TYPE>::operator()(
   const auto rhs_storage = rhs_storage_lookup_result.storage_ptr;
   const auto fixedup_lhs = lhs_storage_lookup_result.fixedup_entry_idx;
   const auto fixedup_rhs = rhs_storage_lookup_result.fixedup_entry_idx;
-  for (const auto order_entry : order_entries_) {
+  for (const auto& order_entry : order_entries_) {
     CHECK_GE(order_entry.tle_no, 1);
     const auto& agg_info = result_set_->targets_[order_entry.tle_no - 1];
     const auto entry_ti = get_compact_type(agg_info);

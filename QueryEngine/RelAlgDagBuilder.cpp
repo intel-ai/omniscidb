@@ -623,6 +623,13 @@ unsigned node_id(const rapidjson::Value& ra_node) noexcept {
   return std::stoi(json_str(id));
 }
 
+std::string json_node_to_string(const rapidjson::Value& node) noexcept {
+  rapidjson::StringBuffer buffer;
+  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+  node.Accept(writer);
+  return buffer.GetString();
+}
+
 // The parse_* functions below de-serialize expressions as they come from Calcite.
 // RelAlgDagBuilder will take care of making the representation easy to
 // navigate for lower layers, for example by replacing RexAbstractInput with RexInput.
@@ -709,7 +716,11 @@ std::unique_ptr<const RexScalar> parse_scalar_expr(const rapidjson::Value& expr,
                                                    RelAlgDagBuilder& root_dag_builder);
 
 SQLTypeInfo parse_type(const rapidjson::Value& type_obj) {
-  CHECK(type_obj.IsObject() && type_obj.MemberCount() >= 2);
+  if (type_obj.IsArray()) {
+    throw QueryNotSupported("Composite types are not currently supported.");
+  }
+  CHECK(type_obj.IsObject() && type_obj.MemberCount() >= 2)
+      << json_node_to_string(type_obj);
   const auto type = to_sql_type(json_str(field(type_obj, "type")));
   const auto nullable = json_bool(field(type_obj, "nullable"));
   const auto precision_it = type_obj.FindMember("precision");
@@ -947,13 +958,6 @@ std::vector<size_t> indices_from_json_array(
     indices.emplace_back(json_idx_arr_it->GetInt());
   }
   return indices;
-}
-
-std::string json_node_to_string(const rapidjson::Value& node) noexcept {
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-  node.Accept(writer);
-  return buffer.GetString();
 }
 
 std::unique_ptr<const RexAgg> parse_aggregate_expr(const rapidjson::Value& expr) {
@@ -2037,7 +2041,8 @@ class RelAlgDispatcher {
       CHECK(crt_node.IsObject());
       std::shared_ptr<RelAlgNode> ra_node = nullptr;
       const auto rel_op = json_str(field(crt_node, "relOp"));
-      if (rel_op == std::string("EnumerableTableScan")) {
+      if (rel_op == std::string("EnumerableTableScan") ||
+          rel_op == std::string("LogicalTableScan")) {
         ra_node = dispatchTableScan(crt_node);
       } else if (rel_op == std::string("LogicalProject")) {
         ra_node = dispatchProject(crt_node, root_dag_builder);
@@ -2335,7 +2340,7 @@ class RelAlgDispatcher {
     if (node.HasMember("inputs")) {
       const auto str_input_ids = strings_from_json_array(field(node, "inputs"));
       RelAlgInputs ra_inputs;
-      for (const auto str_id : str_input_ids) {
+      for (const auto& str_id : str_input_ids) {
         ra_inputs.push_back(nodes_[std::stoi(str_id)]);
       }
       return ra_inputs;
@@ -2432,6 +2437,15 @@ void RelAlgDagBuilder::build(const rapidjson::Value& query_ast,
   coalesce_nodes(nodes_, left_deep_joins);
   CHECK(nodes_.back().unique());
   create_left_deep_join(nodes_);
+}
+
+void RelAlgDagBuilder::eachNode(
+    std::function<void(RelAlgNode const*)> const& callback) const {
+  for (auto const& node : nodes_) {
+    if (node) {
+      callback(node.get());
+    }
+  }
 }
 
 void RelAlgDagBuilder::resetQueryExecutionState() {

@@ -136,11 +136,9 @@ class DataMgr {
   const std::map<ChunkKey, File_Namespace::FileBuffer*>& getChunkMap();
   void checkpoint(const int db_id,
                   const int tb_id);  // checkpoint for individual table of DB
-  void getChunkMetadataVec(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec);
-  void getChunkMetadataVecForKeyPrefix(
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
-      const ChunkKey& keyPrefix);
+  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec);
+  void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
+                                       const ChunkKey& keyPrefix);
   inline bool gpusPresent() { return hasGpus_; }
   void removeTableRelatedDS(const int db_id, const int tb_id);
   void setTableEpoch(const int db_id, const int tb_id, const int start_epoch);
@@ -162,9 +160,9 @@ class DataMgr {
   };
 
   SystemMemoryUsage getSystemMemoryUsage() const;
+  static size_t getTotalSystemMemory();
 
  private:
-  size_t getTotalSystemMemory() const;
   void populateMgrs(const SystemParameters& system_parameters,
                     const size_t userSpecifiedNumReaderThreads);
   void convertDB(const std::string basePath);
@@ -179,6 +177,9 @@ class DataMgr {
   std::map<ChunkKey, std::shared_ptr<mapd_shared_mutex>> chunkMutexMap_;
   mapd_shared_mutex chunkMutexMapMutex_;
 };
+
+std::ostream& operator<<(std::ostream& os, const DataMgr::SystemMemoryUsage&);
+
 }  // namespace Data_Namespace
 
 #endif  // DATAMGR_H

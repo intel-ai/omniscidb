@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 OmniSci, Inc.
+ * Copyright 2019 OmniSci, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,18 +15,19 @@
  */
 
 #pragma once
+#include "Shared/Logger.h"
 
-#include <boost/asio.hpp>
+class GpuSharedMemoryContext {
+ public:
+  GpuSharedMemoryContext() : shared_memory_size_(0) {}
+  GpuSharedMemoryContext(const size_t shared_mem_size)
+      : shared_memory_size_(shared_mem_size) {
+    CHECK(shared_mem_size >= 0);
+  }
 
-namespace Asio {
+  bool isSharedMemoryUsed() const { return shared_memory_size_ > 0; }
+  size_t getSharedMemorySize() const { return shared_memory_size_; }
 
-extern std::atomic<bool> running;
-extern boost::asio::io_service io_context;
-extern boost::asio::signal_set signals;
-
-void register_signal_handler(int signum,
-                             void (*handler)(const boost::system::error_code&, int));
-
-void start();
-
-}  // namespace Asio
+ private:
+  size_t shared_memory_size_;
+};

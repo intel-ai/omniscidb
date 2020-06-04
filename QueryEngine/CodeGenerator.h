@@ -76,9 +76,10 @@ class CodeGenerator {
 
   static std::string generatePTX(const std::string& cuda_llir,
                                  llvm::TargetMachine* nvptx_target_machine,
-                                 CgenState* cgen_state);
+                                 llvm::LLVMContext& context);
 
-  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend();
+  static std::unique_ptr<llvm::TargetMachine> initializeNVPTXBackend(
+      const CudaMgr_Namespace::NvidiaDeviceArch arch);
 
   static bool alwaysCloneRuntimeFunction(const llvm::Function* func);
 

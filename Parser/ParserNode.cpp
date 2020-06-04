@@ -44,6 +44,7 @@
 #include "Utils/Threading.h"
 #include "Analyzer/RangeTableEntry.h"
 #include "Catalog/Catalog.h"
+#include "Catalog/DataframeTableDescriptor.h"
 #include "Catalog/SharedDictionaryValidator.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
 #include "Fragmenter/SortedOrderFragmenter.h"
@@ -78,6 +79,11 @@ using namespace std::string_literals;
 using TableDefFuncPtr = boost::function<void(TableDescriptor&,
                                              const NameValueAssign*,
                                              const std::list<ColumnDescriptor>& columns)>;
+
+using DataframeDefFuncPtr =
+    boost::function<void(DataframeTableDescriptor&,
+                         const NameValueAssign*,
+                         const std::list<ColumnDescriptor>& columns)>;
 
 namespace Parser {
 std::shared_ptr<Analyzer::Expr> NullLiteral::analyze(
@@ -1985,6 +1991,13 @@ decltype(auto) get_frag_size_def(TableDescriptor& td,
                                         [&td](const auto val) { td.maxFragRows = val; });
 }
 
+decltype(auto) get_frag_size_dataframe_def(DataframeTableDescriptor& df_td,
+                                           const NameValueAssign* p,
+                                           const std::list<ColumnDescriptor>& columns) {
+  return get_property_value<IntLiteral>(
+      p, [&df_td](const auto val) { df_td.maxFragRows = val; });
+}
+
 decltype(auto) get_max_chunk_size_def(TableDescriptor& td,
                                       const NameValueAssign* p,
                                       const std::list<ColumnDescriptor>& columns) {
@@ -1992,25 +2005,33 @@ decltype(auto) get_max_chunk_size_def(TableDescriptor& td,
                                         [&td](const auto val) { td.maxChunkSize = val; });
 }
 
-decltype(auto) get_delimiter_def(TableDescriptor& td,
+decltype(auto) get_max_chunk_size_dataframe_def(
+    DataframeTableDescriptor& df_td,
+    const NameValueAssign* p,
+    const std::list<ColumnDescriptor>& columns) {
+  return get_property_value<IntLiteral>(
+      p, [&df_td](const auto val) { df_td.maxChunkSize = val; });
+}
+
+decltype(auto) get_delimiter_def(DataframeTableDescriptor& df_td,
                                  const NameValueAssign* p,
                                  const std::list<ColumnDescriptor>& columns) {
-  return get_property_value<StringLiteral>(p, [&td](const auto val) {
+  return get_property_value<StringLiteral>(p, [&df_td](const auto val) {
     if (val.size() != 1) {
       throw std::runtime_error("Length of DELIMITER must be equal to 1.");
     }
-    td.delimiter = val;
+    df_td.delimiter = val;
   });
 }
 
-decltype(auto) get_header_def(TableDescriptor& td,
+decltype(auto) get_header_def(DataframeTableDescriptor& df_td,
                               const NameValueAssign* p,
                               const std::list<ColumnDescriptor>& columns) {
-  return get_property_value<StringLiteral>(p, [&td](const auto val) {
+  return get_property_value<StringLiteral>(p, [&df_td](const auto val) {
     if (val == "FALSE") {
-      td.hasHeader = false;
+      df_td.hasHeader = false;
     } else if (val == "TRUE") {
-      td.hasHeader = true;
+      df_td.hasHeader = true;
     } else {
       throw std::runtime_error("Option HEADER support only 'true' or 'false' values.");
     }
@@ -2029,10 +2050,11 @@ decltype(auto) get_max_rows_def(TableDescriptor& td,
   return get_property_value<IntLiteral>(p, [&td](const auto val) { td.maxRows = val; });
 }
 
-decltype(auto) get_skip_rows_def(TableDescriptor& td,
+decltype(auto) get_skip_rows_def(DataframeTableDescriptor& df_td,
                                  const NameValueAssign* p,
                                  const std::list<ColumnDescriptor>& columns) {
-  return get_property_value<IntLiteral>(p, [&td](const auto val) { td.skipRows = val; });
+  return get_property_value<IntLiteral>(
+      p, [&df_td](const auto val) { df_td.skipRows = val; });
 }
 
 decltype(auto) get_partions_def(TableDescriptor& td,
@@ -2114,14 +2136,14 @@ void get_table_definitions(TableDescriptor& td,
   return it->second(td, p.get(), columns);
 }
 
-static const std::map<const std::string, const TableDefFuncPtr> dataframeDefFuncMap = {
-    {"fragment_size"s, get_frag_size_def},
-    {"max_chunk_size"s, get_max_chunk_size_def},
-    {"skip_rows"s, get_skip_rows_def},
-    {"delimiter"s, get_delimiter_def},
-    {"header"s, get_header_def}};
+static const std::map<const std::string, const DataframeDefFuncPtr> dataframeDefFuncMap =
+    {{"fragment_size"s, get_frag_size_dataframe_def},
+     {"max_chunk_size"s, get_max_chunk_size_dataframe_def},
+     {"skip_rows"s, get_skip_rows_def},
+     {"delimiter"s, get_delimiter_def},
+     {"header"s, get_header_def}};
 
-void get_dataframe_definitions(TableDescriptor& td,
+void get_dataframe_definitions(DataframeTableDescriptor& df_td,
                                const std::unique_ptr<NameValueAssign>& p,
                                const std::list<ColumnDescriptor>& columns) {
   const auto it =
@@ -2131,7 +2153,7 @@ void get_dataframe_definitions(TableDescriptor& td,
         "Invalid CREATE DATAFRAME option " + *p->get_name() +
         ". Should be FRAGMENT_SIZE, MAX_CHUNK_SIZE, SKIP_ROWS, DELIMITER or HEADER.");
   }
-  return it->second(td, p.get(), columns);
+  return it->second(df_td, p.get(), columns);
 }
 
 }  // namespace
@@ -2243,7 +2265,7 @@ void CreateDataframeStmt::execute(const Catalog_Namespace::SessionInfo& session)
   if (catalog.getMetadataForTable(*table_) != nullptr) {
     throw std::runtime_error("Table " + *table_ + " already exists.");
   }
-  TableDescriptor td;
+  DataframeTableDescriptor df_td;
   std::list<ColumnDescriptor> columns;
   std::vector<SharedDictionaryDef> shared_dict_defs;
 
@@ -2272,30 +2294,30 @@ void CreateDataframeStmt::execute(const Catalog_Namespace::SessionInfo& session)
     columns.push_back(cd);
   }
 
-  td.tableName = *table_;
-  td.nColumns = columns.size();
-  td.isView = false;
-  td.fragmenter = nullptr;
-  td.fragType = Fragmenter_Namespace::FragmenterType::INSERT_ORDER;
-  td.maxFragRows = DEFAULT_FRAGMENT_ROWS;
-  td.maxChunkSize = DEFAULT_MAX_CHUNK_SIZE;
-  td.fragPageSize = DEFAULT_PAGE_SIZE;
-  td.maxRows = DEFAULT_MAX_ROWS;
-  td.persistenceLevel = Data_Namespace::MemoryLevel::CPU_LEVEL;
+  df_td.tableName = *table_;
+  df_td.nColumns = columns.size();
+  df_td.isView = false;
+  df_td.fragmenter = nullptr;
+  df_td.fragType = Fragmenter_Namespace::FragmenterType::INSERT_ORDER;
+  df_td.maxFragRows = DEFAULT_FRAGMENT_ROWS;
+  df_td.maxChunkSize = DEFAULT_MAX_CHUNK_SIZE;
+  df_td.fragPageSize = DEFAULT_PAGE_SIZE;
+  df_td.maxRows = DEFAULT_MAX_ROWS;
+  df_td.persistenceLevel = Data_Namespace::MemoryLevel::CPU_LEVEL;
   if (!storage_options_.empty()) {
     for (auto& p : storage_options_) {
-      get_dataframe_definitions(td, p, columns);
+      get_dataframe_definitions(df_td, p, columns);
     }
   }
-  td.keyMetainfo = serialize_key_metainfo(nullptr, shared_dict_defs);
-  td.userId = session.get_currentUser().userId;
-  td.storageType = *filename_;
+  df_td.keyMetainfo = serialize_key_metainfo(nullptr, shared_dict_defs);
+  df_td.userId = session.get_currentUser().userId;
+  df_td.storageType = *filename_;
 
-  catalog.createShardedTable(td, columns, shared_dict_defs);
+  catalog.createShardedTable(df_td, columns, shared_dict_defs);
   // TODO (max): It's transactionally unsafe, should be fixed: we may create object w/o
   // privileges
   SysCatalog::instance().createDBObject(
-      session.get_currentUser(), td.tableName, TableDBObjectType, catalog);
+      session.get_currentUser(), df_td.tableName, TableDBObjectType, catalog);
 }
 
 std::shared_ptr<ResultSet> getResultSet(QueryStateProxy query_state_proxy,
@@ -3435,7 +3457,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
 
   const TableDescriptor* td{nullptr};
   std::unique_ptr<lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>> td_with_lock;
-  lockmgr::WriteLock insert_data_lock;
+  std::unique_ptr<lockmgr::WriteLock> insert_data_lock;
 
   auto& catalog = session.getCatalog();
 
@@ -3444,7 +3466,8 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
         lockmgr::TableSchemaLockContainer<lockmgr::ReadLock>::acquireTableDescriptor(
             catalog, *table));
     td = (*td_with_lock)();
-    insert_data_lock = lockmgr::InsertDataLockMgr::getWriteLockForTable(catalog, *table);
+    insert_data_lock = std::make_unique<lockmgr::WriteLock>(
+        lockmgr::InsertDataLockMgr::getWriteLockForTable(catalog, *table));
   } catch (const std::runtime_error& e) {
     // noop
     // TODO(adb): We're really only interested in whether the table exists or not.
@@ -4163,14 +4186,33 @@ void RevokeRoleStmt::execute(const Catalog_Namespace::SessionInfo& session) {
 }
 
 void ShowCreateTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
+  using namespace Catalog_Namespace;
+
+  const auto execute_read_lock = mapd_shared_lock<mapd_shared_mutex>(
+      *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
+          legacylockmgr::ExecutorOuterLock, true));
+
   auto& catalog = session.getCatalog();
   const TableDescriptor* td = catalog.getMetadataForTable(*table_);
   if (!td) {
-    throw std::runtime_error("table not found: " + *table_);
+    throw std::runtime_error("Table/View " + *table_ + " does not exist.");
   }
+
+  DBObject dbObject(td->tableName, td->isView ? ViewDBObjectType : TableDBObjectType);
+  dbObject.loadKey(catalog);
+  std::vector<DBObject> privObjects = {dbObject};
+
+  if (!SysCatalog::instance().hasAnyPrivileges(session.get_currentUser(), privObjects)) {
+    throw std::runtime_error("Table/View " + *table_ + " does not exist.");
+  }
+  if (td->isView && !session.get_currentUser().isSuper) {
+    // TODO: we need to run a validate query to ensure the user has access to the
+    // underlying table, but we do not have any of the machinery in here. Disable for now,
+    // unless the current user is a super user.
+    throw std::runtime_error("SHOW CREATE TABLE not yet supported for views");
+  }
+
   create_stmt_ = catalog.dumpCreateTable(td);
-  std::regex regex("@T");
-  create_stmt_ = std::regex_replace(create_stmt_, regex, *table_);
 }
 
 void ExportQueryStmt::execute(const Catalog_Namespace::SessionInfo& session) {

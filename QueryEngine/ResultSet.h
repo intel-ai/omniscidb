@@ -25,8 +25,8 @@
 #ifndef QUERYENGINE_RESULTSET_H
 #define QUERYENGINE_RESULTSET_H
 
-#include "../Chunk/Chunk.h"
 #include "CardinalityEstimator.h"
+#include "DataMgr/Chunk/Chunk.h"
 #include "ResultSetBufferAccessors.h"
 #include "TargetValue.h"
 
@@ -444,6 +444,9 @@ class ResultSet {
   bool isGeoColOnGpu(const size_t col_idx) const;
   int getDeviceId() const;
 
+  void setOuterTableId(int id) { outer_table_id_ = id; }
+  int getOuterTableId() const { return outer_table_id_; }
+
   // Called from the executor because in the new ResultSet we assume the 'padded' field
   // in SlotSize already contains the padding, whereas in the executor it's computed.
   // Once the buffer initialization moves to ResultSet we can remove this method.
@@ -828,10 +831,11 @@ class ResultSet {
   mutable size_t fetched_so_far_;
   size_t drop_first_;
   size_t keep_first_;
-  const std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner_;
+  std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner_;
   std::vector<uint32_t> permutation_;
   int64_t queue_time_ms_;
   int64_t render_time_ms_;
+  int outer_table_id_ = 0;
   const Executor* executor_;  // TODO(alex): remove
 
   std::list<std::shared_ptr<Chunk_NS::Chunk>> chunks_;
@@ -947,4 +951,6 @@ GroupValueInfo get_group_value_reduction(int64_t* groups_buffer,
                                          const size_t that_entry_count,
                                          const uint32_t row_size_quad);
 
+std::vector<int64_t> initialize_target_values_for_storage(
+    const std::vector<TargetInfo>& targets);
 #endif  // QUERYENGINE_RESULTSET_H

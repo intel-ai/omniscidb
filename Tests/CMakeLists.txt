@@ -34,7 +34,7 @@ if(ENABLE_CUDA)
         -O3
         -D_FORCE_INLINES
         ${MAPD_DEFINITIONS}
-        -arch sm_30
+        ${CUDA_COMPILATION_ARCH}
         -std=c++14
         -shared
         ${CMAKE_CURRENT_SOURCE_DIR}/ProfileUtils.cu
@@ -77,16 +77,20 @@ add_executable(UpdateMetadataTest UpdateMetadataTest.cpp)
 add_executable(CalciteOptimizeTest CalciteOptimizeTest.cpp)
 add_executable(JoinHashTableTest JoinHashTableTest.cpp)
 add_executable(CachedHashTableTest CachedHashTableTest.cpp)
+add_executable(RuntimeInterruptTest RuntimeInterruptTest.cpp)
 add_executable(ColumnarResultsTest ColumnarResultsTest.cpp ResultSetTestUtils.cpp)
 add_executable(CommandLineTest CommandLineTest.cpp)
 if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   add_executable(UdfTest UdfTest.cpp)
 endif()
+if(ENABLE_CUDA)
+  add_executable(GpuSharedMemoryTest GpuSharedMemoryTest.cpp ResultSetTestUtils.cpp)
+endif()
 
 # Tests + Microbenchmarks
 add_executable(TableUpdateDeleteBenchmark TableUpdateDeleteBenchmark.cpp)
 
-set(EXECUTE_TEST_LIBS gtest mapd_thrift QueryRunner ${MAPD_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${CURSES_LIBRARIES} ${Boost_LIBRARIES} ${PROFILER_LIBS})
+set(EXECUTE_TEST_LIBS gtest mapd_thrift QueryRunner ${MAPD_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${Boost_LIBRARIES} ${ZLIB_LIBRARIES} ${PROFILER_LIBS})
 set(THRIFT_HANDLER_TEST_LIBRARIES thrift_handler ${EXECUTE_TEST_LIBS})
 
 # Replace Licensing library with TestLicensing library
@@ -139,6 +143,7 @@ target_link_libraries(DateTimeUtilsTest gtest Shared ${LLVM_LINKER_FLAGS})
 target_link_libraries(CalciteOptimizeTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(JoinHashTableTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(CachedHashTableTest ${EXECUTE_TEST_LIBS})
+target_link_libraries(RuntimeInterruptTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(CommandLineTest gtest Shared ${Boost_LIBRARIES})
 # Requires thrift_handler for DBHandler test fixture
 target_link_libraries(DBObjectPrivilegesTest ${THRIFT_HANDLER_TEST_LIBRARIES})
@@ -153,6 +158,9 @@ if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
 endif()
 
 target_link_libraries(TableUpdateDeleteBenchmark benchmark ${EXECUTE_TEST_LIBS})
+if(ENABLE_CUDA)
+  target_link_libraries(GpuSharedMemoryTest ${EXECUTE_TEST_LIBS})
+endif()
 
 set(TEST_ARGS "--gtest_output=xml:../")
 add_test(DumpRestoreTest DumpRestoreTest ${TEST_ARGS})
@@ -195,12 +203,17 @@ add_test(CorrelatedSubqueryTest CorrelatedSubqueryTest ${TEST_ARGS})
 add_test(DateTimeUtilsTest DateTimeUtilsTest ${TEST_ARGS})
 add_test(UpdateMetadataTest UpdateMetadataTest ${TEST_ARGS})
 add_test(CalciteOptimizeTest CalciteOptimizeTest ${TEST_ARGS})
+add_test(JoinHashTableTest JoinHashTableTest ${TEST_ARGS})
+add_tesT(RuntimeInterruptTest RuntimeInterruptTest ${TEST_ARGS})
 add_test(CommandLineTest CommandLineTest ${TEST_ARGS})
 add_test(ForeignServerDdlTest ForeignServerDdlTest ${TEST_ARGS})
 add_test(ShowCommandsDdlTest ShowCommandsDdlTest ${TEST_ARGS})
 add_test(CatalogMigrationTest CatalogMigrationTest ${TEST_ARGS})
 add_test(CreateAndDropTableDdlTest CreateAndDropTableDdlTest ${TEST_ARGS})
 add_test(ForeignTableDmlTest ForeignTableDmlTest ${TEST_ARGS})
+if(ENABLE_CUDA)
+  add_test(GpuSharedMemoryTest GpuSharedMemoryTest ${TEST_ARGS})
+endif()
 
 if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   add_test(UdfTest UdfTest ${TEST_ARGS})
@@ -255,6 +268,7 @@ set(TEST_PROGRAMS
   CalciteOptimizeTest
   JoinHashTableTest
   CachedHashTableTest
+  RuntimeInterruptTest
   StringFunctionsTest
   StringDictionaryTest
   CommandLineTest
@@ -264,6 +278,10 @@ set(TEST_PROGRAMS
   CreateAndDropTableDdlTest
   ForeignTableDmlTest
 )
+
+if(ENABLE_CUDA)
+  list(APPEND TEST_PROGRAMS GpuSharedMemoryTest)
+endif()
 
 if(NOT ${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
   list(APPEND TEST_PROGRAMS UdfTest)

@@ -341,6 +341,20 @@ TEST_F(GrantSyntax, MultiRoleGrantRevoke) {
   check_revoke();
 }
 
+class InvalidGrantSyntax : public DBHandlerTestFixture {};
+
+TEST_F(InvalidGrantSyntax, InvalidGrantSyntax) {
+  std::string error_message;
+  if (g_aggregator) {
+    error_message = "Exception: Syntax error at: ON";
+  } else {
+    error_message = "Syntax error at: ON";
+  }
+
+  queryAndAssertException("GRANT SELECT, INSERT, ON TABLE tbl TO Arsenal, Juventus;",
+                          error_message);
+}
+
 TEST(UserRoles, InvalidGrantsRevokesTest) {
   run_ddl_statement("CREATE USER Antazin(password = 'password', is_super = 'false');");
   run_ddl_statement("CREATE USER Max(password = 'password', is_super = 'false');");
@@ -2552,7 +2566,7 @@ void compare_user_lists(const std::vector<std::string>& expected,
                         const std::list<Catalog_Namespace::UserMetadata>& actual) {
   ASSERT_EQ(expected.size(), actual.size());
   size_t i = 0;
-  for (const auto user : actual) {
+  for (const auto& user : actual) {
     ASSERT_EQ(expected[i++], user.userName);
   }
 }

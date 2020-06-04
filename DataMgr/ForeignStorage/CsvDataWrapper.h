@@ -22,7 +22,7 @@
 
 #include "Catalog/Catalog.h"
 #include "Catalog/ForeignTable.h"
-#include "Chunk/Chunk.h"
+#include "DataMgr/Chunk/Chunk.h"
 #include "ForeignDataWrapper.h"
 #include "Import/Importer.h"
 
@@ -34,7 +34,7 @@ class CsvDataWrapper : public ForeignDataWrapper {
   ForeignStorageBuffer* getChunkBuffer(const ChunkKey& chunk_key) override;
   void populateMetadataForChunkKeyPrefix(
       const ChunkKey& chunk_key_prefix,
-      std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunk_metadata_vector) override;
+      ChunkMetadataVector& chunk_metadata_vector) override;
 
   static void validateOptions(const ForeignTable* foreign_table);
 

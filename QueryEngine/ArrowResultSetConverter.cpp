@@ -302,7 +302,7 @@ ArrowResult ArrowResultSetConverter::getArrowResult() const {
   std::shared_ptr<arrow::RecordBatch> record_batch = convertToArrow();
 
   if (device_type_ == ExecutorDeviceType::CPU) {
-    auto timer = DEBUG_TIMER("T01 serialize records to shm");
+    auto timer = DEBUG_TIMER("serialize batch to shared memory");
     std::shared_ptr<Buffer> serialized_records;
     std::shared_ptr<Buffer> serialized_schema;
     std::vector<char> schema_handle_buffer;
@@ -324,31 +324,26 @@ ArrowResult ArrowResultSetConverter::getArrowResult() const {
       ARROW_THROW_NOT_OK(GetDictionaryPayload(
           dictionary_id, dictionary, options, default_memory_pool(), &payload));
       int32_t metadata_length = 0;
-      WriteIpcPayload(payload, options, dict_stream.get(), &metadata_length);
+      ARROW_THROW_NOT_OK(
+          WriteIpcPayload(payload, options, dict_stream.get(), &metadata_length));
     }
     auto serialized_dict = dict_stream->Finish().ValueOrDie();
     auto dict_size = serialized_dict->size();
 
-    {
-      auto timer = DEBUG_TIMER("T11 serialize schema");
-      ARROW_THROW_NOT_OK(ipc::SerializeSchema(
-          *record_batch->schema(), nullptr, default_memory_pool(), &serialized_schema));
-    }
+    ARROW_THROW_NOT_OK(ipc::SerializeSchema(
+        *record_batch->schema(), nullptr, default_memory_pool(), &serialized_schema));
     schema_size = serialized_schema->size();
 
     ARROW_THROW_NOT_OK(ipc::GetRecordBatchSize(*record_batch, &records_size));
     total_size = schema_size + dict_size + records_size;
     std::tie(records_shm_key, serialized_records) = get_shm_buffer(total_size);
 
-    {
-      auto timer = DEBUG_TIMER("T12 copy schema and dict to shm");
-      memcpy(serialized_records->mutable_data(),
-             serialized_schema->data(),
-             (size_t)schema_size);
-      memcpy(serialized_records->mutable_data() + schema_size,
-             serialized_dict->data(),
-             (size_t)dict_size);
-    }
+    memcpy(serialized_records->mutable_data(),
+           serialized_schema->data(),
+           (size_t)schema_size);
+    memcpy(serialized_records->mutable_data() + schema_size,
+           serialized_dict->data(),
+           (size_t)dict_size);
 
     io::FixedSizeBufferWriter stream(
         SliceMutableBuffer(serialized_records, schema_size + dict_size));
@@ -479,15 +474,10 @@ ArrowResultSetConverter::getSerializedArrowOutput(
   }
 
   if (arrow_copy->num_rows()) {
-    {
-      auto timer = DEBUG_TIMER("T04 validate batch");
-      ARROW_THROW_NOT_OK(arrow_copy->Validate());
-    }
-    {
-      auto timer = DEBUG_TIMER("T05 serialize records");
-      ARROW_THROW_NOT_OK(arrow::ipc::SerializeRecordBatch(
-          *arrow_copy, arrow::default_memory_pool(), &serialized_records));
-    }
+    auto timer = DEBUG_TIMER("serialize records");
+    ARROW_THROW_NOT_OK(arrow_copy->Validate());
+    ARROW_THROW_NOT_OK(arrow::ipc::SerializeRecordBatch(
+        *arrow_copy, arrow::default_memory_pool(), &serialized_records));
   } else {
     ARROW_THROW_NOT_OK(arrow::AllocateBuffer(0, &serialized_records));
   }

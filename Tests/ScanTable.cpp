@@ -32,12 +32,13 @@
 #include <memory>
 #include <random>
 #include <string>
-#include "../Catalog/Catalog.h"
-#include "../Chunk/Chunk.h"
-#include "../DataMgr/DataMgr.h"
-#include "../Fragmenter/Fragmenter.h"
-#include "../Shared/measure.h"
-#include "../Shared/sqltypes.h"
+
+#include "Catalog/Catalog.h"
+#include "DataMgr/Chunk/Chunk.h"
+#include "DataMgr/DataMgr.h"
+#include "Fragmenter/Fragmenter.h"
+#include "Shared/measure.h"
+#include "Shared/sqltypes.h"
 
 using namespace std;
 using namespace Catalog_Namespace;
@@ -45,14 +46,14 @@ using namespace Fragmenter_Namespace;
 using namespace Chunk_NS;
 using namespace Data_Namespace;
 
-void scan_chunk(const ChunkMetadata& chunk_metadata,
+void scan_chunk(const std::shared_ptr<ChunkMetadata>& chunk_metadata,
                 const Chunk& chunk,
                 size_t& hash,
                 bool use_iter) {
   ChunkIter cit = chunk.begin_iterator(chunk_metadata, 0, 1);
   VarlenDatum vd;
   bool is_end;
-  const ColumnDescriptor* cd = chunk.get_column_desc();
+  const ColumnDescriptor* cd = chunk.getColumnDesc();
   std::hash<std::string> string_hash;
   int nth = 0;
   while (true) {
@@ -119,7 +120,7 @@ vector<size_t> scan_table_return_hash(const string& table_name, const Catalog& c
       auto chunk_meta_it = frag.getChunkMetadataMapPhysical().find(cd->columnId);
       ChunkKey chunk_key{
           cat.getCurrentDB().dbId, td->tableId, cd->columnId, frag.fragmentId};
-      total_bytes += chunk_meta_it->second.numBytes;
+      total_bytes += chunk_meta_it->second->numBytes;
       auto ms = measure<>::execution([&]() {
         std::shared_ptr<Chunk> chunkp =
             Chunk::getChunk(cd,
@@ -127,8 +128,8 @@ vector<size_t> scan_table_return_hash(const string& table_name, const Catalog& c
                             chunk_key,
                             CPU_LEVEL,
                             frag.deviceIds[static_cast<int>(CPU_LEVEL)],
-                            chunk_meta_it->second.numBytes,
-                            chunk_meta_it->second.numElements);
+                            chunk_meta_it->second->numBytes,
+                            chunk_meta_it->second->numElements);
         scan_chunk(chunk_meta_it->second, *chunkp, col_hashs[i], true);
         // call Chunk destructor here
       });
@@ -157,7 +158,7 @@ vector<size_t> scan_table_return_hash_non_iter(const string& table_name,
       auto chunk_meta_it = frag.getChunkMetadataMapPhysical().find(cd->columnId);
       ChunkKey chunk_key{
           cat.getCurrentDB().dbId, td->tableId, cd->columnId, frag.fragmentId};
-      total_bytes += chunk_meta_it->second.numBytes;
+      total_bytes += chunk_meta_it->second->numBytes;
       auto ms = measure<>::execution([&]() {
         std::shared_ptr<Chunk> chunkp =
             Chunk::getChunk(cd,
@@ -165,8 +166,8 @@ vector<size_t> scan_table_return_hash_non_iter(const string& table_name,
                             chunk_key,
                             CPU_LEVEL,
                             frag.deviceIds[static_cast<int>(CPU_LEVEL)],
-                            chunk_meta_it->second.numBytes,
-                            chunk_meta_it->second.numElements);
+                            chunk_meta_it->second->numBytes,
+                            chunk_meta_it->second->numElements);
         scan_chunk(chunk_meta_it->second, *chunkp, col_hashs[i], false);
         // call Chunk destructor here
       });

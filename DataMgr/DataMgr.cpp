@@ -19,10 +19,10 @@
  * @author Todd Mostak <todd@mapd.com>
  */
 
-#include "DataMgr.h"
-#include "../CudaMgr/CudaMgr.h"
+#include "DataMgr/DataMgr.h"
 #include "BufferMgr/CpuBufferMgr/CpuBufferMgr.h"
 #include "BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.h"
+#include "CudaMgr/CudaMgr.h"
 #include "FileMgr/GlobalFileMgr.h"
 #include "PersistentStorageMgr/PersistentStorageMgr.h"
 
@@ -134,7 +134,7 @@ DataMgr::SystemMemoryUsage DataMgr::getSystemMemoryUsage() const {
   return usage;
 }
 
-size_t DataMgr::getTotalSystemMemory() const {
+size_t DataMgr::getTotalSystemMemory() {
 #ifdef __APPLE__
   int mib[2];
   size_t physical_memory;
@@ -402,16 +402,14 @@ bool DataMgr::isBufferOnDevice(const ChunkKey& key,
   return bufferMgrs_[memLevel][deviceId]->isBufferOnDevice(key);
 }
 
-void DataMgr::getChunkMetadataVec(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec) {
+void DataMgr::getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) {
   // Can we always assume this will just be at the disklevel bc we just
   // started?
   bufferMgrs_[0][0]->getChunkMetadataVec(chunkMetadataVec);
 }
 
-void DataMgr::getChunkMetadataVecForKeyPrefix(
-    std::vector<std::pair<ChunkKey, ChunkMetadata>>& chunkMetadataVec,
-    const ChunkKey& keyPrefix) {
+void DataMgr::getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
+                                              const ChunkKey& keyPrefix) {
   bufferMgrs_[0][0]->getChunkMetadataVecForKeyPrefix(chunkMetadataVec, keyPrefix);
 }
 
@@ -537,6 +535,17 @@ GlobalFileMgr* DataMgr::getGlobalFileMgr() const {
   }
   CHECK(global_file_mgr);
   return global_file_mgr;
+}
+
+std::ostream& operator<<(std::ostream& os, const DataMgr::SystemMemoryUsage& mem_info) {
+  os << "CPU Memory Info:";
+  os << "\n\tTotal: " << mem_info.total / (1024. * 1024.) << " MB";
+  os << "\n\tFree: " << mem_info.free / (1024. * 1024.) << " MB";
+  os << "\n\tProcess: " << mem_info.resident / (1024. * 1024.) << " MB";
+  os << "\n\tVirtual: " << mem_info.vtotal / (1024. * 1024.) << " MB";
+  os << "\n\tProcess + Swap: " << mem_info.regular / (1024. * 1024.) << " MB";
+  os << "\n\tProcess Shared: " << mem_info.shared / (1024. * 1024.) << " MB";
+  return os;
 }
 
 }  // namespace Data_Namespace

@@ -15,6 +15,7 @@
  */
 
 #include "UDFCompiler.h"
+
 #include <clang/AST/AST.h>
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/RecursiveASTVisitor.h>
@@ -31,6 +32,7 @@
 #include <boost/process/search_path.hpp>
 #include <iterator>
 #include <memory>
+
 #include "Execute.h"
 #include "Shared/Logger.h"
 
@@ -50,7 +52,7 @@ class FunctionDeclVisitor : public RecursiveASTVisitor<FunctionDeclVisitor> {
                       SourceManager& s_manager,
                       ASTContext& context)
       : ast_file_(ast_file), source_manager_(s_manager), context_(context) {
-    source_manager_.getDiagnostics().setShowColors();
+    source_manager_.getDiagnostics().setShowColors(false);
   }
 
   bool VisitFunctionDecl(FunctionDecl* f) {
@@ -123,7 +125,7 @@ class HandleDeclAction : public ASTFrontendAction {
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance& instance,
                                                  StringRef file) override {
-    return llvm::make_unique<DeclASTConsumer>(
+    return std::make_unique<DeclASTConsumer>(
         ast_file_, instance.getSourceManager(), instance.getASTContext());
   }
 
@@ -133,9 +135,17 @@ class HandleDeclAction : public ASTFrontendAction {
 
 class ToolFactory : public FrontendActionFactory {
  public:
+#if LLVM_VERSION_MAJOR >= 10
+  using FrontendActionPtr = std::unique_ptr<clang::FrontendAction>;
+#define CREATE_FRONTEND_ACTION(ast_file_) std::make_unique<HandleDeclAction>(ast_file_)
+#else
+  using FrontendActionPtr = clang::FrontendAction*;
+#define CREATE_FRONTEND_ACTION(ast_file_) new HandleDeclAction(ast_file_)
+#endif
+
   ToolFactory(llvm::raw_fd_ostream& ast_file) : ast_file_(ast_file) {}
 
-  clang::FrontendAction* create() override { return new HandleDeclAction(ast_file_); }
+  FrontendActionPtr create() override { return CREATE_FRONTEND_ACTION(ast_file_); }
 
  private:
   llvm::raw_fd_ostream& ast_file_;
@@ -196,22 +206,29 @@ std::string UdfCompiler::genCpuIrFilename(const char* udf_fileName) {
   return cpu_file_name;
 }
 
-int UdfCompiler::compileFromCommandLine(std::vector<const char*>& command_line) {
+int UdfCompiler::compileFromCommandLine(const std::vector<std::string>& command_line) {
   UdfClangDriver compiler_driver(clang_path_);
   auto the_driver(compiler_driver.getClangDriver());
 
-  // If there were options passed on the command line, append them here
+  std::vector<const char*> clang_command_opts;
+  clang_command_opts.reserve(command_line.size() + clang_options_.size());
+  // add required options first
+  std::transform(std::begin(command_line),
+                 std::end(command_line),
+                 std::back_inserter(clang_command_opts),
+                 [&](const std::string& str) { return str.c_str(); });
 
-  if (clang_options_.size() > 0) {
+  // If there were additional clang options passed to the system, append them here
+  if (!clang_options_.empty()) {
     std::transform(std::begin(clang_options_),
                    std::end(clang_options_),
-                   std::back_inserter(command_line),
+                   std::back_inserter(clang_command_opts),
                    [&](const std::string& str) { return str.c_str(); });
   }
 
   the_driver->CCPrintOptions = 0;
   std::unique_ptr<driver::Compilation> compilation(
-      the_driver->BuildCompilation(command_line));
+      the_driver->BuildCompilation(clang_command_opts));
 
   if (!compilation) {
     LOG(FATAL) << "failed to build compilation object!\n";
@@ -232,21 +249,17 @@ int UdfCompiler::compileFromCommandLine(std::vector<const char*>& command_line) 
 }
 
 int UdfCompiler::compileToGpuByteCode(const char* udf_file_name, bool cpu_mode) {
-  std::string gpu_outName(genGpuIrFilename(udf_file_name));
+  std::string gpu_out_filename(genGpuIrFilename(udf_file_name));
 
-  std::vector<const char*> command_line{clang_path_.c_str(),
-                                        "-c",
-                                        "-O2",
-                                        "-emit-llvm",
-                                        "-o",
-                                        gpu_outName.c_str(),
-                                        "-std=c++14"};
+  std::vector<std::string> command_line{
+      clang_path_, "-c", "-O2", "-emit-llvm", "-o", gpu_out_filename, "-std=c++14"};
 
   // If we are not compiling for cpu mode, then target the gpu
   // Otherwise assume we can generic ir that will
   // be translated to gpu code during target code generation
   if (!cpu_mode) {
-    command_line.emplace_back("--cuda-gpu-arch=sm_30");
+    command_line.emplace_back("--cuda-gpu-arch=" +
+                              CudaMgr_Namespace::CudaMgr::deviceArchToSM(target_arch_));
     command_line.emplace_back("--cuda-device-only");
     command_line.emplace_back("-xcuda");
   }
@@ -257,14 +270,14 @@ int UdfCompiler::compileToGpuByteCode(const char* udf_file_name, bool cpu_mode) 
 }
 
 int UdfCompiler::compileToCpuByteCode(const char* udf_file_name) {
-  std::string cpu_outName(genCpuIrFilename(udf_file_name));
+  std::string cpu_out_filename(genCpuIrFilename(udf_file_name));
 
-  std::vector<const char*> command_line{clang_path_.c_str(),
+  std::vector<std::string> command_line{clang_path_,
                                         "-c",
                                         "-O2",
                                         "-emit-llvm",
                                         "-o",
-                                        cpu_outName.c_str(),
+                                        cpu_out_filename,
                                         "-std=c++14",
                                         udf_file_name};
 
@@ -304,7 +317,7 @@ int UdfCompiler::parseToAst(const char* file_name) {
   llvm::raw_fd_ostream out_file(
       llvm::StringRef(out_name), out_error_info, llvm::sys::fs::F_None);
 
-  auto factory = llvm::make_unique<ToolFactory>(out_file);
+  auto factory = std::make_unique<ToolFactory>(out_file);
   return tool.run(factory.get());
 }
 
@@ -336,16 +349,22 @@ void UdfCompiler::init(const std::string& clang_path) {
   }
 }
 
-UdfCompiler::UdfCompiler(const std::string& file_name, const std::string& clang_path)
-    : udf_file_name_(file_name), udf_ast_file_name_(file_name) {
+UdfCompiler::UdfCompiler(const std::string& file_name,
+                         CudaMgr_Namespace::NvidiaDeviceArch target_arch,
+                         const std::string& clang_path)
+    : udf_file_name_(file_name)
+    , udf_ast_file_name_(file_name)
+    , target_arch_(target_arch) {
   init(clang_path);
 }
 
 UdfCompiler::UdfCompiler(const std::string& file_name,
+                         CudaMgr_Namespace::NvidiaDeviceArch target_arch,
                          const std::string& clang_path,
                          const std::vector<std::string> clang_options)
     : udf_file_name_(file_name)
     , udf_ast_file_name_(file_name)
+    , target_arch_(target_arch)
     , clang_options_(clang_options) {
   init(clang_path);
 }

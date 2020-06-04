@@ -26,8 +26,6 @@
 #include "../Shared/file_delete.h"
 #include "TestHelpers.h"
 
-#include "../Shared/ConfigResolve.h"
-
 // uncomment to run full test suite
 // #define RUN_ALL_TEST
 
@@ -1151,6 +1149,27 @@ TEST(Itas, DifferentColumnNames) {
   check(30, 3);
 }
 
+TEST(Itas, SelectStar) {
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE_1;");
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_SOURCE_2;");
+  run_ddl_statement("DROP TABLE IF EXISTS ITAS_TARGET;");
+
+  run_ddl_statement("CREATE TABLE ITAS_SOURCE_1 (id int);");
+  run_ddl_statement("CREATE TABLE ITAS_SOURCE_2 (id int, val int);");
+  run_ddl_statement("CREATE TABLE ITAS_TARGET (id int, val int);");
+
+  run_multiple_agg("INSERT INTO ITAS_SOURCE_1 VALUES(1); ", ExecutorDeviceType::CPU);
+  run_multiple_agg("INSERT INTO ITAS_SOURCE_2 VALUES(1, 2); ", ExecutorDeviceType::CPU);
+
+  EXPECT_NO_THROW(run_ddl_statement(
+      "INSERT INTO ITAS_TARGET SELECT ITAS_SOURCE_1.*, ITAS_SOURCE_2.val FROM "
+      "ITAS_SOURCE_1 JOIN ITAS_SOURCE_2 on ITAS_SOURCE_1.id = ITAS_SOURCE_2.id;"));
+
+  run_ddl_statement("DROP TABLE ITAS_SOURCE_1;");
+  run_ddl_statement("DROP TABLE ITAS_SOURCE_2;");
+  run_ddl_statement("DROP TABLE ITAS_TARGET;");
+}
+
 void itasTestBody(std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
                   std::string sourcePartitionScheme = ")",
                   std::string targetPartitionScheme = ")",
@@ -1395,12 +1414,6 @@ TEST(Update, InvalidTextArrayAssignment) {
 }
 
 TEST_P(Update, UpdateColumnByColumn) {
-  // disable if varlen update is not enabled
-  if (!is_feature_enabled<VarlenUpdates>()) {
-    LOG(WARNING) << "skipping...";
-    return;
-  }
-
   run_ddl_statement("DROP TABLE IF EXISTS update_test;");
 
   std::string create_sql = "CREATE TABLE update_test(id int";
@@ -1485,12 +1498,6 @@ TEST_P(Update, UpdateColumnByColumn) {
 void updateColumnByLiteralTest(
     std::vector<std::shared_ptr<TestColumnDescriptor>>& columnDescriptors,
     size_t numColsToUpdate) {
-  // disable if varlen update is not enabled
-  if (!is_feature_enabled<VarlenUpdates>()) {
-    LOG(WARNING) << "skipping...";
-    return;
-  }
-
   run_ddl_statement("DROP TABLE IF EXISTS update_test;");
 
   std::string create_sql = "CREATE TABLE update_test(id int";

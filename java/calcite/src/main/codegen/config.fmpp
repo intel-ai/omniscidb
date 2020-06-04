@@ -28,9 +28,11 @@ data: {
         "com.mapd.parser.extension.ddl.SqlCreateServer"
         "com.mapd.parser.extension.ddl.SqlDropServer"
         "com.mapd.parser.extension.ddl.SqlShowTables"
+        "com.mapd.parser.extension.ddl.SqlAlterServer"
         "com.mapd.parser.extension.ddl.SqlCreateForeignTable"
         "com.mapd.parser.extension.ddl.SqlDropForeignTable"
         "com.mapd.parser.extension.ddl.SqlShowUserSessions"
+        "com.mapd.parser.extension.ddl.SqlShowForeignServers"
         "com.mapd.parser.extension.ddl.omnisql.*"
         "java.util.Map"
         "java.util.HashMap"
@@ -42,7 +44,6 @@ data: {
         "IF"
         "FIXED"
         "DICT"
-        "DAYS"
         "COMPRESSED"
         "POINT"
         "POLYGON"
@@ -52,6 +53,9 @@ data: {
         "SESSIONS"
         "TABLES"
         "DATABASES"
+        "SERVERS"
+        "OWNER"
+        "RENAME"
       ]
 
       # List of keywords from "keywords" section that are not reserved.
@@ -86,11 +90,11 @@ data: {
         "CATALOG_NAME"
         "CENTURY"
         "CHAIN"
+        "CHARACTERISTICS"
+        "CHARACTERS"
         "CHARACTER_SET_CATALOG"
         "CHARACTER_SET_NAME"
         "CHARACTER_SET_SCHEMA"
-        "CHARACTERISTICS"
-        "CHARACTERS"
         "CLASS_ORIGIN"
         "COBOL"
         "COLLATION"
@@ -107,8 +111,8 @@ data: {
         "CONNECTION_NAME"
         "CONSTRAINT_CATALOG"
         "CONSTRAINT_NAME"
-        "CONSTRAINT_SCHEMA"
         "CONSTRAINTS"
+        "CONSTRAINT_SCHEMA"
         "CONSTRUCTOR"
         "CONTINUE"
         "CURSOR_NAME"
@@ -116,6 +120,7 @@ data: {
         "DATABASE"
         "DATETIME_INTERVAL_CODE"
         "DATETIME_INTERVAL_PRECISION"
+        "DAYS"
         "DECADE"
         "DEFAULTS"
         "DEFERRABLE"
@@ -157,6 +162,7 @@ data: {
         "GOTO"
         "GRANTED"
         "HIERARCHY"
+        "HOURS"
         "IGNORE"
         "IMMEDIATE"
         "IMMEDIATELY"
@@ -169,8 +175,8 @@ data: {
         "INSTANTIABLE"
         "INVOKER"
         "ISODOW"
-        "ISOYEAR"
         "ISOLATION"
+        "ISOYEAR"
         "JAVA"
         "JSON"
         "K"
@@ -187,13 +193,15 @@ data: {
         "MAP"
         "MATCHED"
         "MAXVALUE"
-        "MICROSECOND"
         "MESSAGE_LENGTH"
         "MESSAGE_OCTET_LENGTH"
         "MESSAGE_TEXT"
-        "MILLISECOND"
+        "MICROSECOND"
         "MILLENNIUM"
+        "MILLISECOND"
+        "MINUTES"
         "MINVALUE"
+        "MONTHS"
         "MORE_"
         "MUMPS"
         "NAME"
@@ -260,6 +268,7 @@ data: {
         "SCOPE_CATALOGS"
         "SCOPE_NAME"
         "SCOPE_SCHEMA"
+        "SECONDS"
         "SECTION"
         "SECURITY"
         "SELF"
@@ -300,8 +309,8 @@ data: {
         "SQL_INTERVAL_YEAR"
         "SQL_INTERVAL_YEAR_TO_MONTH"
         "SQL_LONGVARBINARY"
-        "SQL_LONGVARNCHAR"
         "SQL_LONGVARCHAR"
+        "SQL_LONGVARNCHAR"
         "SQL_NCHAR"
         "SQL_NCLOB"
         "SQL_NUMERIC"
@@ -344,6 +353,7 @@ data: {
         "TRIGGER_CATALOG"
         "TRIGGER_NAME"
         "TRIGGER_SCHEMA"
+        "TUMBLE"
         "TYPE"
         "UNBOUNDED"
         "UNCOMMITTED"
@@ -355,17 +365,28 @@ data: {
         "USER_DEFINED_TYPE_CODE"
         "USER_DEFINED_TYPE_NAME"
         "USER_DEFINED_TYPE_SCHEMA"
-        "UTF8"
         "UTF16"
         "UTF32"
+        "UTF8"
         "VERSION"
         "VIEW"
         "WEEK"
-        "WRAPPER"
         "WORK"
+        "WRAPPER"
         "WRITE"
         "XML"
+        "YEARS"
         "ZONE"
+      ]
+
+      # List of non-reserved keywords to add;
+      # items in this list become non-reserved
+      nonReservedKeywordsToAdd: [
+      ]
+
+      # List of non-reserved keywords to remove;
+      # items in this list become reserved
+      nonReservedKeywordsToRemove: [
       ]
 
       # List of additional join types. Each is a method with no arguments.
@@ -378,6 +399,8 @@ data: {
         "SqlShowUserSessions(span())"
         "SqlShowTables(span())"
         "SqlShowDatabases(span())"
+        "SqlShowForeignServers(span())"
+        "SqlAlterServer(span())"
       ]
 
       # List of methods for parsing custom literals.
@@ -415,6 +438,7 @@ data: {
         "SqlDropServer"
         "SqlDropForeignTable"
       ]
+
 
       # Binary operators tokens
       binaryOperatorsTokens: [
