@@ -6,9 +6,6 @@ set(CMAKE_ENABLE_EXPORTS True)
 set(ENABLE_CONDA OFF)
 if(DEFINED ENV{CONDA_PREFIX})
   set(ENABLE_CONDA ON)
-  list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
-  # resolves link issue for zlib 
-  link_directories("$ENV{CONDA_PREFIX}/lib")
   # various fixes and workarounds
   add_definitions("-Dsecure_getenv=getenv")
   # fixes `undefined reference to `boost::system::detail::system_category_instance'`:
@@ -19,6 +16,9 @@ if(DEFINED ENV{CONDA_PREFIX})
   add_compile_options("-fno-semantic-interposition")
   # Adding `--sysroot=...` resolves `no member named 'signbit' in the global namespace` error:
   set(CMAKE_SYSROOT "$ENV{CONDA_BUILD_SYSROOT}")
+  link_directories("$ENV{CONDA_PREFIX}/lib")  # resolves link issue for zlib 
+  # Adding sysroot include dir resolves `cassert file not found` error:
+  include_directories(SYSTEM "$ENV{CONDA_BUILD_SYSROOT}/usr/include")
 endif(DEFINED ENV{CONDA_PREFIX})
 
 # force `Release` build type if left unspecified
