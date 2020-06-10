@@ -95,7 +95,7 @@ extern bool g_cache_string_hash;
 
 // Serialize temp tables to a json file in the Catalogs directory for Calcite parsing
 // under unit testing.
-bool g_serialize_temp_tables{false};
+bool g_serialize_temp_tables{true};
 
 namespace Catalog_Namespace {
 
