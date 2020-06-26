@@ -16,7 +16,7 @@ dbe = Extension("dbe",
                   "@CMAKE_SOURCE_DIR@",
                   "@CMAKE_CURRENT_SOURCE_DIR@"
                 ],
-                library_dirs=pa.get_library_dirs() + ['.'],
+                library_dirs=pa.get_library_dirs() + ['.'] + ["@CMAKE_CURRENT_BINARY_DIR@"],
                 runtime_library_dirs=pa.get_library_dirs() + ['$ORIGIN/../../'],
                 libraries=pa.get_libraries() + ['DBEngine', 'boost_system'],
                 extra_compile_args=['-std=c++17'],
