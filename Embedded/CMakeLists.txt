@@ -26,7 +26,7 @@ IF(PYTHON)
         cd ${CMAKE_CURRENT_BINARY_DIR} && pip install -e .
         DEPENDS Python)
 
-    install(CODE "execute_process(COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && python3 setup.py install -f)")
+    install(CODE "execute_process(COMMAND python3 ${SETUP_PY} install -f)")
 
 ENDIF(PYTHON)
 #TODO: Some assertion if no Python was found
