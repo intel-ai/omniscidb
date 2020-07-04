@@ -17,7 +17,7 @@ dbe = Extension("dbe",
                   "@CMAKE_CURRENT_SOURCE_DIR@"
                 ],
                 library_dirs=pa.get_library_dirs() + ['.'],
-                runtime_library_dirs=pa.get_library_dirs() + ['$ORIGIN/../../'],
+                runtime_library_dirs=pa.get_library_dirs(),
                 libraries=pa.get_libraries() + ['DBEngine', 'boost_system'],
                 extra_compile_args=['-std=c++17'],
               )
@@ -33,7 +33,7 @@ setup(
     include_path=["@CMAKE_CURRENT_SOURCE_DIR@"],
   ),
   data_files=[
-    ("lib", ["$<TARGET_FILE:DBEngine>"]),
+    ("lib", ["$<TARGET_FILE:DBEngine>", "@CMAKE_BINARY_DIR@/QueryEngine/RuntimeFunctions.bc"]),
     ('include', [
       "@CMAKE_CURRENT_SOURCE_DIR@/DBEngine.h",
       "@CMAKE_CURRENT_SOURCE_DIR@/DBEngine.pxd",

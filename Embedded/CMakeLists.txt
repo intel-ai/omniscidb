@@ -20,7 +20,8 @@ IF(PYTHON)
         COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && python3 ${SETUP_PY} build_ext -g -f -I ${CMAKE_CURRENT_SOURCE_DIR}
         )
 
-    add_custom_target(Python ALL DEPENDS ${OUTPUT_DBE})
+    add_custom_target(DB_Ext ALL DEPENDS ${OUTPUT_DBE})
+    add_dependencies(DB_Ext DBEngine)
 
     add_custom_target(editable-install
         cd ${CMAKE_CURRENT_BINARY_DIR} && pip install -e .
