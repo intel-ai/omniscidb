@@ -68,6 +68,7 @@ class ParserWrapper {
   bool is_copy_to = false;
   bool is_optimize = false;
   bool is_validate = false;
+  bool is_exec_ra = false;
   std::string actual_query;
 
   DMLType getDMLType() const { return dml_type_; }
@@ -123,6 +124,7 @@ class ParserWrapper {
   static const std::string plan_explain_str;
   static const std::string optimize_str;
   static const std::string validate_str;
+  static const std::string exec_ra_str;
 
   bool is_legacy_ddl_ = false;
   bool is_calcite_ddl_ = false;

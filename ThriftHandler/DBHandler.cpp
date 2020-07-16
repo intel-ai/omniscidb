@@ -5082,12 +5082,16 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
               legacylockmgr::ExecutorOuterLock, true));
 
       std::string query_ra;
-      _return.execution_time_ms += measure<>::execution([&]() {
-        TPlanResult result;
-        std::tie(result, locks) =
-            parse_to_ra(query_state_proxy, query_str, {}, true, mapd_parameters_);
-        query_ra = result.plan_result;
-      });
+      if (pw.is_exec_ra) {
+        query_ra = pw.actual_query;
+      } else {
+        _return.execution_time_ms += measure<>::execution([&]() {
+          TPlanResult result;
+          std::tie(result, locks) =
+              parse_to_ra(query_state_proxy, query_str, {}, true, mapd_parameters_);
+          query_ra = result.plan_result;
+        });
+      }
 
       std::string query_ra_calcite_explain;
       if (pw.isCalciteExplain() && (!g_enable_filter_push_down || g_cluster)) {

@@ -849,7 +849,10 @@ TemporaryTable get_separate_results(
 
 }  // namespace
 
-TemporaryTable Executor::resultsUnion(ExecutionDispatch& execution_dispatch, bool merge) {
+TemporaryTable Executor::resultsUnion(ExecutionDispatch& execution_dispatch,
+                                      bool merge,
+                                      bool sort_by_table_id,
+                                      const std::map<int, size_t>& order_map) {
   auto& results_per_device = execution_dispatch.getFragmentResults();
   if (results_per_device.empty()) {
     const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
@@ -863,16 +866,25 @@ TemporaryTable Executor::resultsUnion(ExecutionDispatch& execution_dispatch, boo
                                        row_set_mem_owner_,
                                        this);
   }
-  if (merge) {
-    using IndexedResultSet = std::pair<ResultSetPtr, std::vector<size_t>>;
-    std::sort(results_per_device.begin(),
-              results_per_device.end(),
-              [](const IndexedResultSet& lhs, const IndexedResultSet& rhs) {
-                CHECK_GE(lhs.second.size(), size_t(1));
-                CHECK_GE(rhs.second.size(), size_t(1));
-                return lhs.second.front() < rhs.second.front();
-              });
 
+  using IndexedResultSet = std::pair<ResultSetPtr, std::vector<size_t>>;
+  std::sort(results_per_device.begin(),
+            results_per_device.end(),
+            [sort_by_table_id, &order_map](const IndexedResultSet& lhs,
+                                           const IndexedResultSet& rhs) {
+              CHECK_GE(lhs.second.size(), size_t(1));
+              CHECK_GE(rhs.second.size(), size_t(1));
+              if (sort_by_table_id) {
+                auto ltid = lhs.first->getOuterTableId();
+                auto rtid = rhs.first->getOuterTableId();
+                if (ltid != rtid) {
+                  return order_map.at(ltid) < order_map.at(rtid);
+                }
+              }
+              return lhs.second.front() < rhs.second.front();
+            });
+
+  if (merge) {
     return {get_merged_result(results_per_device)};
   }
   return get_separate_results(results_per_device);
@@ -1477,7 +1489,14 @@ TemporaryTable Executor::executeWorkUnitImpl(
         continue;
       }
     }
-    return resultsUnion(execution_dispatch, !eo.multifrag_result);
+    std::map<int, size_t> order_map;
+    if (eo.preserve_order) {
+      for (size_t i = 0; i < ra_exe_unit.input_descs.size(); ++i) {
+        order_map[ra_exe_unit.input_descs[i].getTableId()] = i;
+      }
+    }
+    return resultsUnion(
+        execution_dispatch, !eo.multifrag_result, eo.preserve_order, order_map);
 
   } while (static_cast<size_t>(crt_min_byte_width) <= sizeof(int64_t));
 

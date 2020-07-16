@@ -86,7 +86,7 @@ if(PREFER_STATIC_LIBS)
 else()
   add_definitions("-DBOOST_LOG_DYN_LINK")
 endif()
-
+link_libraries(z)
 # Required for macOS with Boost 1.71.0+
 # See https://gitlab.kitware.com/cmake/cmake/issues/19714
 set(Boost_NO_BOOST_CMAKE 1)

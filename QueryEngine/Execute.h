@@ -749,7 +749,10 @@ class Executor {
                              CodeCache&);
 
  private:
-  TemporaryTable resultsUnion(ExecutionDispatch& execution_dispatch, bool merge = true);
+  TemporaryTable resultsUnion(ExecutionDispatch& execution_dispatch,
+                              bool merge = true,
+                              bool sort_by_table_id = false,
+                              const std::map<int, size_t>& order_map = {});
   std::vector<int64_t> getJoinHashTablePtrs(const ExecutorDeviceType device_type,
                                             const int device_id);
   ResultSetPtr reduceMultiDeviceResults(

@@ -54,11 +54,18 @@ const std::string ParserWrapper::optimized_explain_str = {"explain optimized"};
 const std::string ParserWrapper::plan_explain_str = {"explain plan"};
 const std::string ParserWrapper::optimize_str = {"optimize"};
 const std::string ParserWrapper::validate_str = {"validate"};
+const std::string ParserWrapper::exec_ra_str = {"execute relalg"};
 
 extern bool g_enable_fsi;
 
 ParserWrapper::ParserWrapper(std::string query_string) {
   query_type_ = QueryType::SchemaRead;
+  if (boost::istarts_with(query_string, exec_ra_str)) {
+    actual_query = boost::trim_copy(query_string.substr(exec_ra_str.size()));
+    is_exec_ra = true;
+    return;
+  }
+
   if (boost::istarts_with(query_string, calcite_explain_str)) {
     actual_query = boost::trim_copy(query_string.substr(calcite_explain_str.size()));
     ParserWrapper inner{actual_query};

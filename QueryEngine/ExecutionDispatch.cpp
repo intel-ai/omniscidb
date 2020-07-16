@@ -283,6 +283,7 @@ void Executor::ExecutionDispatch::runImpl(
   {
     std::lock_guard<std::mutex> lock(reduce_mutex_);
     if (!needs_skip_result(device_results)) {
+      device_results->setOuterTableId(outer_table_id);
       all_fragment_results_.emplace_back(std::move(device_results), outer_tab_frag_ids);
     }
   }
