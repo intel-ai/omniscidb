@@ -161,7 +161,7 @@ void ArrowForeignStorageBase::setNullValues(const std::vector<Frag>& fragments,
                   // copiing
                   // TODO: add support for sentinel values to read_csv
                   auto data = const_cast<uint8_t*>(chunk->data()->buffers[1]->data());
-                  if (data) {  // TODO: to be checked and possibly reimplemented
+                  if (data && chunk->null_bitmap()) {  // TODO: to be checked and possibly reimplemented
                     // CHECK(data) << " is null";
                     T* dataT = reinterpret_cast<T*>(data);
                     const uint8_t* bitmap_data = chunk->null_bitmap_data();
