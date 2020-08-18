@@ -406,7 +406,9 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
         }
       }
       if (ctype != kDECIMAL && ctype != kNUMERIC && !c.columnType.is_string()) {
-        generateNullValues(fragments, arr_col_chunked_array, c.columnType);
+        tg.run([this, fragments, arr_col_chunked_array, type=c.columnType]() {
+          generateNullValues(fragments, arr_col_chunked_array, type);
+        });
       }
     }
   }  // each col and fragment
