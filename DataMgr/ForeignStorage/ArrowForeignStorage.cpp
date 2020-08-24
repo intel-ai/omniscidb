@@ -24,7 +24,7 @@
 #include <tbb/task_group.h>
 #include <array>
 #include <future>
-
+#include <vector>
 #include "Catalog/DataframeTableDescriptor.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
 #include "DataMgr/StringNoneEncoder.h"
@@ -71,6 +71,15 @@ class ArrowForeignStorageBase : public PersistentForeignStorageInterface {
                                      const std::vector<Frag>& fragments,
                                      ChunkKey key,
                                      Data_Namespace::AbstractBufferMgr* mgr);
+
+  void convertArrowDictionary(StringDictionary* dict,
+                              const ColumnDescriptor& c,
+                              std::vector<ArrowFragment>& col,
+                              arrow::ChunkedArray* arr_col_chunked_array,
+                              tbb::task_group& tg,
+                              const std::vector<Frag>& fragments,
+                              ChunkKey key,
+                              Data_Namespace::AbstractBufferMgr* mgr);
 
   template <typename T, typename ChunkType>
   void createDecimalColumn(const ColumnDescriptor& c,
@@ -161,7 +170,8 @@ void ArrowForeignStorageBase::setNullValues(const std::vector<Frag>& fragments,
                   // copiing
                   // TODO: add support for sentinel values to read_csv
                   auto data = const_cast<uint8_t*>(chunk->data()->buffers[1]->data());
-                  if (data && chunk->null_bitmap()) {  // TODO: to be checked and possibly reimplemented
+                  if (data && chunk->null_bitmap()) {  // TODO: to be checked and possibly
+                                                       // reimplemented
                     // CHECK(data) << " is null";
                     T* dataT = reinterpret_cast<T*>(data);
                     const uint8_t* bitmap_data = chunk->null_bitmap_data();
@@ -308,8 +318,18 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
       auto dictDesc = const_cast<DictDescriptor*>(
           catalog->getMetadataForDict(c.columnType.get_comp_param()));
       StringDictionary* dict = dictDesc->stringDict.get();
-      createDictionaryEncodedColumn(
-          dict, c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+      switch (arr_col_chunked_array->type()->id()) {
+        case arrow::Type::STRING:
+          createDictionaryEncodedColumn(
+              dict, c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+          break;
+        case arrow::Type::DICTIONARY:
+          convertArrowDictionary(
+              dict, c, col, arr_col_chunked_array, tg, fragments, key, mgr);
+          break;
+        default:
+          CHECK(false);
+      }
     } else if (ctype == kDECIMAL || ctype == kNUMERIC) {
       tg.run([this, &c, &col, arr_col_chunked_array, &tg, &fragments, key, mgr]() {
         switch (c.columnType.get_size()) {
@@ -625,6 +645,79 @@ void ArrowForeignStorageBase::createDictionaryEncodedColumn(
   });
 }
 
+void ArrowForeignStorageBase::convertArrowDictionary(
+    StringDictionary* dict,
+    const ColumnDescriptor& c,
+    std::vector<ArrowFragment>& col,
+    arrow::ChunkedArray* arr_col_chunked_array,
+    tbb::task_group& tg,
+    const std::vector<Frag>& fragments,
+    ChunkKey key,
+    Data_Namespace::AbstractBufferMgr* mgr) {
+  tg.run([this, dict, &c, &col, arr_col_chunked_array, &tg, &fragments, k = key, mgr]() {
+    auto key = k;
+    // TODO: allocate one big array and split it by fragments as it is done in
+    // createDictionaryEncodedColumn
+    std::vector<std::shared_ptr<arrow::Array>> converted_chunks;
+    for (auto& chunk : arr_col_chunked_array->chunks()) {
+      auto dict_array = std::static_pointer_cast<arrow::DictionaryArray>(chunk);
+      auto values =
+          std::static_pointer_cast<arrow::StringArray>(dict_array->dictionary());
+      std::vector<std::string_view> strings(values->length());
+      for (int i = 0; i < values->length(); i++) {
+        auto view = values->GetView(i);
+        strings[i] = std::string_view(view.data(), view.length());
+      }
+      auto arrow_indices =
+          std::static_pointer_cast<arrow::Int32Array>(dict_array->indices());
+      std::vector<int> indices_mapping(values->length());
+      dict->getOrAddBulk(strings, indices_mapping.data());
+
+      // create new arrow chunk with remapped indices
+      std::shared_ptr<arrow::Buffer> dict_indices_buf;
+      ARROW_THROW_NOT_OK(arrow::AllocateBuffer(arrow_indices->length() * sizeof(int32_t),
+                                               &dict_indices_buf));
+      auto raw_data = reinterpret_cast<int32_t*>(dict_indices_buf->mutable_data());
+
+      for (int i = 0; i < arrow_indices->length(); i++) {
+        raw_data[i] = indices_mapping[arrow_indices->Value(i)];
+      }
+
+      converted_chunks.push_back(
+          std::make_shared<arrow::Int32Array>(arrow_indices->length(), dict_indices_buf));
+    }
+
+    for (size_t f = 0; f < fragments.size(); f++) {
+      auto& frag = col[f];
+      frag.chunks.resize(fragments[f].last_chunk - fragments[f].first_chunk + 1);
+      for (int i = fragments[f].first_chunk, e = fragments[f].last_chunk; i <= e; i++) {
+        int size, offset;
+        getSizeAndOffset(fragments[f], arr_col_chunked_array->chunk(i), i, size, offset);
+        frag.offset += offset;
+        frag.sz += size;
+        frag.chunks[i - fragments[f].first_chunk] = converted_chunks[i]->data();
+      }
+
+      auto b = mgr->createBuffer(key);
+      b->sql_type = c.columnType;
+      b->setSize(frag.sz * b->sql_type.get_size());
+      b->encoder.reset(Encoder::Create(b, c.columnType));
+      b->has_encoder = true;
+      b->encoder->setNumElems(frag.sz);
+      tg.run([&frag, b]() {
+        for (size_t i = 0; i < frag.chunks.size(); i++) {
+          auto& chunk = frag.chunks[i];
+          int offset = chunk->offset;
+          size_t size = chunk->length;
+          auto data = chunk->buffers[1]->data();
+          b->encoder->updateStats((const int8_t*)data + offset * b->sql_type.get_size(),
+                                  size);
+        }
+      });
+    }
+  });
+}
+
 template <typename T, typename ChunkType>
 void ArrowForeignStorageBase::createDecimalColumn(
     const ColumnDescriptor& c,
@@ -768,13 +861,15 @@ static SQLTypeInfo getOmnisciType(const arrow::DataType& type) {
       return SQLTypeInfo(kFLOAT, false);
     case Type::DOUBLE:
       return SQLTypeInfo(kDOUBLE, false);
-    case Type::STRING: {
+    case Type::DICTIONARY: {
       auto type = SQLTypeInfo(kTEXT, false, kENCODING_DICT);
       // this is needed because createTable forces type.size to be equal to
       // comp_param / 8, no matter what type.size you set here
       type.set_comp_param(sizeof(uint32_t) * 8);
       return type;
     }
+    case Type::STRING:
+      return SQLTypeInfo(kTEXT, false, kENCODING_NONE);
     case Type::DECIMAL: {
       const auto& decimal_type = static_cast<const arrow::DecimalType&>(type);
       return SQLTypeInfo(kDECIMAL, decimal_type.precision(), decimal_type.scale(), false);
