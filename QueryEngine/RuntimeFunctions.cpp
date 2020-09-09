@@ -111,37 +111,51 @@
     return null_val;                                              \
   }
 
-#define DEF_BINARY_NULLABLE_ALL_OPS(type, null_type) \
-  DEF_ARITH_NULLABLE(type, null_type, add, +)        \
-  DEF_ARITH_NULLABLE(type, null_type, sub, -)        \
-  DEF_ARITH_NULLABLE(type, null_type, mul, *)        \
-  DEF_ARITH_NULLABLE(type, null_type, div, /)        \
-  DEF_SAFE_DIV_NULLABLE(type, null_type, safe_div)   \
-  DEF_ARITH_NULLABLE_LHS(type, null_type, add, +)    \
-  DEF_ARITH_NULLABLE_LHS(type, null_type, sub, -)    \
-  DEF_ARITH_NULLABLE_LHS(type, null_type, mul, *)    \
-  DEF_ARITH_NULLABLE_LHS(type, null_type, div, /)    \
-  DEF_ARITH_NULLABLE_RHS(type, null_type, add, +)    \
-  DEF_ARITH_NULLABLE_RHS(type, null_type, sub, -)    \
-  DEF_ARITH_NULLABLE_RHS(type, null_type, mul, *)    \
-  DEF_ARITH_NULLABLE_RHS(type, null_type, div, /)    \
-  DEF_CMP_NULLABLE(type, null_type, eq, ==)          \
-  DEF_CMP_NULLABLE(type, null_type, ne, !=)          \
-  DEF_CMP_NULLABLE(type, null_type, lt, <)           \
-  DEF_CMP_NULLABLE(type, null_type, gt, >)           \
-  DEF_CMP_NULLABLE(type, null_type, le, <=)          \
-  DEF_CMP_NULLABLE(type, null_type, ge, >=)          \
-  DEF_CMP_NULLABLE_LHS(type, null_type, eq, ==)      \
-  DEF_CMP_NULLABLE_LHS(type, null_type, ne, !=)      \
-  DEF_CMP_NULLABLE_LHS(type, null_type, lt, <)       \
-  DEF_CMP_NULLABLE_LHS(type, null_type, gt, >)       \
-  DEF_CMP_NULLABLE_LHS(type, null_type, le, <=)      \
-  DEF_CMP_NULLABLE_LHS(type, null_type, ge, >=)      \
-  DEF_CMP_NULLABLE_RHS(type, null_type, eq, ==)      \
-  DEF_CMP_NULLABLE_RHS(type, null_type, ne, !=)      \
-  DEF_CMP_NULLABLE_RHS(type, null_type, lt, <)       \
-  DEF_CMP_NULLABLE_RHS(type, null_type, gt, >)       \
-  DEF_CMP_NULLABLE_RHS(type, null_type, le, <=)      \
+#define DEF_SAFE_INF_DIV_NULLABLE(type, null_type, opname)       \
+  extern "C" ALWAYS_INLINE type safe_inf_div_##type(             \
+      const type lhs, const type rhs, const null_type inf_val) { \
+    if (rhs != 0) {                                              \
+      return lhs / rhs;                                          \
+    }                                                            \
+    if (lhs > 0) {                                               \
+      return inf_val;                                            \
+    } else {                                                     \
+      return -inf_val;                                           \
+    }                                                            \
+  }
+
+#define DEF_BINARY_NULLABLE_ALL_OPS(type, null_type)       \
+  DEF_ARITH_NULLABLE(type, null_type, add, +)              \
+  DEF_ARITH_NULLABLE(type, null_type, sub, -)              \
+  DEF_ARITH_NULLABLE(type, null_type, mul, *)              \
+  DEF_ARITH_NULLABLE(type, null_type, div, /)              \
+  DEF_SAFE_DIV_NULLABLE(type, null_type, safe_div)         \
+  DEF_SAFE_INF_DIV_NULLABLE(type, null_type, safe_inf_div) \
+  DEF_ARITH_NULLABLE_LHS(type, null_type, add, +)          \
+  DEF_ARITH_NULLABLE_LHS(type, null_type, sub, -)          \
+  DEF_ARITH_NULLABLE_LHS(type, null_type, mul, *)          \
+  DEF_ARITH_NULLABLE_LHS(type, null_type, div, /)          \
+  DEF_ARITH_NULLABLE_RHS(type, null_type, add, +)          \
+  DEF_ARITH_NULLABLE_RHS(type, null_type, sub, -)          \
+  DEF_ARITH_NULLABLE_RHS(type, null_type, mul, *)          \
+  DEF_ARITH_NULLABLE_RHS(type, null_type, div, /)          \
+  DEF_CMP_NULLABLE(type, null_type, eq, ==)                \
+  DEF_CMP_NULLABLE(type, null_type, ne, !=)                \
+  DEF_CMP_NULLABLE(type, null_type, lt, <)                 \
+  DEF_CMP_NULLABLE(type, null_type, gt, >)                 \
+  DEF_CMP_NULLABLE(type, null_type, le, <=)                \
+  DEF_CMP_NULLABLE(type, null_type, ge, >=)                \
+  DEF_CMP_NULLABLE_LHS(type, null_type, eq, ==)            \
+  DEF_CMP_NULLABLE_LHS(type, null_type, ne, !=)            \
+  DEF_CMP_NULLABLE_LHS(type, null_type, lt, <)             \
+  DEF_CMP_NULLABLE_LHS(type, null_type, gt, >)             \
+  DEF_CMP_NULLABLE_LHS(type, null_type, le, <=)            \
+  DEF_CMP_NULLABLE_LHS(type, null_type, ge, >=)            \
+  DEF_CMP_NULLABLE_RHS(type, null_type, eq, ==)            \
+  DEF_CMP_NULLABLE_RHS(type, null_type, ne, !=)            \
+  DEF_CMP_NULLABLE_RHS(type, null_type, lt, <)             \
+  DEF_CMP_NULLABLE_RHS(type, null_type, gt, >)             \
+  DEF_CMP_NULLABLE_RHS(type, null_type, le, <=)            \
   DEF_CMP_NULLABLE_RHS(type, null_type, ge, >=)
 
 DEF_BINARY_NULLABLE_ALL_OPS(int8_t, int64_t)

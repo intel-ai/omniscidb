@@ -4467,6 +4467,24 @@ TEST(Select, ReturnNullFromDivByZero) {
   }
 }
 
+TEST(Select, ReturnInfFromDivByZero) {
+  SKIP_ALL_ON_AGGREGATOR();
+
+  g_inf_div_by_zero = true;
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    c("SELECT f / 0. FROM test;",
+      "SELECT CASE WHEN f / 0. IS NULL THEN 2e308 ELSE f / 0. END FROM test;",
+      dt);
+    c("SELECT d / 0. FROM test;",
+      "SELECT CASE WHEN d / 0. IS NULL THEN 2e308 ELSE d / 0. END FROM test;",
+      dt);
+    c("SELECT f / (f - f) FROM test;",
+      "SELECT CASE WHEN f / (f - f) IS NULL THEN 2e308 ELSE f / (f - f) END FROM test;",
+      dt);
+  }
+}
+
 TEST(Select, ConstantFolding) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();

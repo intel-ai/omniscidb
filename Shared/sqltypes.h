@@ -27,6 +27,7 @@
 
 #include <cassert>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <limits>
@@ -183,6 +184,9 @@ enum EncodingType {
 #define NULL_BIGINT INT64_MIN
 #define NULL_FLOAT FLT_MIN
 #define NULL_DOUBLE DBL_MIN
+
+#define INF_FLOAT HUGE_VALF
+#define INF_DOUBLE HUGE_VAL
 
 #define NULL_ARRAY_BOOLEAN (INT8_MIN + 1)
 #define NULL_ARRAY_TINYINT (INT8_MIN + 1)

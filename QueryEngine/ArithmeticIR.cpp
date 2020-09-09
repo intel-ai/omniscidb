@@ -474,6 +474,17 @@ llvm::Value* CodeGenerator::codegenDiv(llvm::Value* lhs_lv,
                          {lhs_lv, scale_lv, cgen_state_->llInt(inline_int_null_val(ti))});
     }
   }
+  if (g_inf_div_by_zero) {
+    llvm::Value* inf_lv{nullptr};
+    if (ti.is_fp()) {
+      inf_lv = ti.get_type() == kFLOAT ? cgen_state_->llFp(INF_FLOAT)
+                                       : cgen_state_->llFp(INF_DOUBLE);
+    } else {
+      inf_lv = cgen_state_->llInt(inline_int_null_val(ti));
+    }
+    return cgen_state_->emitCall("safe_inf_div_" + numeric_type_name(ti),
+                                 {lhs_lv, rhs_lv, inf_lv});
+  }
   if (g_null_div_by_zero) {
     llvm::Value* null_lv{nullptr};
     if (ti.is_fp()) {
