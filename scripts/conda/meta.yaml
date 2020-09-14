@@ -80,6 +80,22 @@ outputs:
         - tbb =2020.1
         - llvm 9
 
+    about:
+      home: https://www.omnisci.com/
+      license: Apache-2.0
+      license_family: APACHE
+      license_file: LICENSE.md
+      summary: 'The OmniSci database'
+      description: |
+        <strong>LEGAL NOTICE: Use of this software package is subject to the
+        software license agreement (as set forth above, in the license section of
+        the installed Conda package and/or the README file) and all notices,
+        disclaimers or license terms for third party or open source software
+        included in or with the software.</strong>
+        <br/><br/>
+        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        <br/><br/>
+
   - name: omniscidb-cpu
     script: install-omniscidb-cpu.sh
     requirements:
@@ -109,6 +125,21 @@ outputs:
         - omnisql -v
         - which omnisci_initdb
         - which omnisci_server
+    about:
+      home: https://www.omnisci.com/
+      license: Apache-2.0
+      license_family: APACHE
+      license_file: LICENSE.md
+      summary: 'The OmniSci database'
+      description: |
+        <strong>LEGAL NOTICE: Use of this software package is subject to the
+        software license agreement (as set forth above, in the license section of
+        the installed Conda package and/or the README file) and all notices,
+        disclaimers or license terms for third party or open source software
+        included in or with the software.</strong>
+        <br/><br/>
+        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        <br/><br/>
 
   - name: omniscidbe
     script: install-omniscidbe.sh
@@ -117,6 +148,22 @@ outputs:
         - cmake >3.14
       run:
         - {{ pin_subpackage('omniscidb-common', exact=True) }}
+    about:
+      home: https://www.omnisci.com/
+      license: Apache-2.0
+      license_family: APACHE
+      license_file: LICENSE.md
+      summary: 'The OmniSci database'
+      description: |
+        <strong>LEGAL NOTICE: Use of this software package is subject to the
+        software license agreement (as set forth above, in the license section of
+        the installed Conda package and/or the README file) and all notices,
+        disclaimers or license terms for third party or open source software
+        included in or with the software.</strong>
+        <br/><br/>
+        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        <br/><br/>
+
 
   - name: omniscidbe4py
     script: install-omniscidbe4py.sh
@@ -169,20 +216,25 @@ outputs:
     test:
       imports:
         - dbe
+    about:
+      home: https://www.omnisci.com/
+      license: Apache-2.0
+      license_family: APACHE
+      license_file: LICENSE.md
+      summary: 'The OmniSci DataBase Embedded'
+      description: |
+        <strong>LEGAL NOTICE: Use of this software package is subject to the
+        software license agreement (as set forth above, in the license section of
+        the installed Conda package and/or the README file) and all notices,
+        disclaimers or license terms for third party or open source software
+        included in or with the software.</strong>
+        <br/><br/>
+        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        <br/><br/>
+
 
 about:
   home: https://www.omnisci.com/
-  license: Apache-2.0
-  license_family: APACHE
-  license_file: LICENSE.md
-  summary: 'The OmniSci database'
-
-  description: |
-    LEGAL NOTICE: Use of this software package is subject to the software license
-    agreement (as set forth above, in the license section of the installed Conda
-    package and/or the README file) and all notices, disclaimers or license terms for
-    third party or open source software included in or with the software.
-    Third party programs: https://github.com/intel-go/omniscidb/blob/conda_build_changes/tpp.txt
   doc_url: https://www.omnisci.com/docs/latest/
   dev_url: https://github.com/omnisci/omniscidb
 
