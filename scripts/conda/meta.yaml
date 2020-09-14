@@ -85,7 +85,9 @@ outputs:
       license: Apache-2.0
       license_family: APACHE
       license_file: LICENSE.md
-      summary: 'The OmniSci database'
+      summary: 'Common parts for the OmniSci database'
+      doc_url: https://www.omnisci.com/docs/latest/
+      dev_url: https://github.com/omnisci/omniscidb
       description: |
         <strong>LEGAL NOTICE: Use of this software package is subject to the
         software license agreement (as set forth above, in the license section of
@@ -93,7 +95,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0</a>
         <br/><br/>
 
   - name: omniscidb-cpu
@@ -130,7 +132,9 @@ outputs:
       license: Apache-2.0
       license_family: APACHE
       license_file: LICENSE.md
-      summary: 'The OmniSci database'
+      summary: 'The OmniSci database server for CPU'
+      doc_url: https://www.omnisci.com/docs/latest/
+      dev_url: https://github.com/omnisci/omniscidb
       description: |
         <strong>LEGAL NOTICE: Use of this software package is subject to the
         software license agreement (as set forth above, in the license section of
@@ -138,7 +142,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0</a>
         <br/><br/>
 
   - name: omniscidbe
@@ -153,7 +157,9 @@ outputs:
       license: Apache-2.0
       license_family: APACHE
       license_file: LICENSE.md
-      summary: 'The OmniSci database'
+      summary: 'The OmniSci database as a library'
+      doc_url: https://www.omnisci.com/docs/latest/
+      dev_url: https://github.com/omnisci/omniscidb
       description: |
         <strong>LEGAL NOTICE: Use of this software package is subject to the
         software license agreement (as set forth above, in the license section of
@@ -161,7 +167,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0</a>
         <br/><br/>
 
 
@@ -221,7 +227,9 @@ outputs:
       license: Apache-2.0
       license_family: APACHE
       license_file: LICENSE.md
-      summary: 'The OmniSci DataBase Embedded'
+      summary: 'The OmniSci database library for Python'
+      doc_url: https://www.omnisci.com/docs/latest/
+      dev_url: https://github.com/omnisci/omniscidb
       description: |
         <strong>LEGAL NOTICE: Use of this software package is subject to the
         software license agreement (as set forth above, in the license section of
@@ -229,14 +237,8 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0</a>
         <br/><br/>
-
-
-about:
-  home: https://www.omnisci.com/
-  doc_url: https://www.omnisci.com/docs/latest/
-  dev_url: https://github.com/omnisci/omniscidb
 
 extra:
   recipe-maintainers:
