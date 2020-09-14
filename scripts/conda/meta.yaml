@@ -93,7 +93,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
         <br/><br/>
 
   - name: omniscidb-cpu
@@ -138,7 +138,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
         <br/><br/>
 
   - name: omniscidbe
@@ -161,7 +161,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
         <br/><br/>
 
 
@@ -229,7 +229,7 @@ outputs:
         disclaimers or license terms for third party or open source software
         included in or with the software.</strong>
         <br/><br/>
-        EULA: <a href="https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT " target="_blank">Apache-2.0 with LLVM-exception</a>
+        EULA: <a href="https://github.com/omnisci/omniscidb/blob/master/LICENSE.md" target="_blank">Apache-2.0 with LLVM-exception</a>
         <br/><br/>
 
 
