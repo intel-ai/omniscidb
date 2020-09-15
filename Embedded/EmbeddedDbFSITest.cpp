@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
     std::map<std::string, std::string> parameters = {
       {"path", base_path},
       {"port", std::to_string(calcite_port)}};
-    DBEngine* dbe = DBEngine::create(parameters);
+    DBEngine* dbe = DBEngine::init(parameters);
     if (dbe) {
       dbe->executeDDL(R"(
 CREATE TEMPORARY TABLE test (

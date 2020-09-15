@@ -38,8 +38,6 @@
 #include <csignal>
 #include <random>
 
-#define CALCITEPORT 3279
-
 extern size_t g_leaf_count;
 extern bool g_enable_filter_push_down;
 
@@ -116,6 +114,29 @@ QueryRunner* QueryRunner::init(const char* db_path,
   return qr_instance_.get();
 }
 
+QueryRunner* QueryRunner::init(const char* db_path,
+                               bool is_new_catalog,
+                               int calcite_port,
+                               const std::string& udf_filename) {
+  qr_instance_.reset(new QueryRunner(db_path,
+                                     std::string{OMNISCI_ROOT_USER},
+                                     "HyperInteractive",
+                                     std::string{OMNISCI_DEFAULT_DB},
+                                     {},
+                                     {},
+                                     udf_filename,
+                                     false,
+                                     0,
+                                     256 << 20,
+                                     true,
+                                     true,
+                                     ExecutorDeviceType::CPU,
+                                     is_new_catalog,
+                                     calcite_port));
+  return qr_instance_.get();
+}
+
+
 QueryRunner::QueryRunner(const char* db_path,
                          const std::string& user_name,
                          const std::string& passwd,
@@ -127,13 +148,18 @@ QueryRunner::QueryRunner(const char* db_path,
                          const size_t max_gpu_mem,
                          const int reserved_gpu_mem,
                          const bool create_user,
-                         const bool create_db) {
+                         const bool create_db,
+                         ExecutorDeviceType device_type,
+                         bool is_new_catalog,
+                         int calcite_port) {
   g_serialize_temp_tables = true;
 
   boost::filesystem::path base_path{db_path};
   CHECK(boost::filesystem::exists(base_path));
   auto system_db_file = base_path / "mapd_catalogs" / OMNISCI_DEFAULT_DB;
-  CHECK(boost::filesystem::exists(system_db_file));
+  if (!is_new_catalog) {
+    CHECK(boost::filesystem::exists(system_db_file));
+  }
   auto data_dir = base_path / "mapd_data";
   Catalog_Namespace::UserMetadata user;
   Catalog_Namespace::DBMetadata db;
@@ -141,7 +167,7 @@ QueryRunner::QueryRunner(const char* db_path,
   register_signal_handler();
   logger::set_once_fatal_func(&calcite_shutdown_handler);
   g_calcite =
-      std::make_shared<Calcite>(-1, CALCITEPORT, db_path, 1024, 5000, udf_filename);
+      std::make_shared<Calcite>(-1, calcite_port, db_path, 1024, 5000, udf_filename);
   ExtensionFunctionsWhitelist::add(g_calcite->getExtensionFunctionWhitelist());
   if (!udf_filename.empty()) {
     ExtensionFunctionsWhitelist::addUdfs(g_calcite->getUserDefinedFunctionWhitelist());
@@ -165,7 +191,7 @@ QueryRunner::QueryRunner(const char* db_path,
                data_mgr,
                {},
                g_calcite,
-               false,
+               is_new_catalog,
                mapd_params.aggregator,
                string_servers);
 
@@ -188,7 +214,7 @@ QueryRunner::QueryRunner(const char* db_path,
       base_path.string(), db, data_mgr, string_servers, g_calcite, create_db);
   Catalog_Namespace::Catalog::set(cat->getCurrentDB().dbName, cat);
   session_info_ = std::make_unique<Catalog_Namespace::SessionInfo>(
-      cat, user, ExecutorDeviceType::GPU, "");
+      cat, user, device_type, "");
 }
 
 QueryRunner::QueryRunner(std::unique_ptr<Catalog_Namespace::SessionInfo> session)

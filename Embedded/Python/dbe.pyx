@@ -159,14 +159,13 @@ ColumnDetailsTp = namedtuple("ColumnDetails", ["name", "type", "nullable",
                                              "comp_param", "encoding",
                                              "is_array"])
 cdef class PyDbEngine:
-    cdef DBEngine* c_dbe  #Hold a C++ instance which we're wrapping
     cdef map[string, string] c_parameters
 
     def __cinit__(self, **kwargs):
         try:
             for key, value in kwargs.items():
                 self.c_parameters[key] = str(value)
-            self.c_dbe = DBEngine.create(self.c_parameters)
+            DBEngine.init(self.c_parameters)
             assert not self.closed
         except OSError as err:
             print("DBEngine: OS error: {0}".format(err))
@@ -178,15 +177,9 @@ cdef class PyDbEngine:
             print("DBEngine: Unexpected error while constructing", sys.exc_info()[0], sys.exc_info()[1])
             raise
 
-    def __dealloc__(self):
-        assert not self.closed
-        self.c_dbe.reset()
-        del self.c_dbe
-        self.c_dbe = NULL
-
     @property
     def closed(self):
-        return self.c_dbe == NULL
+        return DBEngine.get() == NULL
 
     def close(self):
         pass
@@ -194,20 +187,20 @@ cdef class PyDbEngine:
     def executeDDL(self, query):
         try:
             assert not self.closed
-            self.c_dbe.executeDDL(bytes(query, 'utf-8'))
+            DBEngine.get().executeDDL(bytes(query, 'utf-8'))
         except Exception, e:
             os.abort()
 
     def executeDML(self, query):
         obj = PyCursor();
         assert not self.closed
-        obj.c_cursor = self.c_dbe.executeDML(bytes(query, 'utf-8'));
+        obj.c_cursor = DBEngine.get().executeDML(bytes(query, 'utf-8'));
         return obj;
 
     def executeRA(self, query):
         obj = PyCursor();
         assert not self.closed
-        obj.c_cursor = self.c_dbe.executeRA(bytes(query, 'utf-8'));
+        obj.c_cursor = DBEngine.get().executeRA(bytes(query, 'utf-8'));
         return obj
 
     def importArrowTable(self, name, table, **kwargs):
@@ -217,7 +210,7 @@ cdef class PyDbEngine:
         cdef uint64_t fragment_size = kwargs.get("fragment_size", 0)
         assert t.get() and not n.empty()
         assert not self.closed
-        self.c_dbe.importArrowTable(n, t, fragment_size)
+        DBEngine.get().importArrowTable(n, t, fragment_size)
 
     # TODO: remove this legacy alias.
     def consumeArrowTable(self, name, table, **kwargs):
@@ -226,12 +219,12 @@ cdef class PyDbEngine:
     def select_df(self, query):
         obj = PyCursor();
         assert not self.closed
-        obj.c_cursor = self.c_dbe.executeDML(bytes(query, 'utf-8'));
+        obj.c_cursor = DBEngine.get().executeDML(bytes(query, 'utf-8'));
         prb = obj.getArrowRecordBatch()
         return prb.to_pandas()
 
     def get_table_details(self, table_name):
-        cdef vector[ColumnDetails] table_details = self.c_dbe.getTableDetails(bytes(table_name, 'utf-8'))
+        cdef vector[ColumnDetails] table_details = DBEngine.get().getTableDetails(bytes(table_name, 'utf-8'))
         return [
             ColumnDetailsTp(x.col_name, PyColumnType(<int>x.col_type).to_str(),
                             x.nullable, x.precision, x.scale, x.comp_param,
@@ -240,4 +233,4 @@ cdef class PyDbEngine:
         ]
 
     def get_tables(self):
-        return self.c_dbe.getTables()
+        return DBEngine.get().getTables()

@@ -31,6 +31,8 @@
 #include "QueryEngine/OverlapsJoinHashTable.h"
 #include "ThriftHandler/QueryState.h"
 
+#define CALCITEPORT 3279
+
 namespace Catalog_Namespace {
 class Catalog;
 struct UserMetadata;
@@ -94,6 +96,11 @@ class QueryRunner {
                            const int reserved_gpu_mem = 256 << 20,
                            const bool create_user = false,
                            const bool create_db = false);
+
+  static QueryRunner* init(const char* db_path,
+                           bool is_new_catalog,
+                           int calcite_port = CALCITEPORT,
+                           const std::string& udf_filename = "");
 
   static QueryRunner* init(std::unique_ptr<Catalog_Namespace::SessionInfo>& session) {
     qr_instance_.reset(new QueryRunner(std::move(session)));
@@ -177,7 +184,10 @@ class QueryRunner {
               const size_t max_gpu_mem,
               const int reserved_gpu_mem,
               const bool create_user,
-              const bool create_db);
+              const bool create_db,
+              ExecutorDeviceType device_type = ExecutorDeviceType::GPU,
+              bool is_new_catalog = false,
+              int calcite_port = CALCITEPORT);
 
   static std::unique_ptr<QueryRunner> qr_instance_;
 

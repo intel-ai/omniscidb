@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
     std::map<std::string, std::string> parameters = {
       {"path", base_path},
       {"port", std::to_string(calcite_port)}};
-    auto dbe = DBEngine::create(parameters);
+    auto dbe = DBEngine::init(parameters);
 
     if (dbe) {
       auto memory_pool = arrow::default_memory_pool();

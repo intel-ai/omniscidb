@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
   std::map<std::string, std::string> parameters = {
     {"path", std::string(BASE_PATH)}};
 
-  engine = DBEngine::create(parameters);
+  engine = DBEngine::init(parameters);
 
   int err{0};
 

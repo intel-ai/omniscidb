@@ -96,85 +96,26 @@ class CursorImpl : public Cursor {
  * DBEngine internal implementation
  */
 class DBEngineImpl : public DBEngine {
- public:
-  DBEngineImpl(const std::string& base_path,
-               int port,
-               const std::string& udf_filename = "")
-      : is_temp_db_(false) {
-    if (!init(base_path, port, udf_filename)) {
-      std::cerr << "DBEngine initialization failed" << std::endl;
+
+public:
+  static DBEngineImpl* get()
+  {
+    if (!engine_) {
+      std::cerr << "DBEngine uninitialized" << std::endl;
+      return nullptr;
     }
+    return engine_.get();
+  }
+
+  static DBEngineImpl* create(const std::string& base_path, int port, const std::string& udf_filename) {
+    std::call_once(once_flag_,
+        [&] {
+            engine_.reset(new DBEngineImpl(base_path, port, udf_filename));
+    });
+    return get();
   }
 
   ~DBEngineImpl() { reset(); }
-
-  bool init(const std::string& base_path, int port, const std::string& udf_filename) {
-    SystemParameters mapd_parms;
-    std::string db_path = base_path;
-    try {
-      registerArrowForeignStorage();
-      registerArrowCsvForeignStorage();
-      bool is_new_db = base_path.empty() || !catalogExists(base_path);
-      if (is_new_db) {
-        db_path = createCatalog(base_path);
-        if (db_path.empty()) {
-          return false;
-        }
-      }
-      auto data_path = db_path + +"/mapd_data";
-      data_mgr_ =
-          std::make_shared<Data_Namespace::DataMgr>(data_path, mapd_parms, false, 0);
-      calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000);
-
-      ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
-      if (!udf_filename.empty()) {
-        ExtensionFunctionsWhitelist::addUdfs(calcite_->getUserDefinedFunctionWhitelist());
-      }
-      table_functions::TableFunctionsFactory::init();
-
-      auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-      sys_cat.init(db_path, data_mgr_, {}, calcite_, is_new_db, false, {});
-
-      logger::LogOptions log_options("DBE");
-      log_options.set_base_path(db_path);
-      logger::init(log_options);
-
-      if (!sys_cat.getSqliteConnector()) {
-        std::cerr << "DBE:init: SqliteConnector is null" << std::endl;
-        return false;
-      }
-
-      sys_cat.getMetadataForDB(OMNISCI_DEFAULT_DB, database_);
-      auto catalog = Catalog_Namespace::Catalog::get(
-          db_path, database_, data_mgr_, std::vector<LeafHostInfo>(), calcite_, false);
-      sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user_);
-      auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
-          catalog, user_, ExecutorDeviceType::CPU, "");
-      QR::init(session);
-
-      base_path_ = db_path;
-      return true;
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:init: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:init: Unknown exception" << std::endl;
-    }
-    return false;
-  }
-
-  void reset() {
-    if (calcite_) {
-      calcite_->close_calcite_server();
-      calcite_.reset();
-    }
-    QR::reset();
-    ForeignStorageInterface::destroy();
-    data_mgr_.reset();
-    if (is_temp_db_) {
-      boost::filesystem::remove_all(base_path_);
-    }
-    base_path_.clear();
-  }
 
   void executeDDL(const std::string& query) {
     try {
@@ -415,10 +356,53 @@ class DBEngineImpl : public DBEngine {
   }
 
  protected:
+  DBEngineImpl(const std::string& base_path,
+               int port,
+               const std::string& udf_filename = "")
+      : is_temp_db_(false) {
+    if (!init(base_path, port, udf_filename)) {
+      std::cerr << "DBEngine initialization failed" << std::endl;
+    }
+  }
+
+  bool init(const std::string& base_path, int port, const std::string& udf_filename) {
+    SystemParameters mapd_parms;
+    std::string db_path = base_path;
+    try {
+      registerArrowForeignStorage();
+      registerArrowCsvForeignStorage();
+      bool is_new_db = base_path.empty() || !catalogExists(base_path);
+      if (is_new_db) {
+        db_path = createCatalog(base_path);
+        if (db_path.empty()) {
+          std::cerr << "DBE:init: DB path is empty" << std::endl;
+          return false;
+        }
+      }
+      QR::init(db_path.c_str(), is_new_db, port, udf_filename);
+      session_ = QR::get()->getSession();
+      base_path_ = db_path;
+      return true;
+    } catch (std::exception const& e) {
+      std::cerr << "DBE:init: " << e.what() << std::endl;
+    } catch (...) {
+      std::cerr << "DBE:init: Unknown exception" << std::endl;
+    }
+    return false;
+  }
+
+  void reset() {
+    QR::reset();
+    ForeignStorageInterface::destroy();
+    if (is_temp_db_) {
+      boost::filesystem::remove_all(base_path_);
+    }
+    base_path_.clear();
+  }
+
   void updateSession(std::shared_ptr<Catalog_Namespace::Catalog> catalog) {
     auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
         catalog, user_, ExecutorDeviceType::CPU, "");
-    QR::reset();
     QR::init(session);
   }
 
@@ -489,9 +473,14 @@ class DBEngineImpl : public DBEngine {
   }
 
  private:
+  static std::unique_ptr<DBEngineImpl> engine_;
+  static std::once_flag once_flag_;
+
+  DBEngineImpl(const DBEngineImpl&) = delete;
+  DBEngineImpl& operator=(const DBEngineImpl&) = delete;
+
   std::string base_path_;
-  std::shared_ptr<Data_Namespace::DataMgr> data_mgr_;
-  std::shared_ptr<Calcite> calcite_;
+  std::shared_ptr<Catalog_Namespace::SessionInfo> session_;
   Catalog_Namespace::DBMetadata database_;
   Catalog_Namespace::UserMetadata user_;
   bool is_temp_db_;
@@ -502,40 +491,56 @@ class DBEngineImpl : public DBEngine {
                                               "mapd_export"};
 };
 
-DBEngine* DBEngine::create(const std::string& path, int port) {
-  g_enable_union = false;
-  g_enable_columnar_output = true;
-  return new DBEngineImpl(path, port);
+std::unique_ptr<DBEngineImpl> DBEngineImpl::engine_;
+std::once_flag DBEngineImpl::once_flag_;
+
+DBEngine* DBEngine::get()
+{
+    return DBEngineImpl::get();
 }
 
-DBEngine* DBEngine::create(const std::map<std::string, std::string>& parameters) {
-  int port = DEFAULT_CALCITE_PORT;
-  std::string path, udf_filename;
-  g_enable_union = false;
-  g_enable_columnar_output = true;
-  for (const auto& [key, value] : parameters) {
-    if (key == "path") {
-      path = value;
-    } else if (key == "port") {
-      port = std::stoi(value);
-    } else if (key == "enable_columnar_output") {
-      g_enable_columnar_output = std::stoi(value);
-    } else if (key == "enable_union") {
-      g_enable_union = std::stoi(value);
-    } else if (key == "enable_debug_timer") {
-      g_enable_debug_timer = std::stoi(value);
-    } else if (key == "enable_lazy_fetch") {
-      g_enable_lazy_fetch = std::stoi(value);
-    } else if (key == "udf_filename") {
-      udf_filename = value;
-    } else if (key == "null_div_by_zero") {
-      g_null_div_by_zero = std::stoi(value);
-    } else {
-      std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
-                << std::endl;
-    }
+DBEngine* DBEngine::init(const std::string& path, int port) {
+  auto engine = DBEngineImpl::get();
+  if (!engine) {
+    g_enable_union = false;
+    g_enable_columnar_output = true;
+    engine = DBEngineImpl::create(path, port, "");
   }
-  return new DBEngineImpl(path, port, udf_filename);
+  return engine;
+}
+
+DBEngine* DBEngine::init(const std::map<std::string, std::string>& parameters) {
+  auto engine = DBEngineImpl::get();
+  if (!engine) {
+    int port = DEFAULT_CALCITE_PORT;
+    std::string path, udf_filename;
+    g_enable_union = false;
+    g_enable_columnar_output = true;
+    for (const auto& [key, value] : parameters) {
+      if (key == "path") {
+        path = value;
+      } else if (key == "port") {
+        port = std::stoi(value);
+      } else if (key == "enable_columnar_output") {
+        g_enable_columnar_output = std::stoi(value);
+      } else if (key == "enable_union") {
+        g_enable_union = std::stoi(value);
+      } else if (key == "enable_debug_timer") {
+        g_enable_debug_timer = std::stoi(value);
+      } else if (key == "enable_lazy_fetch") {
+        g_enable_lazy_fetch = std::stoi(value);
+      } else if (key == "udf_filename") {
+        udf_filename = value;
+      } else if (key == "null_div_by_zero") {
+        g_null_div_by_zero = std::stoi(value);
+      } else {
+        std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
+                  << std::endl;
+      }
+    }
+    engine = DBEngineImpl::create(path, port, udf_filename);
+  }
+  return engine;
 }
 
 /** DBEngine downcasting methods */

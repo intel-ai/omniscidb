@@ -96,9 +96,10 @@ cdef extern from "DBEngine.h" namespace 'EmbeddedDatabase':
         void dropDatabase(string db_name)
         bool setDatabase(string db_name)
         bool login(string db_name, string user_name, string password)
-        void reset()
         @staticmethod
-        DBEngine* create(map[string, string])
+        DBEngine* init(map[string, string])
+        @staticmethod
+        DBEngine* get()
 
 cdef extern from "DBETypes.h" namespace 'EmbeddedDatabase::ColumnType':
     cdef ColumnType SMALLINT
