@@ -1,8 +1,7 @@
-{% set version = "0.1" %}
-{% set number = "1" %}
-{% set build_ext_version = "1.0.0" %}
+{% set version = GIT_DESCRIBE_TAG %}
+{% set number = GIT_DESCRIBE_NUMBER|int %}
 {% set build_ext = "cpu" %}
-{% set build_string = "h{}_{}_{}".format(PKG_HASH, number, build_ext) %}
+{% set build_string = "h{}_{}_{}".format(GIT_DESCRIBE_HASH, number, build_ext) %}
 
 package:
   name: omniscidb
@@ -28,7 +27,7 @@ requirements:
     - make
     - maven
   host:
-    - numpy =1.18.5
+    - numpy
     - cython
     # omniscidb <=5.2.2 is not arrow-cpp 0.17+ ready
     - arrow-cpp =0.16
@@ -183,7 +182,7 @@ outputs:
         - make
         - maven
       host:
-        - numpy =1.18.5
+        - numpy
         - cython
         # omniscidb <=5.2.2 is not arrow-cpp 0.17+ ready
         - arrow-cpp =0.16
@@ -211,7 +210,7 @@ outputs:
         - tbb-devel =2020.1
         - python
         - cython
-        - numpy =1.18.5
+        - numpy
         - pyarrow =0.16
         - {{ pin_subpackage('omniscidbe', exact=True) }}
       run:
