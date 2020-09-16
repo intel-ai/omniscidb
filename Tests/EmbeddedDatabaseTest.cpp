@@ -268,7 +268,6 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  engine->reset();
-  //delete engine;
+  delete engine;
   return err;
 }

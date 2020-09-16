@@ -41,7 +41,6 @@ class Cursor {
 class DBEngine {
  public:
   virtual ~DBEngine() {}
-  void reset();
   void executeDDL(const std::string& query);
   std::unique_ptr<Cursor> executeDML(const std::string& query);
   std::unique_ptr<Cursor> executeRA(const std::string& query);

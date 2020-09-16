@@ -555,11 +555,6 @@ inline const DBEngineImpl* getImpl(const DBEngine* ptr) {
 
 /** DBEngine external methods */
 
-void DBEngine::reset() {
-  DBEngineImpl* engine = getImpl(this);
-  engine->reset();
-}
-
 void DBEngine::executeDDL(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   engine->executeDDL(query);
