@@ -25,8 +25,6 @@
 using namespace std;
 using namespace EmbeddedDatabase;
 
-DBEngine* engine = nullptr;
-
 class DBEngineSQLTest : public ::testing::Test {
 protected:
   DBEngineSQLTest() {}
@@ -42,29 +40,29 @@ protected:
   }
 
   int select_int(const string& query_str) {
-    auto cursor = ::engine->executeDML(query_str);
+    auto cursor = DBEngine::get()->executeDML(query_str);
     auto row = cursor->getNextRow();
     return row.getInt(0);
   }
 
   float select_float(const string& query_str) {
-    auto cursor = ::engine->executeDML(query_str);
+    auto cursor = DBEngine::get()->executeDML(query_str);
     auto row = cursor->getNextRow();
     return row.getFloat(0);
   }
 
   double select_double(const string& query_str) {
-    auto cursor = ::engine->executeDML(query_str);
+    auto cursor = DBEngine::get()->executeDML(query_str);
     auto row = cursor->getNextRow();
     return row.getDouble(0);
   }
 
   void run_ddl(const string& query_str) {
-    ::engine->executeDDL(query_str);
+    DBEngine::get()->executeDDL(query_str);
   }
 
   std::shared_ptr<arrow::RecordBatch> run_dml(const string& query_str) {
-    auto cursor = ::engine->executeDML(query_str);
+    auto cursor = DBEngine::get()->executeDML(query_str);
     return cursor ? cursor->getArrowRecordBatch(): nullptr;
   }
 };
@@ -259,7 +257,10 @@ int main(int argc, char** argv) {
   std::map<std::string, std::string> parameters = {
     {"path", std::string(BASE_PATH)}};
 
-  engine = DBEngine::init(parameters);
+  if (!DBEngine::init(parameters)) {
+    std::cout << "DBEngine initialization failed" << std::endl;
+    return 0;
+  }
 
   int err{0};
 
@@ -268,6 +269,5 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  delete engine;
   return err;
 }

@@ -69,8 +69,8 @@ int main(int argc, char* argv[]) {
     std::map<std::string, std::string> parameters = {
       {"path", base_path},
       {"port", std::to_string(calcite_port)}};
-    DBEngine* dbe = DBEngine::init(parameters);
-    if (dbe) {
+    if (DBEngine::init(parameters)) {
+      auto dbe = DBEngine::get();
       dbe->executeDDL(R"(
 CREATE TEMPORARY TABLE test (
 trip_id BIGINT,
@@ -136,7 +136,6 @@ dropoff_puma BIGINT) WITH (storage_type='CSV:/localdisk1/amalakho/omniscidb/Test
         std::cerr << "Cursor is NULL" << std::endl;
       }
     }
-    delete dbe;
   } catch (std::exception& e) {
     std::cerr << "Exception: " << e.what() << "\n";
   }

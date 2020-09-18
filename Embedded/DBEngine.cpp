@@ -98,24 +98,20 @@ class CursorImpl : public Cursor {
 class DBEngineImpl : public DBEngine {
 
 public:
-  static DBEngineImpl* get()
+  static std::shared_ptr<DBEngineImpl> get()
   {
-    if (!engine_) {
-      std::cerr << "DBEngine uninitialized" << std::endl;
-      return nullptr;
-    }
-    return engine_.get();
+    return engine_;
   }
 
-  static DBEngineImpl* create(const std::string& base_path, int port, const std::string& udf_filename) {
+  static bool init(const std::string& base_path, int port, const std::string& udf_filename) {
     std::call_once(once_flag_,
         [&] {
             engine_.reset(new DBEngineImpl(base_path, port, udf_filename));
     });
-    return get();
+    return !!engine_;
   }
 
-  ~DBEngineImpl() { reset(); }
+  ~DBEngineImpl() { reset_query_runner(); }
 
   void executeDDL(const std::string& query) {
     try {
@@ -360,12 +356,14 @@ public:
                int port,
                const std::string& udf_filename = "")
       : is_temp_db_(false) {
-    if (!init(base_path, port, udf_filename)) {
+    if (!init_query_runner(base_path, port, udf_filename)) {
       std::cerr << "DBEngine initialization failed" << std::endl;
     }
   }
 
-  bool init(const std::string& base_path, int port, const std::string& udf_filename) {
+  bool init_query_runner(const std::string& base_path,
+                         int port,
+                         const std::string& udf_filename) {
     SystemParameters mapd_parms;
     std::string db_path = base_path;
     try {
@@ -391,9 +389,9 @@ public:
     return false;
   }
 
-  void reset() {
-    QR::reset();
+  void reset_query_runner() {
     ForeignStorageInterface::destroy();
+    QR::reset();
     if (is_temp_db_) {
       boost::filesystem::remove_all(base_path_);
     }
@@ -473,7 +471,7 @@ public:
   }
 
  private:
-  static std::unique_ptr<DBEngineImpl> engine_;
+  static std::shared_ptr<DBEngineImpl> engine_;
   static std::once_flag once_flag_;
 
   DBEngineImpl(const DBEngineImpl&) = delete;
@@ -491,25 +489,29 @@ public:
                                               "mapd_export"};
 };
 
-std::unique_ptr<DBEngineImpl> DBEngineImpl::engine_;
+std::shared_ptr<DBEngineImpl> DBEngineImpl::engine_;
 std::once_flag DBEngineImpl::once_flag_;
 
-DBEngine* DBEngine::get()
+std::mutex g_mutex;
+
+std::shared_ptr<DBEngine> DBEngine::get()
 {
     return DBEngineImpl::get();
 }
 
-DBEngine* DBEngine::init(const std::string& path, int port) {
+bool DBEngine::init(const std::string& path, int port) {
+  const std::lock_guard<std::mutex> lock(g_mutex);
   auto engine = DBEngineImpl::get();
   if (!engine) {
     g_enable_union = false;
     g_enable_columnar_output = true;
-    engine = DBEngineImpl::create(path, port, "");
+    return DBEngineImpl::init(path, port, "");
   }
-  return engine;
+  return true;
 }
 
-DBEngine* DBEngine::init(const std::map<std::string, std::string>& parameters) {
+bool DBEngine::init(const std::map<std::string, std::string>& parameters) {
+  const std::lock_guard<std::mutex> lock(g_mutex);
   auto engine = DBEngineImpl::get();
   if (!engine) {
     int port = DEFAULT_CALCITE_PORT;
@@ -538,9 +540,9 @@ DBEngine* DBEngine::init(const std::map<std::string, std::string>& parameters) {
                   << std::endl;
       }
     }
-    engine = DBEngineImpl::create(path, port, udf_filename);
+    return DBEngineImpl::init(path, port, udf_filename);
   }
-  return engine;
+  return true;
 }
 
 /** DBEngine downcasting methods */
@@ -582,7 +584,7 @@ std::vector<std::string> DBEngine::getTables() {
   return engine->getTables();
 }
 
-std::vector<ColumnDetails> DBEngine::getTableDetails(const std::string& table_name) {
+std::vector<ColumnDetails> DBEngine::getTableDetails (const std::string& table_name) {
   DBEngineImpl* engine = getImpl(this);
   return engine->getTableDetails(table_name);
 }

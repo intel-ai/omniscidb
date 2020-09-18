@@ -69,9 +69,8 @@ int main(int argc, char* argv[]) {
     std::map<std::string, std::string> parameters = {
       {"path", base_path},
       {"port", std::to_string(calcite_port)}};
-    auto dbe = DBEngine::init(parameters);
-
-    if (dbe) {
+    if (DBEngine::init(parameters)) {
+      auto dbe = DBEngine::get();
       auto memory_pool = arrow::default_memory_pool();
       auto arrow_parse_options = arrow::csv::ParseOptions::Defaults();
       auto arrow_read_options = arrow::csv::ReadOptions::Defaults();
