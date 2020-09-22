@@ -112,6 +112,8 @@ class Buffer : public AbstractBuffer {
    * @return A constant memory pointer for read-only access.
    */
   int8_t* getMemoryPtr() override;
+  
+  void replaceMemoryPtr(int8_t *new_ptr) override;
 
   inline size_t size() const override { return size_; }
 

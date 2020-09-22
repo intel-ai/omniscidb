@@ -34,6 +34,10 @@ void ForeignStorageBuffer::read(int8_t* const dst,
   persistent_foreign_storage_->read(chunk_key_, sql_type, dst, numBytes);
 }
 
+int8_t* ForeignStorageBuffer::tryZeroCopy(const size_t numBytes) {
+  return persistent_foreign_storage_->tryZeroCopy(chunk_key_, sql_type, numBytes);
+}
+
 void ForeignStorageBuffer::append(int8_t* src,
                                   const size_t numBytes,
                                   const Data_Namespace::MemoryLevel srcBufferType,
@@ -87,8 +91,16 @@ void ForeignStorageBufferMgr::fetchBuffer(const ChunkKey& key,
                                           const size_t numBytes) {
   CHECK(numBytes);
   destBuffer->reserve(numBytes);
-  auto file_buffer = getBuffer(key, numBytes);
-  file_buffer->read(destBuffer->getMemoryPtr(), numBytes);
+  auto file_buffer = dynamic_cast<ForeignStorageBuffer*>(getBuffer(key, numBytes));
+  CHECK(file_buffer);
+
+  // TODO: check if GPU is used
+  auto buf = file_buffer->tryZeroCopy(numBytes);
+  if (buf) {
+    destBuffer->replaceMemoryPtr(buf);
+  } else {
+    file_buffer->read(destBuffer->getMemoryPtr(), numBytes);
+  }
   destBuffer->setSize(numBytes);
   destBuffer->syncEncoder(file_buffer);
 }
