@@ -108,7 +108,7 @@ public:
         [&] {
             engine_.reset(new DBEngineImpl(base_path, port, udf_filename));
     });
-    return !!engine_;
+    return engine_! = nullptr;
   }
 
   ~DBEngineImpl() { reset_query_runner(); }
@@ -538,6 +538,7 @@ bool DBEngine::init(const std::map<std::string, std::string>& parameters) {
       } else {
         std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
                   << std::endl;
+        return false;
       }
     }
     return DBEngineImpl::init(path, port, udf_filename);
