@@ -163,19 +163,11 @@ cdef class PyDbEngine:
     cdef map[string, string] c_parameters
 
     def __cinit__(self, **kwargs):
-        try:
-            for key, value in kwargs.items():
-                self.c_parameters[key] = str(value)
-            self.c_dbe = DBEngine.create(self.c_parameters)
-            if self.closed:
-                raise RuntimeError('Initialization failed')
-        except OSError as err:
-            print("DBE init: OS error: {0}".format(err))
-        except RuntimeError, e:
-            print("DBE:init: Runtime error: {0}".format(e))
-        except:
-            print("DBE init: Unexpected error: ", sys.exc_info()[0], sys.exc_info()[1])
-            raise
+        for key, value in kwargs.items():
+            self.c_parameters[key] = str(value)
+        self.c_dbe = DBEngine.create(self.c_parameters)
+        if self.closed:
+            raise RuntimeError('Initialization failed')
 
     @property
     def closed(self):
@@ -189,71 +181,30 @@ cdef class PyDbEngine:
             raise RuntimeError('DB engine uninitialized')
 
     def executeDDL(self, query):
-        try:
-            self.check_closed()
-            self.c_dbe.get().executeDDL(bytes(query, 'utf-8'))
-        except RuntimeError, e:
-            print("DBE:DDL: Runtime error: {0}".format(e))
-        except:
-            print("DBE:DDL: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        self.check_closed()
+        self.c_dbe.get().executeDDL(bytes(query, 'utf-8'))
 
     def executeDML(self, query):
-        try:
-            self.check_closed()
-            obj = PyCursor();
-            obj.c_cursor = self.c_dbe.get().executeDML(bytes(query, 'utf-8'));
-            return obj;
-        except ZeroDivisionError, e:
-            print("DBE:DML: ZeroDivision error: {0}".format(e))
-        except OverflowError, e:
-            print("DBE:DML: Overflow error: {0}".format(e))
-        except RuntimeError, e:
-            print("DBE:DML: Runtime error: {0}".format(e))
-        except ValueError, e:
-            print("DBE:DML: Value error: {0}".format(e))
-        except:
-            print("DBE:DML: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        self.check_closed()
+        obj = PyCursor();
+        obj.c_cursor = self.c_dbe.get().executeDML(bytes(query, 'utf-8'));
+        return obj;
 
     def executeRA(self, query):
-        try:
             self.check_closed()
             obj = PyCursor();
             obj.c_cursor = self.c_dbe.get().executeRA(bytes(query, 'utf-8'));
             return obj
-        except ZeroDivisionError, e:
-            print("DBE:RA: ZeroDivision error: {0}".format(e))
-        except OverflowError, e:
-            print("DBE:RA: Overflow error: {0}".format(e))
-        except RuntimeError, e:
-            print("DBE:RA: Runtime error: {0}".format(e))
-        except ValueError, e:
-            print("DBE:RA: Value error: {0}".format(e))
-        except:
-            print("DBE:RA: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def importArrowTable(self, name, table, **kwargs):
-        cdef shared_ptr[CTable] t
-        cdef string n
-        cdef uint64_t fragment_size
-        try:
-            self.check_closed()
-            t = pyarrow_unwrap_table(table)
-            n = bytes(name, 'utf-8')
-            fragment_size = kwargs.get("fragment_size", 0)
-            if n.empty() or not t.get():
-                raise RuntimeError('Table initialization failed')
-            self.check_closed()
-            self.c_dbe.get().importArrowTable(n, t, fragment_size)
-        except ZeroDivisionError, e:
-            print("DBE:Import: ZeroDivision error: {0}".format(e))
-        except OverflowError, e:
-            print("DBE:Import: Overflow error: {0}".format(e))
-        except RuntimeError, e:
-            print("DBE:Import: Runtime error: {0}".format(e))
-        except ValueError, e:
-            print("DBE:Import: Value error: {0}".format(e))
-        except:
-            print("DBE:Import: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        self.check_closed()
+        cdef shared_ptr[CTable] t = pyarrow_unwrap_table(table)
+        cdef string n = bytes(name, 'utf-8')
+        cdef uint64_t fragment_size = kwargs.get("fragment_size", 0)
+        if n.empty() or not t.get():
+            raise RuntimeError('Table initialization failed')
+        self.check_closed()
+        self.c_dbe.get().importArrowTable(n, t, fragment_size)
 
     # TODO: remove this legacy alias.
     def consumeArrowTable(self, name, table, **kwargs):
@@ -261,44 +212,21 @@ cdef class PyDbEngine:
 
     def select_df(self, query):
         obj = self.executeDML(query)
-        try:
-            if obj:
-                prb = obj.getArrowRecordBatch()
-                return prb.to_pandas()
-            else:
-                print("DBE:PDF: Cursor uninitialized")
-        except ZeroDivisionError, e:
-            print("DBE:PDF: ZeroDivision error: {0}".format(e))
-        except OverflowError, e:
-            print("DBE:PDF: Overflow error: {0}".format(e))
-        except RuntimeError, e:
-            print("DBE:PDF: Runtime error: {0}".format(e))
-        except ValueError, e:
-            print("DBE:PDF: Value error: {0}".format(e))
-        except:
-            print("DBE:PDF: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        if not obj:
+            raise RuntimeError("Cursor uninitialized")
+        prb = obj.getArrowRecordBatch()
+        return prb.to_pandas()
 
     def get_table_details(self, table_name):
-        cdef vector[ColumnDetails] table_details
-        try:
-            self.check_closed()
-            table_details = self.c_dbe.get().getTableDetails(bytes(table_name, 'utf-8'))
-            return [
-                ColumnDetailsTp(x.col_name, PyColumnType(<int>x.col_type).to_str(),
-                                x.nullable, x.precision, x.scale, x.comp_param,
-                                PyColumnEncoding(<int>x.encoding).to_str(), x.is_array)
-                for x in table_details
-            ]
-        except RuntimeError, e:
-            print("DBE:GTD: Runtime error: {0}".format(e))
-        except:
-            print("DBE:GTD: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        self.check_closed()
+        cdef vector[ColumnDetails] table_details = self.c_dbe.get().getTableDetails(bytes(table_name, 'utf-8'))
+        return [
+            ColumnDetailsTp(x.col_name, PyColumnType(<int>x.col_type).to_str(),
+                            x.nullable, x.precision, x.scale, x.comp_param,
+                            PyColumnEncoding(<int>x.encoding).to_str(), x.is_array)
+            for x in table_details
+        ]
 
     def get_tables(self):
-        try:
-            self.check_closed()
-            return self.c_dbe.get().getTables()
-        except RuntimeError, e:
-            print("DBE:GT: Runtime error: {0}".format(e))
-        except:
-            print("DBE:GT: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
+        self.check_closed()
+        return self.c_dbe.get().getTables()
