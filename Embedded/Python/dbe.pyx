@@ -191,10 +191,10 @@ cdef class PyDbEngine:
         return obj;
 
     def executeRA(self, query):
-            self.check_closed()
-            obj = PyCursor();
-            obj.c_cursor = self.c_dbe.get().executeRA(bytes(query, 'utf-8'));
-            return obj
+        self.check_closed()
+        obj = PyCursor();
+        obj.c_cursor = self.c_dbe.get().executeRA(bytes(query, 'utf-8'));
+        return obj
 
     def importArrowTable(self, name, table, **kwargs):
         self.check_closed()
