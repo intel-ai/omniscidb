@@ -84,21 +84,20 @@ cdef extern from "DBEngine.h" namespace 'EmbeddedDatabase':
         shared_ptr[CRecordBatch] getArrowRecordBatch() nogil except +
 
     cdef cppclass DBEngine:
-        void executeDDL(string)
-        unique_ptr[Cursor] executeDML(string)
-        unique_ptr[Cursor] executeRA(string)
-        vector[string] getTables()
-        vector[ColumnDetails] getTableDetails(string)
-        void importArrowTable(string, shared_ptr[CTable]&, uint64_t)
-        void createUser(string user_name, string password)
-        void dropUser(string user_name)
-        void createDatabase(string db_name)
-        void dropDatabase(string db_name)
-        bool setDatabase(string db_name)
-        bool login(string db_name, string user_name, string password)
-        void reset()
+        void executeDDL(string) except +
+        shared_ptr[Cursor] executeDML(string) except +
+        shared_ptr[Cursor] executeRA(string) except +
+        vector[string] getTables() except +
+        vector[ColumnDetails] getTableDetails(string) except +
+        void importArrowTable(string, shared_ptr[CTable]&, uint64_t) except +
+        void createUser(string user_name, string password) except +
+        void dropUser(string user_name) except +
+        void createDatabase(string db_name) except +
+        void dropDatabase(string db_name) except +
+        bool setDatabase(string db_name) except +
+        bool login(string db_name, string user_name, string password) except +
         @staticmethod
-        DBEngine* create(map[string, string])
+        shared_ptr[DBEngine] create(map[string, string]) except+
 
 cdef extern from "DBETypes.h" namespace 'EmbeddedDatabase::ColumnType':
     cdef ColumnType SMALLINT

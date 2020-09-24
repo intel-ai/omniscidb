@@ -25,7 +25,7 @@
 using namespace std;
 using namespace EmbeddedDatabase;
 
-DBEngine* engine = nullptr;
+std::shared_ptr<DBEngine> engine;
 
 class DBEngineSQLTest : public ::testing::Test {
 protected:
@@ -268,7 +268,5 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     LOG(ERROR) << e.what();
   }
-  engine->reset();
-  //delete engine;
   return err;
 }

@@ -28,7 +28,7 @@
 using namespace EmbeddedDatabase;
 
 int main(int argc, char* argv[]) {
-  std::string base_path;
+  std::string base_path, csv_path;
   int calcite_port = 5555;
   bool columnar_output = true;
   namespace po = boost::program_options;
@@ -38,7 +38,10 @@ int main(int argc, char* argv[]) {
       "data",
       po::value<std::string>(&base_path)->required(),
       "Directory path to OmniSci catalogs")(
-      "calcite-port",
+      "csv",
+      po::value<std::string>(&csv_path)->required(),
+      "Directory path to CSV file")(
+      "csv_path",
       po::value<int>(&calcite_port)->default_value(calcite_port),
       "Calcite port")("columnar-output",
                       po::value<bool>(&columnar_output)->default_value(columnar_output),
@@ -69,9 +72,9 @@ int main(int argc, char* argv[]) {
     std::map<std::string, std::string> parameters = {
       {"path", base_path},
       {"port", std::to_string(calcite_port)}};
-    DBEngine* dbe = DBEngine::create(parameters);
+    auto dbe = DBEngine::create(parameters);
     if (dbe) {
-      dbe->executeDDL(R"(
+      dbe->executeDDL(std::string(R"(
 CREATE TEMPORARY TABLE test (
 trip_id BIGINT,
 vendor_id TEXT ENCODING NONE,
@@ -123,7 +126,7 @@ dropoff_boroct2010 BIGINT,
 dropoff_cdeligibil TEXT ENCODING NONE,
 dropoff_ntacode TEXT ENCODING NONE,
 dropoff_ntaname TEXT ENCODING NONE,
-dropoff_puma BIGINT) WITH (storage_type='CSV:/localdisk1/amalakho/omniscidb/Tests/Import/datafiles/trips_with_headers_top1000.csv', fragment_size=100);)");
+dropoff_puma BIGINT) WITH (storage_type='CSV:") + csv_path + std::string("', fragment_size=100);)"));
       auto schema = dbe->getTableDetails("test");
       for (auto& item : schema) {
         std::cout << item.col_name << std::endl;
@@ -136,7 +139,6 @@ dropoff_puma BIGINT) WITH (storage_type='CSV:/localdisk1/amalakho/omniscidb/Test
         std::cerr << "Cursor is NULL" << std::endl;
       }
     }
-    delete dbe;
   } catch (std::exception& e) {
     std::cerr << "Exception: " << e.what() << "\n";
   }

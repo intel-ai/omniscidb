@@ -106,7 +106,7 @@ cdef class PyRow:
 
 
 cdef class PyCursor:
-    cdef unique_ptr[_Cursor] c_cursor  #Hold a C++ instance which we're wrapping
+    cdef shared_ptr[_Cursor] c_cursor  #Hold a C++ instance which we're wrapping
     cdef shared_ptr[CRecordBatch] c_batch
 
     def colCount(self):
@@ -159,7 +159,7 @@ ColumnDetailsTp = namedtuple("ColumnDetails", ["name", "type", "nullable",
                                              "comp_param", "encoding",
                                              "is_array"])
 cdef class PyDbEngine:
-    cdef DBEngine* c_dbe  #Hold a C++ instance which we're wrapping
+    cdef shared_ptr[DBEngine] c_dbe  #Hold a C++ instance which we're wrapping
     cdef map[string, string] c_parameters
 
     def __cinit__(self, **kwargs):
@@ -167,22 +167,15 @@ cdef class PyDbEngine:
             for key, value in kwargs.items():
                 self.c_parameters[key] = str(value)
             self.c_dbe = DBEngine.create(self.c_parameters)
-            assert not self.closed
+            if self.closed:
+                raise RuntimeError('Initialization failed')
         except OSError as err:
-            print("DBEngine: OS error: {0}".format(err))
-            raise
-        except ValueError:
-            print("DBEngine: ValueError: Could not convert data to string")
-            raise
+            print("DBE init: OS error: {0}".format(err))
+        except RuntimeError, e:
+            print("DBE:init: Runtime error: {0}".format(e))
         except:
-            print("DBEngine: Unexpected error while constructing", sys.exc_info()[0], sys.exc_info()[1])
+            print("DBE init: Unexpected error: ", sys.exc_info()[0], sys.exc_info()[1])
             raise
-
-    def __dealloc__(self):
-        assert not self.closed
-        self.c_dbe.reset()
-        del self.c_dbe
-        self.c_dbe = NULL
 
     @property
     def closed(self):
@@ -191,53 +184,121 @@ cdef class PyDbEngine:
     def close(self):
         pass
 
+    def check_closed(self):
+        if self.closed:
+            raise RuntimeError('DB engine uninitialized')
+
     def executeDDL(self, query):
         try:
-            assert not self.closed
-            self.c_dbe.executeDDL(bytes(query, 'utf-8'))
-        except Exception, e:
-            os.abort()
+            self.check_closed()
+            self.c_dbe.get().executeDDL(bytes(query, 'utf-8'))
+        except RuntimeError, e:
+            print("DBE:DDL: Runtime error: {0}".format(e))
+        except:
+            print("DBE:DDL: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def executeDML(self, query):
-        obj = PyCursor();
-        assert not self.closed
-        obj.c_cursor = self.c_dbe.executeDML(bytes(query, 'utf-8'));
-        return obj;
+        try:
+            self.check_closed()
+            obj = PyCursor();
+            obj.c_cursor = self.c_dbe.get().executeDML(bytes(query, 'utf-8'));
+            return obj;
+        except ZeroDivisionError, e:
+            print("DBE:DML: ZeroDivision error: {0}".format(e))
+        except OverflowError, e:
+            print("DBE:DML: Overflow error: {0}".format(e))
+        except RuntimeError, e:
+            print("DBE:DML: Runtime error: {0}".format(e))
+        except ValueError, e:
+            print("DBE:DML: Value error: {0}".format(e))
+        except:
+            print("DBE:DML: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def executeRA(self, query):
-        obj = PyCursor();
-        assert not self.closed
-        obj.c_cursor = self.c_dbe.executeRA(bytes(query, 'utf-8'));
-        return obj
+        try:
+            self.check_closed()
+            obj = PyCursor();
+            obj.c_cursor = self.c_dbe.get().executeRA(bytes(query, 'utf-8'));
+            return obj
+        except ZeroDivisionError, e:
+            print("DBE:RA: ZeroDivision error: {0}".format(e))
+        except OverflowError, e:
+            print("DBE:RA: Overflow error: {0}".format(e))
+        except RuntimeError, e:
+            print("DBE:RA: Runtime error: {0}".format(e))
+        except ValueError, e:
+            print("DBE:RA: Value error: {0}".format(e))
+        except:
+            print("DBE:RA: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def importArrowTable(self, name, table, **kwargs):
-        assert not self.closed
-        cdef shared_ptr[CTable] t = pyarrow_unwrap_table(table)
-        cdef string n = bytes(name, 'utf-8')
-        cdef uint64_t fragment_size = kwargs.get("fragment_size", 0)
-        assert t.get() and not n.empty()
-        assert not self.closed
-        self.c_dbe.importArrowTable(n, t, fragment_size)
+        cdef shared_ptr[CTable] t
+        cdef string n
+        cdef uint64_t fragment_size
+        try:
+            self.check_closed()
+            t = pyarrow_unwrap_table(table)
+            n = bytes(name, 'utf-8')
+            fragment_size = kwargs.get("fragment_size", 0)
+            if n.empty() or not t.get():
+                raise RuntimeError('Table initialization failed')
+            self.check_closed()
+            self.c_dbe.get().importArrowTable(n, t, fragment_size)
+        except ZeroDivisionError, e:
+            print("DBE:Import: ZeroDivision error: {0}".format(e))
+        except OverflowError, e:
+            print("DBE:Import: Overflow error: {0}".format(e))
+        except RuntimeError, e:
+            print("DBE:Import: Runtime error: {0}".format(e))
+        except ValueError, e:
+            print("DBE:Import: Value error: {0}".format(e))
+        except:
+            print("DBE:Import: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     # TODO: remove this legacy alias.
     def consumeArrowTable(self, name, table, **kwargs):
         return self.importArrowTable(name, table, **kwargs)
 
     def select_df(self, query):
-        obj = PyCursor();
-        assert not self.closed
-        obj.c_cursor = self.c_dbe.executeDML(bytes(query, 'utf-8'));
-        prb = obj.getArrowRecordBatch()
-        return prb.to_pandas()
+        obj = self.executeDML(query)
+        try:
+            if obj:
+                prb = obj.getArrowRecordBatch()
+                return prb.to_pandas()
+            else:
+                print("DBE:PDF: Cursor uninitialized")
+        except ZeroDivisionError, e:
+            print("DBE:PDF: ZeroDivision error: {0}".format(e))
+        except OverflowError, e:
+            print("DBE:PDF: Overflow error: {0}".format(e))
+        except RuntimeError, e:
+            print("DBE:PDF: Runtime error: {0}".format(e))
+        except ValueError, e:
+            print("DBE:PDF: Value error: {0}".format(e))
+        except:
+            print("DBE:PDF: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def get_table_details(self, table_name):
-        cdef vector[ColumnDetails] table_details = self.c_dbe.getTableDetails(bytes(table_name, 'utf-8'))
-        return [
-            ColumnDetailsTp(x.col_name, PyColumnType(<int>x.col_type).to_str(),
-                            x.nullable, x.precision, x.scale, x.comp_param,
-                            PyColumnEncoding(<int>x.encoding).to_str(), x.is_array)
-            for x in table_details
-        ]
+        cdef vector[ColumnDetails] table_details
+        try:
+            self.check_closed()
+            table_details = self.c_dbe.get().getTableDetails(bytes(table_name, 'utf-8'))
+            return [
+                ColumnDetailsTp(x.col_name, PyColumnType(<int>x.col_type).to_str(),
+                                x.nullable, x.precision, x.scale, x.comp_param,
+                                PyColumnEncoding(<int>x.encoding).to_str(), x.is_array)
+                for x in table_details
+            ]
+        except RuntimeError, e:
+            print("DBE:GTD: Runtime error: {0}".format(e))
+        except:
+            print("DBE:GTD: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])
 
     def get_tables(self):
-        return self.c_dbe.getTables()
+        try:
+            self.check_closed()
+            return self.c_dbe.get().getTables()
+        except RuntimeError, e:
+            print("DBE:GT: Runtime error: {0}".format(e))
+        except:
+            print("DBE:GT: Unexpected error:", sys.exc_info()[0], sys.exc_info()[1])

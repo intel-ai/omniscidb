@@ -16,6 +16,7 @@
 
 #include "DBEngine.h"
 #include <boost/filesystem.hpp>
+#include <stdexcept>
 #include "DataMgr/ForeignStorage/ArrowForeignStorage.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
 #include "Fragmenter/FragmentDefaultValues.h"
@@ -97,93 +98,55 @@ class CursorImpl : public Cursor {
  */
 class DBEngineImpl : public DBEngine {
  public:
-  DBEngineImpl(const std::string& base_path,
-               int port,
-               const std::string& udf_filename = "")
-      : is_temp_db_(false) {
-    if (!init(base_path, port, udf_filename)) {
-      std::cerr << "DBEngine initialization failed" << std::endl;
-    }
-  }
+  DBEngineImpl() : is_temp_db_(false) { }
 
   ~DBEngineImpl() { reset(); }
 
   bool init(const std::string& base_path, int port, const std::string& udf_filename) {
     SystemParameters mapd_parms;
     std::string db_path = base_path;
-    try {
-      registerArrowForeignStorage();
-      registerArrowCsvForeignStorage();
-      bool is_new_db = base_path.empty() || !catalogExists(base_path);
-      if (is_new_db) {
-        db_path = createCatalog(base_path);
-        if (db_path.empty()) {
-          return false;
-        }
+    registerArrowForeignStorage();
+    registerArrowCsvForeignStorage();
+    bool is_new_db = base_path.empty() || !catalogExists(base_path);
+    if (is_new_db) {
+      db_path = createCatalog(base_path);
+      if (db_path.empty()) {
+        throw std::runtime_error("Database directory could not be created");
       }
-      auto data_path = db_path + +"/mapd_data";
-      data_mgr_ =
-          std::make_shared<Data_Namespace::DataMgr>(data_path, mapd_parms, false, 0);
-      calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000);
-
-      ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
-      if (!udf_filename.empty()) {
-        ExtensionFunctionsWhitelist::addUdfs(calcite_->getUserDefinedFunctionWhitelist());
-      }
-      table_functions::TableFunctionsFactory::init();
-
-      auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-      sys_cat.init(db_path, data_mgr_, {}, calcite_, is_new_db, false, {});
-
-      logger::LogOptions log_options("DBE");
-      log_options.set_base_path(db_path);
-      logger::init(log_options);
-
-      if (!sys_cat.getSqliteConnector()) {
-        std::cerr << "DBE:init: SqliteConnector is null" << std::endl;
-        return false;
-      }
-
-      sys_cat.getMetadataForDB(OMNISCI_DEFAULT_DB, database_);
-      auto catalog = Catalog_Namespace::Catalog::get(
-          db_path, database_, data_mgr_, std::vector<LeafHostInfo>(), calcite_, false);
-      sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user_);
-      auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
-          catalog, user_, ExecutorDeviceType::CPU, "");
-      QR::init(session);
-
-      base_path_ = db_path;
-      return true;
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:init: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:init: Unknown exception" << std::endl;
     }
-    return false;
+    auto data_path = db_path + +"/mapd_data";
+    data_mgr_ =
+        std::make_shared<Data_Namespace::DataMgr>(data_path, mapd_parms, false, 0);
+    calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000);
+
+    ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
+    if (!udf_filename.empty()) {
+      ExtensionFunctionsWhitelist::addUdfs(calcite_->getUserDefinedFunctionWhitelist());
+    }
+    table_functions::TableFunctionsFactory::init();
+
+    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
+    sys_cat.init(db_path, data_mgr_, {}, calcite_, is_new_db, false, {});
+
+    if (!sys_cat.getSqliteConnector()) {
+      throw std::runtime_error("System catalog initialization failed");
+    }
+
+    sys_cat.getMetadataForDB(OMNISCI_DEFAULT_DB, database_);
+    auto catalog = Catalog_Namespace::Catalog::get(
+        db_path, database_, data_mgr_, std::vector<LeafHostInfo>(), calcite_, false);
+    sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user_);
+    auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
+        catalog, user_, ExecutorDeviceType::CPU, "");
+    QR::init(session);
+
+    base_path_ = db_path;
+    return true;
   }
 
-  void reset() {
-    if (calcite_) {
-      calcite_->close_calcite_server();
-      calcite_.reset();
-    }
-    QR::reset();
-    ForeignStorageInterface::destroy();
-    data_mgr_.reset();
-    if (is_temp_db_) {
-      boost::filesystem::remove_all(base_path_);
-    }
-    base_path_.clear();
-  }
 
   void executeDDL(const std::string& query) {
-    try {
       QR::get()->runDDLStatement(query);
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:executeDDL: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:executeDDL: Unknown exception" << std::endl;
-    }
   }
 
   void importArrowTable(const std::string& name,
@@ -220,80 +183,63 @@ class DBEngineImpl : public DBEngine {
     releaseArrowTable(name);
   }
 
-  std::unique_ptr<CursorImpl> executeDML(const std::string& query) {
-    try {
-      ParserWrapper pw{query};
-      if (pw.isCalcitePathPermissable()) {
-        const auto execution_result =
-            QR::get()->runSelectQuery(query, ExecutorDeviceType::CPU, true, true);
-        auto targets = execution_result.getTargetsMeta();
-        std::vector<std::string> col_names;
-        for (const auto target : targets) {
-          col_names.push_back(target.get_resname());
-        }
-        return std::make_unique<CursorImpl>(execution_result.getRows(), col_names);
-      }
-
-      auto session_info = QR::get()->getSession();
-      auto query_state = QR::create_query_state(session_info, query);
-      auto stdlog = STDLOG(query_state);
-
-      SQLParser parser;
-      std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
-      std::string last_parsed;
-      CHECK_EQ(parser.parse(query, parse_trees, last_parsed), 0) << query;
-      CHECK_EQ(parse_trees.size(), size_t(1));
-      auto stmt = parse_trees.front().get();
-      auto insert_values_stmt = dynamic_cast<InsertValuesStmt*>(stmt);
-      CHECK(insert_values_stmt);
-      insert_values_stmt->execute(*session_info);
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:executeDML: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:executeDML: Unknown exception" << std::endl;
-    }
-    return std::unique_ptr<CursorImpl>();
-  }
-
-  std::unique_ptr<CursorImpl> executeRA(const std::string& query) {
-    if (boost::starts_with(query, "execute calcite")) {
-      return executeDML(query);
-    }
-    try {
+  std::shared_ptr<CursorImpl> executeDML(const std::string& query) {
+    ParserWrapper pw{query};
+    if (pw.isCalcitePathPermissable()) {
       const auto execution_result =
-          QR::get()->runSelectQueryRA(query, ExecutorDeviceType::CPU, true, true);
+          QR::get()->runSelectQuery(query, ExecutorDeviceType::CPU, true, true);
       auto targets = execution_result.getTargetsMeta();
       std::vector<std::string> col_names;
       for (const auto target : targets) {
         col_names.push_back(target.get_resname());
       }
-      return std::make_unique<CursorImpl>(execution_result.getRows(), col_names);
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:executeRA: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:executeRA: Unknown exception" << std::endl;
+      return std::make_shared<CursorImpl>(execution_result.getRows(), col_names);
     }
-    return std::unique_ptr<CursorImpl>();
+
+    auto session_info = QR::get()->getSession();
+    auto query_state = QR::create_query_state(session_info, query);
+    auto stdlog = STDLOG(query_state);
+
+    SQLParser parser;
+    std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
+    std::string last_parsed;
+    CHECK_EQ(parser.parse(query, parse_trees, last_parsed), 0) << query;
+    CHECK_EQ(parse_trees.size(), size_t(1));
+    auto stmt = parse_trees.front().get();
+    auto insert_values_stmt = dynamic_cast<InsertValuesStmt*>(stmt);
+    CHECK(insert_values_stmt);
+    insert_values_stmt->execute(*session_info);
+    return std::shared_ptr<CursorImpl>();
+  }
+
+  std::shared_ptr<CursorImpl> executeRA(const std::string& query) {
+    if (boost::starts_with(query, "execute calcite")) {
+      return executeDML(query);
+    }
+    const auto execution_result =
+      QR::get()->runSelectQueryRA(query, ExecutorDeviceType::CPU, true, true);
+    auto targets = execution_result.getTargetsMeta();
+    std::vector<std::string> col_names;
+    for (const auto target : targets) {
+      col_names.push_back(target.get_resname());
+    }
+    return std::make_shared<CursorImpl>(execution_result.getRows(), col_names);
   }
 
   std::vector<std::string> getTables() {
     std::vector<std::string> table_names;
     auto catalog = QR::get()->getCatalog();
     if (catalog) {
-      try {
-        const auto tables = catalog->getAllTableMetadata();
-        for (const auto td : tables) {
-          if (td->shard >= 0) {
-            // skip shards, they're not standalone tables
-            continue;
-          }
-          table_names.push_back(td->tableName);
+      const auto tables = catalog->getAllTableMetadata();
+      for (const auto td : tables) {
+        if (td->shard >= 0) {
+          // skip shards, they're not standalone tables
+          continue;
         }
-      } catch (std::exception const& e) {
-        std::cerr << "DBE:getTables: " << e.what() << std::endl;
+        table_names.push_back(td->tableName);
       }
     } else {
-      std::cerr << "DBE:getTables: catalog is NULL" << std::endl;
+      throw std::runtime_error("System catalog uninitialized");
     }
     return table_names;
   }
@@ -335,7 +281,7 @@ class DBEngineImpl : public DBEngine {
             if (dd) {
               col_details.comp_param = dd->dictNBits;
             } else {
-              std::cerr << "DBE:getTableDetails: Dictionary doesn't exist" << std::endl;
+              throw std::runtime_error("Dictionary definition for column doesn't exist");
             }
           } else {
             col_details.comp_param = ct.get_comp_param();
@@ -383,42 +329,42 @@ class DBEngineImpl : public DBEngine {
   }
 
   bool setDatabase(std::string& db_name) {
-    try {
-      auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-      auto catalog = sys_cat.switchDatabase(db_name, user_.userName);
-      updateSession(catalog);
-      sys_cat.getMetadataForDB(db_name, database_);
-      return true;
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:setDatabase: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:setDatabase: Unknown exception" << std::endl;
-    }
-    return false;
+    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
+    auto catalog = sys_cat.switchDatabase(db_name, user_.userName);
+    updateSession(catalog);
+    sys_cat.getMetadataForDB(db_name, database_);
+    return true;
   }
 
   bool login(std::string& db_name, std::string& user_name, const std::string& password) {
     Catalog_Namespace::UserMetadata user_meta;
-    try {
-      auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-      auto catalog = sys_cat.login(db_name, user_name, password, user_meta, true);
-      updateSession(catalog);
-      sys_cat.getMetadataForDB(db_name, database_);
-      sys_cat.getMetadataForUser(user_name, user_);
-      return true;
-    } catch (std::exception const& e) {
-      std::cerr << "DBE:login: " << e.what() << std::endl;
-    } catch (...) {
-      std::cerr << "DBE:login: Unknown exception" << std::endl;
-    }
-    return false;
+    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
+    auto catalog = sys_cat.login(db_name, user_name, password, user_meta, true);
+    updateSession(catalog);
+    sys_cat.getMetadataForDB(db_name, database_);
+    sys_cat.getMetadataForUser(user_name, user_);
+    return true;
   }
 
  protected:
+
+  void reset() {
+    if (calcite_) {
+      calcite_->close_calcite_server();
+      calcite_.reset();
+    }
+    QR::reset();
+    ForeignStorageInterface::destroy();
+    data_mgr_.reset();
+    if (is_temp_db_) {
+      boost::filesystem::remove_all(base_path_);
+    }
+    base_path_.clear();
+  }
+
   void updateSession(std::shared_ptr<Catalog_Namespace::Catalog> catalog) {
     auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
         catalog, user_, ExecutorDeviceType::CPU, "");
-    QR::reset();
     QR::init(session);
   }
 
@@ -502,13 +448,18 @@ class DBEngineImpl : public DBEngine {
                                               "mapd_export"};
 };
 
-DBEngine* DBEngine::create(const std::string& path, int port) {
+std::shared_ptr<DBEngine> DBEngine::create(const std::string& path, int port) {
+  auto engine = std::make_shared<DBEngineImpl>();
   g_enable_union = false;
   g_enable_columnar_output = true;
-  return new DBEngineImpl(path, port);
+  if (!engine->init(path, port, "")) {
+    throw std::runtime_error("DBE initialization failed");
+  }
+  return engine;
 }
 
-DBEngine* DBEngine::create(const std::map<std::string, std::string>& parameters) {
+std::shared_ptr<DBEngine> DBEngine::create(const std::map<std::string, std::string>& parameters) {
+  auto engine = std::make_shared<DBEngineImpl>();
   int port = DEFAULT_CALCITE_PORT;
   std::string path, udf_filename;
   g_enable_union = false;
@@ -535,7 +486,10 @@ DBEngine* DBEngine::create(const std::map<std::string, std::string>& parameters)
                 << std::endl;
     }
   }
-  return new DBEngineImpl(path, port, udf_filename);
+  if (!engine->init(path, port, udf_filename)) {
+    throw std::runtime_error("DBE initialization failed");
+  }
+  return engine;
 }
 
 /** DBEngine downcasting methods */
@@ -550,22 +504,17 @@ inline const DBEngineImpl* getImpl(const DBEngine* ptr) {
 
 /** DBEngine external methods */
 
-void DBEngine::reset() {
-  DBEngineImpl* engine = getImpl(this);
-  engine->reset();
-}
-
 void DBEngine::executeDDL(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   engine->executeDDL(query);
 }
 
-std::unique_ptr<Cursor> DBEngine::executeDML(const std::string& query) {
+std::shared_ptr<Cursor> DBEngine::executeDML(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   return engine->executeDML(query);
 }
 
-std::unique_ptr<Cursor> DBEngine::executeRA(const std::string& query) {
+std::shared_ptr<Cursor> DBEngine::executeRA(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   return engine->executeRA(query);
 }
