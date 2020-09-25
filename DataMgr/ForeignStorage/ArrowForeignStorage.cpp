@@ -764,7 +764,7 @@ static SQLTypeInfo getOmnisciType(const arrow::DataType& type) {
       return SQLTypeInfo(kBIGINT, false);
     case Type::BOOL:
       return SQLTypeInfo(kBOOLEAN, false);
-    case Type::HALF_FLOAT:
+    case Type::FLOAT:
       return SQLTypeInfo(kFLOAT, false);
     case Type::DOUBLE:
       return SQLTypeInfo(kDOUBLE, false);
