@@ -53,11 +53,12 @@ def test_failed_DDL():
 #######################Check right DML statement
 def test_success_DML():
     engine.executeDML("insert into test values(55,5,3,'la-la-la')")
-    engine.executeDML("insert into test values(66,6,1, null)")
-    engine.executeDML("insert into test values(77,7,null,null)")
+    engine.executeDML("insert into test values(66,6,1, 'aa')")
+    engine.executeDML("insert into test values(77,7,0,'bb')")
     dframe = engine.select_df("select * from test")
-    df = pandas.DataFrame({'x': [55,66,77], 'w': [5,6,7], 'y': [3,1,numpy.nan], 'z': ['la-la-la', numpy.nan, numpy.nan]})
-    assert not dframe.equals(df)
+    dforig = pandas.DataFrame({'x': [55,66,77], 'w': [5,6,7], 'y': [3,1,0], 'z': ['la-la-la', 'aa', 'bb']})
+    dforig = dforig.astype(dtype= {"x":"int32", "w":"int8","y":"int32", "z":"category"})
+    assert dframe.equals(dforig)
 
 #######################Check wrong DML statement
 def test_failed_DML():
