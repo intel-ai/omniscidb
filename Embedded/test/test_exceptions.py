@@ -20,9 +20,7 @@ def test_failed_init():
         pass
 
     with pytest.raises(RuntimeError) as excinfo:
-        def f(eng):
-            eng = dbe.PyDbEngine(**{"port": 5555, "path": "/"+data_path})
-        f(engine)
+        engine = dbe.PyDbEngine(**{"port": 5555, "path": "/"+data_path})
     assert "Permission denied" in str(excinfo.value)
 
 ######################Check init with right parameters
@@ -41,9 +39,7 @@ def test_success_DDL():
 #######################Check creating a duplicate table
 def test_failed_DDL():
     with pytest.raises(RuntimeError) as excinfo:
-        def f():
-            engine.executeDDL("create table test (x int not null, w tinyint, y int, z text)")
-        f()
+        engine.executeDDL("create table test (x int not null, w tinyint, y int, z text)")
     assert "already exists" in str(excinfo.value)
 
 #######################Check right DML statement
@@ -59,15 +55,11 @@ def test_success_DML():
 #######################Check wrong DML statement
 def test_failed_DML():
     with pytest.raises(ValueError) as excinfo:
-        def f():
-            cursor = engine.executeDML("selectTT * from test")
-        f()
+        cursor = engine.executeDML("selectTT * from test")
     assert "Parse failed" in str(excinfo.value)
 
 #######################Check zero division exception
 def test_zero_division():
     with pytest.raises(RuntimeError) as excinfo:
-        def f():
-            cursor = engine.executeDML("SELECT x / (x - x) FROM test")
-        f()
+        cursor = engine.executeDML("SELECT x / (x - x) FROM test")
     assert "Division by zero" in str(excinfo.value)
