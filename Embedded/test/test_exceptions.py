@@ -13,20 +13,16 @@ ctypes._dlopen('libDBEngine.so', ctypes.RTLD_GLOBAL)
 data_path = "test_dbe_data"
 #######################Check init with wrong parameter
 def test_failed_init():
+    global engine
     try:
         shutil.rmtree(data_path)
     except FileNotFoundError:
         pass
 
     with pytest.raises(RuntimeError) as excinfo:
-        def f():
-            engine = dbe.PyDbEngine(**{"port": 5555, "path": "/"+data_path})
-            with pytest.raises(RuntimeError) as excinfo:
-                def ff():
-                    engine.check_closed()
-                f()
-            assert "uninitialized" in str(excinfo.value)
-        f()
+        def f(eng):
+            eng = dbe.PyDbEngine(**{"port": 5555, "path": "/"+data_path})
+        f(engine)
     assert "Permission denied" in str(excinfo.value)
 
 ######################Check init with right parameters
