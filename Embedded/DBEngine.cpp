@@ -150,7 +150,6 @@ class DBEngineImpl : public DBEngine {
     return true;
   }
 
-
   void executeDDL(const std::string& query) {
       QR::get()->runDDLStatement(query);
   }
