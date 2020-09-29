@@ -15,6 +15,7 @@
  */
 
 #include "DBEngine.h"
+#include <atomic>
 #include <boost/filesystem.hpp>
 #include <stdexcept>
 #include "DataMgr/ForeignStorage/ArrowForeignStorage.h"
@@ -103,6 +104,11 @@ class DBEngineImpl : public DBEngine {
   ~DBEngineImpl() { reset(); }
 
   bool init(const std::string& base_path, int port, const std::string& udf_filename) {
+    static std::atomic<bool> initializing{false};
+    if (initializing.load())
+    {
+      throw std::runtime_error("Database engine already initialized");
+    }
     SystemParameters mapd_parms;
     std::string db_path = base_path;
     registerArrowForeignStorage();
@@ -139,8 +145,8 @@ class DBEngineImpl : public DBEngine {
     auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
         catalog, user_, ExecutorDeviceType::CPU, "");
     QR::init(session);
-
     base_path_ = db_path;
+    initializing.store(true);
     return true;
   }
 
@@ -448,7 +454,10 @@ class DBEngineImpl : public DBEngine {
                                               "mapd_export"};
 };
 
+std::mutex g_init_mutex;
+
 std::shared_ptr<DBEngine> DBEngine::create(const std::string& path, int port) {
+  const std::lock_guard<std::mutex> lock(g_init_mutex);
   auto engine = std::make_shared<DBEngineImpl>();
   g_enable_union = false;
   g_enable_columnar_output = true;
@@ -459,6 +468,7 @@ std::shared_ptr<DBEngine> DBEngine::create(const std::string& path, int port) {
 }
 
 std::shared_ptr<DBEngine> DBEngine::create(const std::map<std::string, std::string>& parameters) {
+  const std::lock_guard<std::mutex> lock(g_init_mutex);
   auto engine = std::make_shared<DBEngineImpl>();
   int port = DEFAULT_CALCITE_PORT;
   std::string path, udf_filename;
