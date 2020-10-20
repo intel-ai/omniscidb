@@ -112,7 +112,7 @@ void ArrowForeignStorageBase::generateNullValues(
     std::shared_ptr<arrow::ChunkedArray> arr_col_chunked_array,
     const SQLTypeInfo& columnType) {
   const size_t typeSize = columnType.get_size();
-  if (columnType.is_integer()) {
+  if (columnType.is_integer() || is_datetime(columnType.get_type())) {
     switch (typeSize) {
       case 1:
         setNullValues<int8_t>(fragments, arr_col_chunked_array);
@@ -208,7 +208,7 @@ void ArrowForeignStorageBase::generateSentinelValues(int8_t* data,
                                                      const SQLTypeInfo& columnType,
                                                      size_t count) {
   const size_t type_size = columnType.get_size();
-  if (columnType.is_integer()) {
+  if (columnType.is_integer() || is_datetime(columnType.get_type())) {
     switch (type_size) {
       case 1:
         setNulls<int8_t>(data, count);
