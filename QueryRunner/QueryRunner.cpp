@@ -437,7 +437,7 @@ ExecutionResult run_select_query_with_filter_push_down(
   co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
 
   ExecutionOptions eo = {g_enable_columnar_output,
-                         true,
+                         g_enable_multifrag_rs,
                          just_explain,
                          allow_loop_joins,
                          false,
@@ -525,9 +525,8 @@ ExecutionResult QueryRunner::runSelectQuery(const std::string& query_str,
   auto executor = Executor::getExecutor(cat.getCurrentDB().dbId);
   CompilationOptions co = CompilationOptions::defaults(device_type);
   co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
-
   ExecutionOptions eo = {g_enable_columnar_output,
-                         true,
+                         g_enable_multifrag_rs,
                          just_explain,
                          allow_loop_joins,
                          false,
@@ -580,7 +579,7 @@ ExecutionResult QueryRunner::runSelectQueryRA(const std::string& query_str,
   co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
 
   ExecutionOptions eo = {g_enable_columnar_output,
-                         true,
+                         g_enable_multifrag_rs,
                          just_explain,
                          allow_loop_joins,
                          false,
