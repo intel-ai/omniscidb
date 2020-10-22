@@ -505,7 +505,7 @@ std::shared_ptr<DBEngine> DBEngine::create(
       udf_filename = value;
     } else if (key == "null_div_by_zero") {
       g_null_div_by_zero = std::stoi(value);
-    } else if (key == "enable_multifrag") {
+    } else if (key == "enable_multifrag_rs") {
       g_enable_multifrag_rs = std::stoi(value);
     } else {
       std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
