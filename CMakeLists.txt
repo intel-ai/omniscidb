@@ -55,7 +55,7 @@ add_definitions("-DMAPD_EDITION_${MAPD_EDITION}")
 string(TOLOWER "${MAPD_EDITION}" MAPD_EDITION_LOWER)
 
 set(MAPD_VERSION_MAJOR "5")
-set(MAPD_VERSION_MINOR "4")
+set(MAPD_VERSION_MINOR "5")
 set(MAPD_VERSION_PATCH "0")
 set(MAPD_VERSION_EXTRA "dev")
 set(MAPD_VERSION_RAW "${MAPD_VERSION_MAJOR}.${MAPD_VERSION_MINOR}.${MAPD_VERSION_PATCH}${MAPD_VERSION_EXTRA}")
@@ -85,6 +85,7 @@ add_custom_target(clean-all
 option(PREFER_STATIC_LIBS "Prefer linking against static libraries" OFF)
 if(PREFER_STATIC_LIBS)
   set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+  set(Arrow_USE_STATIC_LIBS ON)
   set(Boost_USE_STATIC_LIBS ON)
   set(OPENSSL_USE_STATIC_LIBS ON)
   set(Thrift_USE_STATIC_LIBS ON)
@@ -147,6 +148,24 @@ if(XCODE)
   add_definitions("-DXCODE")
 endif()
 
+option(ENABLE_GEOS "Enable GEOS Support" ON)
+if (ENABLE_GEOS)
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    set(ENABLE_GEOS OFF CACHE BOOL "Enable GEOS support" FORCE)
+    message(STATUS "GEOS functionality is not supported on macOS.")
+  else()
+    find_package(GEOS)
+    if(GEOS_NOTFOUND)
+      set(ENABLE_GEOS OFF CACHE BOOL "Enable GEOS support" FORCE)
+      message(STATUS "GEOS not found, disabling support.")
+    else()
+      set(GEOS_LIBRARY_FILENAME '"${GEOS_LIBRARY}"')
+      add_definitions("-DENABLE_GEOS -DGEOS_LIBRARY_FILENAME=${GEOS_LIBRARY_FILENAME}")
+      set(GEOS_RT_DEFINITIONS "-DENABLE_GEOS")
+    endif()
+  endif()
+endif()
+
 # fixme: hack works for Homebrew, might not work for Conda
 if(ENABLE_CONDA)
   set(OPENSSL_ROOT_DIR "$ENV{CONDA_PREFIX}")
@@ -157,8 +176,15 @@ endif()
 find_package(OpenSSL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
-find_package(Thrift REQUIRED)
-message("Found Thrift version: ${Thrift_VERSION}")
+if(MSVC)
+  find_package(Thrift CONFIG REQUIRED)
+  set(Thrift_INCLUDE_DIRS ${THRIFT_INCLUDE_DIR})
+  set(Thrift_EXECUTABLE "${THRIFT_BIN_DIR}/thrift.exe")
+  set(Thrift_LIBRARIES ${THRIFT_LIBRARIES})
+else()
+  find_package(Thrift REQUIRED)
+  message("Found Thrift version: ${Thrift_VERSION}")
+endif()
 include_directories(${Thrift_INCLUDE_DIRS})
 if("${Thrift_VERSION}" VERSION_LESS "0.11.0")
   add_definitions("-DHAVE_THRIFT_BOOST_SHAREDPTR")
@@ -177,6 +203,7 @@ find_package(PNG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(GDAL REQUIRED)
 find_package(GDALExtra REQUIRED)
+find_package(BLOSC REQUIRED)
 list(APPEND GDAL_LIBRARIES ${PNG_LIBRARIES} ${GDALExtra_LIBRARIES})
 include_directories(${GDAL_INCLUDE_DIRS})
 
@@ -192,20 +219,28 @@ if(ENABLE_FOLLY)
   endif()
 endif()
 
-find_package(Curses REQUIRED)
-include_directories(${CURSES_INCLUDE_DIRS})
-if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
-  include_directories(${CURSES_INCLUDE_DIRS}/ncurses/)
+if(MSVC)
+  include_directories(include_directories("${LIBS_PATH}/include/pdcurses"))
+else()
+  find_package(Curses)
+  include_directories(${CURSES_INCLUDE_DIRS})
+  if (CURSES_HAVE_NCURSES_CURSES_H AND NOT CURSES_HAVE_CURSES_H)
+    include_directories(${CURSES_INCLUDE_DIRS}/ncurses/)
+  endif()
 endif()
 
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR}/bin)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
-endif()
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+if(MSVC)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /permissive- /EHsc /std:c++17 /D NOMINMAX /D WIN32_LEAN_AND_MEAN")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-unused-local-typedefs -fdiagnostics-color=auto -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS")
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-register")
+  endif()
+  if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+  endif()
 endif()
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -222,6 +257,7 @@ if(ENABLE_ASAN)
   set(SAN_FLAGS "-fsanitize=address -O1 -fno-omit-frame-pointer")
   add_definitions("-DWITH_DECODERS_BOUNDS_CHECKING")
 elseif(ENABLE_TSAN)
+  add_definitions("-DHAVE_TSAN")
   # Copy the config directory to the build dir for TSAN suppressions
   file(COPY config DESTINATION ${CMAKE_BINARY_DIR})
 
@@ -272,24 +308,75 @@ include_directories(${CMAKE_SOURCE_DIR}
 ## Dependencies
 
 # LLVM
-set(llvm_config_cmd llvm-config)
+if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+  list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/llvm")
+endif()
+find_package(LLVM CONFIG REQUIRED)
 
-execute_process(COMMAND ${llvm_config_cmd} "--includedir" OUTPUT_VARIABLE LLVM_INC_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--libs" OUTPUT_VARIABLE LLVM_LIB_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--ldflags" OUTPUT_VARIABLE LLVM_LD_FLAGS)
-execute_process(COMMAND ${llvm_config_cmd} "--version" OUTPUT_VARIABLE LLVM_VERSION_STR)
-string(REGEX MATCH "^([0-9]+)" LLVM_VERSION_MAJOR "${LLVM_VERSION_STR}")
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-string(REPLACE "\n" " " LLVM_LINKER_FLAGS "${LLVM_LIB_FLAGS} ${LLVM_LD_FLAGS} ${CURSES_LIBRARIES}")
-string(STRIP "${LLVM_LINKER_FLAGS}" LLVM_LINKER_FLAGS)
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
 
-include_directories(${LLVM_INC_FLAGS})
+find_library(CLANG_LIB clang-cpp)
+find_library(LLVM_LIB LLVM)
+# Deps builds use separate libs for each clang component, while some distros now bundle into a single lib
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" OR NOT LLVM_LIB)
+  set(LLVM_COMPONENTS support mcjit core irreader option)
+
+  option(ENABLE_INTEL_JIT_LISTENER "Enable Intel Vtune JIT Listener" OFF)
+  if(ENABLE_INTEL_JIT_LISTENER)
+    list(APPEND LLVM_COMPONENTS inteljitevents)
+  endif()
+
+  llvm_map_components_to_libnames(llvm_libs ${LLVM_TARGETS_TO_BUILD} ${LLVM_COMPONENTS})
+  set(clang_libs
+      clangFrontend
+      clangSerialization
+      clangDriver
+      clangTooling
+      clangParse
+      clangSema
+      clangAnalysis
+      clangEdit
+      clangAST
+      clangLex
+      clangBasic
+      clangRewrite
+      clangRewriteFrontend)
+
+  # LLVMSupport explicitly lists tinfo in its INTERFACE_LINK_LIBRARIES, even
+  # though we provide it in our build of ncurses. Since LLVMSupport is listed
+  # as a requirement for other llvm libs, we need to walk through the entire
+  # list in order to remove all instances of tinfo.
+  foreach(lib ${llvm_libs})
+    get_target_property(interface_libs ${lib} INTERFACE_LINK_LIBRARIES)
+    list(REMOVE_ITEM interface_libs tinfo z rt pthread -lpthread m dl)
+    set_target_properties(${lib} PROPERTIES INTERFACE_LINK_LIBRARIES "${interface_libs}")
+  endforeach()
+
+  list(APPEND llvm_libs ${CURSES_NCURSES_LIBRARY})
+else()
+  if(NOT CLANG_LIB)
+    message(FATAL_ERROR "Could not find CLANG library.")
+  endif()
+
+  set(clang_libs ${CLANG_LIB})
+  set(llvm_libs ${LLVM_LIB})
+endif()
+
+# Clang (UDF Compiler)
+find_package(Clang REQUIRED)
+include_directories(${CLANG_INCLUDE_DIRS})
+add_definitions(${CLANG_DEFINITIONS})
+
 
 # Boost
-find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale REQUIRED)
+find_package(Boost COMPONENTS log log_setup filesystem program_options regex system thread timer locale iostreams REQUIRED)
 include_directories(${Boost_INCLUDE_DIR})
 
-# CUDA architecture flags 
+# CUDA architecture flags
 set (CUDA_COMPILATION_ARCH
   -gencode=arch=compute_35,code=compute_35
   -gencode=arch=compute_50,code=compute_50
@@ -310,6 +397,9 @@ add_subdirectory(ThirdParty/googletest)
 
 # Google Benchmark
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "Suppressing benchmark's tests" FORCE)
+if(WIN32)
+  set(HAVE_POSIX_REGEX 0)
+endif()
 add_subdirectory(ThirdParty/googlebenchmark)
 
 # Arrow
@@ -318,8 +408,7 @@ add_definitions("-DARROW_NO_DEPRECATED_API")
 include_directories(${Arrow_INCLUDE_DIRS})
 
 option(ENABLE_IMPORT_PARQUET "Enable Parquet Importer support" ON)
-# temporarily disable parquet if static linking due to issues with arrow+zstd
-if(ENABLE_IMPORT_PARQUET AND NOT PREFER_STATIC_LIBS)
+if(ENABLE_IMPORT_PARQUET)
   find_package(Parquet)
   if(NOT Parquet_FOUND)
     set(ENABLE_IMPORT_PARQUET OFF CACHE BOOL "Enable Parquet Importer support" FORCE)
@@ -487,6 +576,11 @@ else()
   set(PROFILER_LIBS "")
 endif()
 
+option(ENABLE_FSI "Enable Foreign Storage Interface" OFF)
+if(ENABLE_FSI)
+  add_definitions("-DENABLE_FSI")
+endif()
+
 add_subdirectory(SqliteConnector)
 
 add_subdirectory(StringDictionary)
@@ -497,20 +591,22 @@ include_directories(${CalciteThrift_BINARY_DIR})
 add_subdirectory(Catalog)
 add_subdirectory(Parser)
 add_subdirectory(Analyzer)
-add_subdirectory(Import)
+add_subdirectory(ImportExport)
 add_subdirectory(QueryEngine)
 add_subdirectory(DataMgr)
 add_subdirectory(CudaMgr)
 add_subdirectory(LockMgr)
+add_subdirectory(Logger)
 add_subdirectory(MigrationMgr)
 add_subdirectory(Fragmenter)
 add_subdirectory(Shared)
+add_subdirectory(OSDependent)
 add_subdirectory(Utils)
 add_subdirectory(QueryRunner)
 add_subdirectory(SQLFrontend)
 add_subdirectory(TableArchiver)
 add_subdirectory(ThriftHandler)
-
+add_subdirectory(Geospatial)
 add_subdirectory(Distributed)
 
 if(ENABLE_DBE)
@@ -522,7 +618,7 @@ if(ENABLE_ODBC)
   add_subdirectory(ODBC)
 endif()
 
-set(MAPD_LIBRARIES Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer CsvImport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter)
+set(MAPD_LIBRARIES OSDependent Shared Catalog SqliteConnector MigrationMgr TableArchiver Parser Analyzer ImportExport QueryRunner QueryEngine QueryState LockMgr DataMgr Fragmenter Logger Geospatial)
 
 if("${MAPD_EDITION_LOWER}" STREQUAL "ee")
   list(APPEND MAPD_LIBRARIES Distributed)
@@ -557,7 +653,7 @@ if (ENABLE_TESTS)
   add_subdirectory(SampleCode)
 endif()
 
-if(ENABLE_RENDERING AND (ENABLE_TESTS OR ENABLE_RENDER_TESTS))
+if(ENABLE_RENDERING AND ENABLE_RENDER_TESTS)
   enable_testing()
   add_subdirectory(Tests/RenderTests)
 endif()
@@ -652,14 +748,14 @@ endmacro()
 find_program(JQ_EXECUTABLE NAMES jq)
 if (NOT ${JQ_EXECUTABLE} STREQUAL "JQ_EXECUTABLE-NOTFOUND")
   file(WRITE ${CMAKE_BINARY_DIR}/jq.filter "map(select(.file | test(\".*/(build|ThirdParty)/.*\") | not))")
-  add_custom_target(clang-tidy
+  add_custom_target(run-clang-tidy
     COMMAND mkdir -p clang-tidy
     COMMAND ${JQ_EXECUTABLE} -f jq.filter ${CMAKE_BINARY_DIR}/compile_commands.json > clang-tidy/compile_commands.json
     COMMAND cd clang-tidy && ${CMAKE_SOURCE_DIR}/ThirdParty/clang/run-clang-tidy.py -quiet -format -fix -header-filter="${CMAKE_SOURCE_DIR}/.*" 2> /dev/null
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 else()
-  message(STATUS "jq not found, disabling clang-tidy target")
+  message(STATUS "jq not found, disabling run-clang-tidy target")
 endif()
 
 # doxygen
@@ -848,22 +944,6 @@ else()
   install(FILES docker/Dockerfile.cpu RENAME Dockerfile DESTINATION "docker")
 endif()
 
-execute_process(
-  COMMAND ln -sf omnisql mapdql
-  COMMAND ln -sf omnisci_server mapd_server
-  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  )
-install(FILES
-  ${CMAKE_BINARY_DIR}/bin/mapdql
-  ${CMAKE_BINARY_DIR}/bin/mapd_server
-  DESTINATION "bin" COMPONENT "exe"
-  )
-execute_process(
-  COMMAND ln -sf startomnisci startmapd
-  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-  )
-install(FILES ${CMAKE_BINARY_DIR}/startmapd DESTINATION ".")
-
 exec_program(uname ARGS -m OUTPUT_VARIABLE MAPD_HOST_SYSTEM_ARCHITECTURE) # does not account for cross-compiling or Windows
 set(CPACK_PACKAGE_FILE_NAME "${CMAKE_PROJECT_NAME}-${MAPD_EDITION_LOWER}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${MAPD_HOST_SYSTEM_ARCHITECTURE}${MAPD_PACKAGE_FLAGS}")
 
@@ -882,8 +962,3 @@ if(DOXYGEN_FOUND)
 
   add_dependencies(sphinx doxygen)
 endif(DOXYGEN_FOUND)
-
-option(ENABLE_FSI "Enable Foreign Storage Interface" OFF)
-if(ENABLE_FSI)
-  add_definitions("-DENABLE_FSI")
-endif()

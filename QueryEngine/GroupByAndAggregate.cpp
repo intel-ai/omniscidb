@@ -16,7 +16,6 @@
 
 #include "GroupByAndAggregate.h"
 #include "AggregateUtils.h"
-#include "Allocators/CudaAllocator.h"
 
 #include "CardinalityEstimator.h"
 #include "CodeGenerator.h"
@@ -113,6 +112,22 @@ bool is_column_range_too_big_for_perfect_hash(const ColRangeInfo& col_range_info
   }
 }
 
+bool cardinality_estimate_less_than_column_range(const int64_t cardinality_estimate,
+                                                 const ColRangeInfo& col_range_info) {
+  try {
+    // the cardinality estimate is the size of the baseline hash table. further penalize
+    // the baseline hash table by a factor of 2x due to overhead in computing baseline
+    // hash. This has the overall effect of penalizing baseline hash over perfect hash by
+    // 4x; i.e. if the cardinality of the filtered data is less than 25% of the entry
+    // count of the column, we use baseline hash on the filtered set
+    return checked_int64_t(cardinality_estimate) * 2 <
+           static_cast<int64_t>(checked_int64_t(col_range_info.max) -
+                                checked_int64_t(col_range_info.min));
+  } catch (...) {
+    return false;
+  }
+}
+
 }  // namespace
 
 ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
@@ -176,10 +191,57 @@ ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
   if (has_count_distinct(ra_exe_unit_)) {
     max_entry_count = std::min(max_entry_count, baseline_threshold);
   }
-  if ((!ra_exe_unit_.groupby_exprs.front()->get_type_info().is_string() &&
-       !expr_is_rowid(ra_exe_unit_.groupby_exprs.front().get(), *executor_->catalog_)) &&
-      is_column_range_too_big_for_perfect_hash(col_range_info, max_entry_count) &&
-      !col_range_info.bucket) {
+  const auto& groupby_expr_ti = ra_exe_unit_.groupby_exprs.front()->get_type_info();
+  if (groupby_expr_ti.is_string() && !col_range_info.bucket) {
+    CHECK(groupby_expr_ti.get_compression() == kENCODING_DICT);
+
+    const bool has_filters =
+        !ra_exe_unit_.quals.empty() || !ra_exe_unit_.simple_quals.empty();
+    if (has_filters &&
+        is_column_range_too_big_for_perfect_hash(col_range_info, max_entry_count)) {
+      // if filters are present, we can use the filter to narrow the cardinality of the
+      // group by in the case of ranges too big for perfect hash. Otherwise, we are better
+      // off attempting perfect hash (since we know the range will be made of
+      // monotonically increasing numbers from min to max for dictionary encoded strings)
+      // and failing later due to excessive memory use.
+      // Check the conditions where baseline hash can provide a performance increase and
+      // return baseline hash (potentially forcing an estimator query) as the range type.
+      // Otherwise, return col_range_info which will likely be perfect hash, though could
+      // be baseline from a previous call of this function prior to the estimator query.
+      if (!ra_exe_unit_.sort_info.order_entries.empty()) {
+        // TODO(adb): allow some sorts to pass through this block by centralizing sort
+        // algorithm decision making
+        if (has_count_distinct(ra_exe_unit_) &&
+            is_column_range_too_big_for_perfect_hash(col_range_info, max_entry_count)) {
+          // always use baseline hash for column range too big for perfect hash with count
+          // distinct descriptors. We will need 8GB of CPU memory minimum for the perfect
+          // hash group by in this case.
+          return {QueryDescriptionType::GroupByBaselineHash,
+                  col_range_info.min,
+                  col_range_info.max,
+                  0,
+                  col_range_info.has_nulls};
+        } else {
+          // use original col range for sort
+          return col_range_info;
+        }
+      }
+      // if filters are present and the filtered range is less than the cardinality of
+      // the column, consider baseline hash
+      if (!group_cardinality_estimation_ ||
+          cardinality_estimate_less_than_column_range(*group_cardinality_estimation_,
+                                                      col_range_info)) {
+        return {QueryDescriptionType::GroupByBaselineHash,
+                col_range_info.min,
+                col_range_info.max,
+                0,
+                col_range_info.has_nulls};
+      }
+    }
+  } else if ((!expr_is_rowid(ra_exe_unit_.groupby_exprs.front().get(),
+                             *executor_->catalog_)) &&
+             is_column_range_too_big_for_perfect_hash(col_range_info, max_entry_count) &&
+             !col_range_info.bucket) {
     return {QueryDescriptionType::GroupByBaselineHash,
             col_range_info.min,
             col_range_info.max,
@@ -241,18 +303,21 @@ int64_t GroupByAndAggregate::getBucketedCardinality(const ColRangeInfo& col_rang
 #define LL_INT(v) executor_->cgen_state_->llInt(v)
 #define LL_FP(v) executor_->cgen_state_->llFp(v)
 #define ROW_FUNC executor_->cgen_state_->row_func_
+#define CUR_FUNC executor_->cgen_state_->current_func_
 
 GroupByAndAggregate::GroupByAndAggregate(
     Executor* executor,
     const ExecutorDeviceType device_type,
     const RelAlgExecutionUnit& ra_exe_unit,
     const std::vector<InputTableInfo>& query_infos,
-    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner)
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+    const std::optional<int64_t>& group_cardinality_estimation)
     : executor_(executor)
     , ra_exe_unit_(ra_exe_unit)
     , query_infos_(query_infos)
     , row_set_mem_owner_(row_set_mem_owner)
-    , device_type_(device_type) {
+    , device_type_(device_type)
+    , group_cardinality_estimation_(group_cardinality_estimation) {
   for (const auto& groupby_expr : ra_exe_unit_.groupby_exprs) {
     if (!groupby_expr) {
       continue;
@@ -275,6 +340,8 @@ int64_t GroupByAndAggregate::getShardedTopBucket(const ColRangeInfo& col_range_i
                                                  const size_t shard_count) const {
   size_t device_count{0};
   if (device_type_ == ExecutorDeviceType::GPU) {
+    auto cuda_mgr = executor_->getCatalog()->getDataMgr().getCudaMgr();
+    CHECK(cuda_mgr);
     device_count = executor_->getCatalog()->getDataMgr().getCudaMgr()->getDeviceCount();
     CHECK_GT(device_count, 0u);
   }
@@ -286,18 +353,18 @@ int64_t GroupByAndAggregate::getShardedTopBucket(const ColRangeInfo& col_range_i
     /*
       when a node has fewer devices than shard count,
       a) In a distributed setup, the minimum distance between two keys would be
-      device_count because shards are stored consecutively across the physical tables, i.e
-      if a shard column has values 0 to 9, and 3 shards on each leaf, then node 1 would
-      have values: 0,1,2,6,7,8 and node 2 would have values: 3,4,5,9. If each leaf node
-      has only 1 device, in this case, all the keys from each node are loaded on the
-      device each.
+      device_count because shards are stored consecutively across the physical tables,
+      i.e if a shard column has values 0 to 9, and 3 shards on each leaf, then node 1
+      would have values: 0,1,2,6,7,8 and node 2 would have values: 3,4,5,9. If each leaf
+      node has only 1 device, in this case, all the keys from each node are loaded on
+      the device each.
 
       b) In a single node setup, the distance would be minimum of device_count or
       difference of device_count - shard_count. For example: If a single node server
       running on 3 devices a shard column has values 0 to 9 in a table with 4 shards,
-      device to fragment keys mapping would be: device 1 - 4,8,3,7 device 2 - 1,5,9 device
-      3 - 2, 6 The bucket value would be 4(shards) - 3(devices) = 1 i.e. minimum of
-      device_count or difference.
+      device to fragment keys mapping would be: device 1 - 4,8,3,7 device 2 - 1,5,9
+      device 3 - 2, 6 The bucket value would be 4(shards) - 3(devices) = 1 i.e. minimum
+      of device_count or difference.
 
       When a node has device count equal to or more than shard count then the
       minimum distance is always at least shard_count * no of leaf nodes.
@@ -840,16 +907,17 @@ GroupByAndAggregate::DiamondCodegen::DiamondCodegen(
     DiamondCodegen* parent,
     const bool share_false_edge_with_parent)
     : executor_(executor), chain_to_next_(chain_to_next), parent_(parent) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   if (parent_) {
     CHECK(!chain_to_next_);
   }
-  cond_true_ = llvm::BasicBlock::Create(LL_CONTEXT, label_prefix + "_true", ROW_FUNC);
+  cond_true_ = llvm::BasicBlock::Create(LL_CONTEXT, label_prefix + "_true", CUR_FUNC);
   if (share_false_edge_with_parent) {
     CHECK(parent);
     orig_cond_false_ = cond_false_ = parent_->cond_false_;
   } else {
     orig_cond_false_ = cond_false_ =
-        llvm::BasicBlock::Create(LL_CONTEXT, label_prefix + "_false", ROW_FUNC);
+        llvm::BasicBlock::Create(LL_CONTEXT, label_prefix + "_false", CUR_FUNC);
   }
 
   LL_BUILDER.CreateCondBr(cond, cond_true_, cond_false_);
@@ -867,6 +935,7 @@ void GroupByAndAggregate::DiamondCodegen::setFalseTarget(llvm::BasicBlock* cond_
 }
 
 GroupByAndAggregate::DiamondCodegen::~DiamondCodegen() {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   if (parent_ && orig_cond_false_ != parent_->cond_false_) {
     LL_BUILDER.CreateBr(parent_->cond_false_);
   } else if (chain_to_next_) {
@@ -882,6 +951,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
                                   const QueryMemoryDescriptor& query_mem_desc,
                                   const CompilationOptions& co,
                                   const GpuSharedMemoryContext& gpu_smem_context) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   CHECK(filter_result);
 
   bool can_return_error = false;
@@ -896,7 +966,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
     DiamondCodegen filter_cfg(filter_result,
                               executor_,
                               !is_group_by || query_mem_desc.usesGetGroupValueFast(),
-                              "filter",
+                              "filter",  // filter_true and filter_false basic blocks
                               nullptr,
                               false);
     filter_false = filter_cfg.cond_false_;
@@ -1003,6 +1073,7 @@ llvm::Value* GroupByAndAggregate::codegenOutputSlot(
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co,
     DiamondCodegen& diamond_codegen) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   CHECK(query_mem_desc.getQueryDescriptionType() == QueryDescriptionType::Projection);
   CHECK_EQ(size_t(1), ra_exe_unit_.groupby_exprs.size());
   const auto group_expr = ra_exe_unit_.groupby_exprs.front();
@@ -1093,6 +1164,7 @@ std::tuple<llvm::Value*, llvm::Value*> GroupByAndAggregate::codegenGroupBy(
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co,
     DiamondCodegen& diamond_codegen) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   auto arg_it = ROW_FUNC->arg_begin();
   auto groups_buffer = arg_it++;
 
@@ -1214,6 +1286,7 @@ GroupByAndAggregate::codegenSingleColumnPerfectHash(
     llvm::Value* group_expr_lv_translated,
     llvm::Value* group_expr_lv_original,
     const int32_t row_size_quad) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   CHECK(query_mem_desc.usesGetGroupValueFast());
   std::string get_group_fn_name{query_mem_desc.didOutputColumnar()
                                     ? "get_columnar_group_bin_offset"
@@ -1262,6 +1335,7 @@ std::tuple<llvm::Value*, llvm::Value*> GroupByAndAggregate::codegenMultiColumnPe
     llvm::Value* key_size_lv,
     const QueryMemoryDescriptor& query_mem_desc,
     const int32_t row_size_quad) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   CHECK(query_mem_desc.getQueryDescriptionType() ==
         QueryDescriptionType::GroupByPerfectHash);
   // compute the index (perfect hash)
@@ -1307,6 +1381,7 @@ GroupByAndAggregate::codegenMultiColumnBaselineHash(
     const QueryMemoryDescriptor& query_mem_desc,
     const size_t key_width,
     const int32_t row_size_quad) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   auto arg_it = ROW_FUNC->arg_begin();  // groups_buffer
   ++arg_it;                             // current match count
   ++arg_it;                             // total match count
@@ -1343,6 +1418,7 @@ GroupByAndAggregate::codegenMultiColumnBaselineHash(
 }
 
 llvm::Function* GroupByAndAggregate::codegenPerfectHashFunction() {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   CHECK_GT(ra_exe_unit_.groupby_exprs.size(), size_t(1));
   auto ft = llvm::FunctionType::get(
       get_int_type(32, LL_CONTEXT),
@@ -1391,6 +1467,7 @@ llvm::Function* GroupByAndAggregate::codegenPerfectHashFunction() {
 llvm::Value* GroupByAndAggregate::convertNullIfAny(const SQLTypeInfo& arg_type,
                                                    const TargetInfo& agg_info,
                                                    llvm::Value* target) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   const auto& agg_type = agg_info.sql_type;
   const size_t chosen_bytes = agg_type.get_size();
 
@@ -1443,8 +1520,9 @@ llvm::Value* GroupByAndAggregate::codegenWindowRowPointer(
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co,
     DiamondCodegen& diamond_codegen) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(executor_);
   if (window_func_context && window_function_is_aggregate(window_func->getKind())) {
     const int32_t row_size_quad = query_mem_desc.didOutputColumnar()
                                       ? 0
@@ -1485,10 +1563,11 @@ bool GroupByAndAggregate::codegenAggCalls(
     const CompilationOptions& co,
     const GpuSharedMemoryContext& gpu_smem_context,
     DiamondCodegen& diamond_codegen) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   auto agg_out_ptr_w_idx = agg_out_ptr_w_idx_in;
   // TODO(alex): unify the two cases, the output for non-group by queries
   //             should be a contiguous buffer
-  const bool is_group_by{std::get<0>(agg_out_ptr_w_idx)};
+  const bool is_group_by = std::get<0>(agg_out_ptr_w_idx);
   bool can_return_error = false;
   if (is_group_by) {
     CHECK(agg_out_vec.empty());
@@ -1551,6 +1630,7 @@ llvm::Value* GroupByAndAggregate::codegenAggColumnPtr(
     const size_t chosen_bytes,
     const size_t agg_out_off,
     const size_t target_idx) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   llvm::Value* agg_col_ptr{nullptr};
   if (query_mem_desc.didOutputColumnar()) {
     // TODO(Saman): remove the second columnar branch, and support all query description
@@ -1604,6 +1684,7 @@ void GroupByAndAggregate::codegenEstimator(
     GroupByAndAggregate::DiamondCodegen& diamond_codegen,
     const QueryMemoryDescriptor& query_mem_desc,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   const auto& estimator_arg = ra_exe_unit_.estimator->getArgument();
   auto estimator_comp_count_lv = LL_INT(static_cast<int32_t>(estimator_arg.size()));
   auto estimator_key_lv = LL_BUILDER.CreateAlloca(llvm::Type::getInt64Ty(LL_CONTEXT),
@@ -1654,6 +1735,7 @@ void GroupByAndAggregate::codegenCountDistinct(
     std::vector<llvm::Value*>& agg_args,
     const QueryMemoryDescriptor& query_mem_desc,
     const ExecutorDeviceType device_type) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   const auto agg_info = get_target_info(target_expr, g_bigint_count);
   const auto& arg_ti =
       static_cast<const Analyzer::AggExpr*>(target_expr)->get_arg()->get_type_info();
@@ -1728,6 +1810,7 @@ llvm::Value* GroupByAndAggregate::getAdditionalLiteral(const int32_t off) {
 std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
     const Analyzer::Expr* target_expr,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   const auto agg_expr = dynamic_cast<const Analyzer::AggExpr*>(target_expr);
   const auto func_expr = dynamic_cast<const Analyzer::FunctionOper*>(target_expr);
   const auto arr_expr = dynamic_cast<const Analyzer::ArrayExpr*>(target_expr);
@@ -1783,18 +1866,18 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
           const auto size = LL_BUILDER.CreateExtractValue(target_lv, 1);
           const auto null_flag = LL_BUILDER.CreateExtractValue(target_lv, 2);
 
-          const auto nullcheck_ok_bb = llvm::BasicBlock::Create(
-              LL_CONTEXT, "arr_nullcheck_ok_bb", executor_->cgen_state_->row_func_);
-          const auto nullcheck_fail_bb = llvm::BasicBlock::Create(
-              LL_CONTEXT, "arr_nullcheck_fail_bb", executor_->cgen_state_->row_func_);
+          const auto nullcheck_ok_bb =
+              llvm::BasicBlock::Create(LL_CONTEXT, "arr_nullcheck_ok_bb", CUR_FUNC);
+          const auto nullcheck_fail_bb =
+              llvm::BasicBlock::Create(LL_CONTEXT, "arr_nullcheck_fail_bb", CUR_FUNC);
 
           // TODO(adb): probably better to zext the bool
           const auto nullcheck = LL_BUILDER.CreateICmpEQ(
               null_flag, executor_->cgen_state_->llInt(static_cast<int8_t>(1)));
           LL_BUILDER.CreateCondBr(nullcheck, nullcheck_fail_bb, nullcheck_ok_bb);
 
-          const auto ret_bb = llvm::BasicBlock::Create(
-              LL_CONTEXT, "arr_return", executor_->cgen_state_->row_func_);
+          const auto ret_bb =
+              llvm::BasicBlock::Create(LL_CONTEXT, "arr_return", CUR_FUNC);
           LL_BUILDER.SetInsertPoint(ret_bb);
           auto result_phi = LL_BUILDER.CreatePHI(i8p_ty, 2, "array_ptr_return");
           result_phi->addIncoming(ptr, nullcheck_ok_bb);
@@ -1828,8 +1911,10 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
               bool const fetch_columns) -> std::vector<llvm::Value*> {
         const auto target_lvs =
             code_generator.codegen(selected_target_expr, fetch_columns, co);
-        const auto geo_expr = dynamic_cast<const Analyzer::GeoExpr*>(target_expr);
-        if (geo_expr) {
+        const auto geo_uoper = dynamic_cast<const Analyzer::GeoUOper*>(target_expr);
+        const auto geo_binoper = dynamic_cast<const Analyzer::GeoBinOper*>(target_expr);
+        if (geo_uoper || geo_binoper) {
+          CHECK(target_expr->get_type_info().is_geometry());
           CHECK_EQ(2 * static_cast<size_t>(target_ti.get_physical_coord_cols()),
                    target_lvs.size());
           return target_lvs;
@@ -1897,10 +1982,12 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
 
 llvm::Value* GroupByAndAggregate::emitCall(const std::string& fname,
                                            const std::vector<llvm::Value*>& args) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   return executor_->cgen_state_->emitCall(fname, args);
 }
 
 void GroupByAndAggregate::checkErrorCode(llvm::Value* retCode) {
+  AUTOMATIC_IR_METADATA(executor_->cgen_state_.get());
   auto zero_const = llvm::ConstantInt::get(retCode->getType(), 0, true);
   auto rc_check_condition = executor_->cgen_state_->ir_builder_.CreateICmp(
       llvm::ICmpInst::ICMP_EQ, retCode, zero_const);
@@ -1908,6 +1995,7 @@ void GroupByAndAggregate::checkErrorCode(llvm::Value* retCode) {
   executor_->cgen_state_->emitErrorCheck(rc_check_condition, retCode, "rc");
 }
 
+#undef CUR_FUNC
 #undef ROW_FUNC
 #undef LL_FP
 #undef LL_INT

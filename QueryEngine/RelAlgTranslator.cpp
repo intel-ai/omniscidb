@@ -80,6 +80,16 @@ std::pair<Datum, bool> datum_from_scalar_tv(const ScalarTargetValue* scalar_tv,
   Datum d{0};
   bool is_null_const{false};
   switch (ti.get_type()) {
+    case kBOOLEAN: {
+      const auto ival = boost::get<int64_t>(scalar_tv);
+      CHECK(ival);
+      if (*ival == inline_int_null_val(ti)) {
+        is_null_const = true;
+      } else {
+        d.boolval = *ival;
+      }
+      break;
+    }
     case kTINYINT: {
       const auto ival = boost::get<int64_t>(scalar_tv);
       CHECK(ival);
@@ -159,7 +169,7 @@ std::pair<Datum, bool> datum_from_scalar_tv(const ScalarTargetValue* scalar_tv,
       break;
     }
     default:
-      CHECK(false);
+      CHECK(false) << "Unhandled type: " << ti.get_type_name();
   }
   return {d, is_null_const};
 }
@@ -387,10 +397,14 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateInput(
   const size_t col_id = rex_input->getIndex();
   CHECK_LT(col_id, in_metainfo.size());
   auto col_ti = in_metainfo[col_id].get_type_info();
-  CHECK_LE(static_cast<size_t>(rte_idx), join_types_.size());
-  if (rte_idx > 0 && join_types_[rte_idx - 1] == JoinType::LEFT) {
-    col_ti.set_notnull(false);
+
+  if (join_types_.size() > 0) {
+    CHECK_LE(static_cast<size_t>(rte_idx), join_types_.size());
+    if (rte_idx > 0 && join_types_[rte_idx - 1] == JoinType::LEFT) {
+      col_ti.set_notnull(false);
+    }
   }
+
   return std::make_shared<Analyzer::ColumnVar>(col_ti, -source->getId(), col_id, rte_idx);
 }
 
@@ -1031,47 +1045,16 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateDateadd(
   if (number_units_const && number_units_const->get_is_null()) {
     throw std::runtime_error("The 'Interval' argument literal must not be 'null'.");
   }
-  auto cast_number_units = number_units->add_cast(SQLTypeInfo(kBIGINT, false));
+  const auto cast_number_units = number_units->add_cast(SQLTypeInfo(kBIGINT, false));
   const auto datetime = translateScalarRex(rex_function->getOperand(2));
   const auto& datetime_ti = datetime->get_type_info();
   if (datetime_ti.get_type() == kTIME) {
     throw std::runtime_error("DateAdd operation not supported for TIME.");
   }
   const auto& field = to_dateadd_field(*timeunit_lit->get_constval().stringval);
-  if (!datetime_ti.is_high_precision_timestamp() &&
-      DateTimeUtils::is_subsecond_dateadd_field(field)) {
-    // Scale the number to get value in seconds
-    const auto bigint_ti = SQLTypeInfo(kBIGINT, false);
-    cast_number_units = makeExpr<Analyzer::BinOper>(
-        bigint_ti.get_type(),
-        kDIVIDE,
-        kONE,
-        cast_number_units,
-        makeNumericConstant(bigint_ti,
-                            DateTimeUtils::get_dateadd_timestamp_precision_scale(field)));
-    cast_number_units = fold_expr(cast_number_units.get());
-  }
-  if (datetime_ti.is_high_precision_timestamp() &&
-      DateTimeUtils::is_subsecond_dateadd_field(field)) {
-    const auto oper_scale = DateTimeUtils::get_dateadd_high_precision_adjusted_scale(
-        field, datetime_ti.get_dimension());
-    if (oper_scale.first) {
-      // scale number to desired precision
-      const auto bigint_ti = SQLTypeInfo(kBIGINT, false);
-      cast_number_units =
-          makeExpr<Analyzer::BinOper>(bigint_ti.get_type(),
-                                      oper_scale.first,
-                                      kONE,
-                                      cast_number_units,
-                                      makeNumericConstant(bigint_ti, oper_scale.second));
-      cast_number_units = fold_expr(cast_number_units.get());
-    }
-  }
+  const int dim = datetime_ti.get_dimension();
   return makeExpr<Analyzer::DateaddExpr>(
-      SQLTypeInfo(kTIMESTAMP, datetime_ti.get_dimension(), 0, false),
-      to_dateadd_field(*timeunit_lit->get_constval().stringval),
-      cast_number_units,
-      datetime);
+      SQLTypeInfo(kTIMESTAMP, dim, 0, false), field, cast_number_units, datetime);
 }
 
 namespace {
@@ -1206,6 +1189,27 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateKeyForString(
                              " expects a dictionary encoded text column.");
   }
   return makeExpr<Analyzer::KeyForStringExpr>(args[0]);
+}
+
+std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateSampleRatio(
+    const RexFunctionOperator* rex_function) const {
+  CHECK_EQ(size_t(1), rex_function->size());
+  auto arg = translateScalarRex(rex_function->getOperand(0));
+  const auto& arg_ti = arg->get_type_info();
+  if (arg_ti.get_type() != kDOUBLE) {
+    const auto& double_ti = SQLTypeInfo(kDOUBLE, arg_ti.get_notnull());
+    arg = arg->add_cast(double_ti);
+  }
+  return makeExpr<Analyzer::SampleRatioExpr>(arg);
+}
+
+std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateCurrentUser(
+    const RexFunctionOperator* rex_function) const {
+  std::string user{"SESSIONLESS_USER"};
+  if (query_state_) {
+    user = query_state_->getConstSessionInfo()->get_currentUser().userName;
+  }
+  return Parser::UserLiteral::get(user);
 }
 
 std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateLower(
@@ -1408,6 +1412,12 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
   if (rex_function->getName() == "KEY_FOR_STRING"sv) {
     return translateKeyForString(rex_function);
   }
+  if (rex_function->getName() == "SAMPLE_RATIO"sv) {
+    return translateSampleRatio(rex_function);
+  }
+  if (rex_function->getName() == "CURRENT_USER"sv) {
+    return translateCurrentUser(rex_function);
+  }
   if (g_enable_experimental_string_functions && rex_function->getName() == "LOWER"sv) {
     return translateLower(rex_function);
   }
@@ -1550,8 +1560,22 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
                    "ST_GeomFromText"sv,
                    "ST_GeogFromText"sv,
                    "ST_Point"sv,
+                   "ST_Centroid"sv,
                    "ST_SetSRID"sv)) {
-    return translateGeoConstructor(rex_function);
+    SQLTypeInfo ti;
+    return translateGeoProjection(rex_function, ti, false);
+  }
+  if (func_resolve(rex_function->getName(),
+                   "ST_Intersection"sv,
+                   "ST_Difference"sv,
+                   "ST_Union"sv,
+                   "ST_Buffer"sv)) {
+    SQLTypeInfo ti;
+    return translateGeoBinaryConstructor(rex_function, ti, false);
+  }
+  if (func_resolve(rex_function->getName(), "ST_IsEmpty"sv, "ST_IsValid"sv)) {
+    SQLTypeInfo ti;
+    return translateGeoPredicate(rex_function, ti, false);
   }
 
   auto arg_expr_list = translateFunctionArgs(rex_function);
@@ -1567,8 +1591,19 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
   // that have different return types but Calcite specifies the return
   // type according to the first implementation.
   auto ext_func_sig = bind_function(rex_function->getName(), arg_expr_list);
+  auto ext_func_args = ext_func_sig.getArgs();
+  CHECK_EQ(arg_expr_list.size(), ext_func_args.size());
+  for (size_t i = 0; i < arg_expr_list.size(); i++) {
+    // fold casts on constants
+    if (auto constant = std::dynamic_pointer_cast<Analyzer::Constant>(arg_expr_list[i])) {
+      auto ext_func_arg_ti = ext_arg_type_to_type_info(ext_func_args[i]);
+      if (ext_func_arg_ti != arg_expr_list[i]->get_type_info()) {
+        arg_expr_list[i] = constant->add_cast(ext_func_arg_ti);
+      }
+    }
+  }
   auto ret_ti = ext_arg_type_to_type_info(ext_func_sig.getRet());
-  // By defualt, the extension function type will not allow nulls. If one of the arguments
+  // By default, the extension function type will not allow nulls. If one of the arguments
   // is nullable, the extension function must also explicitly allow nulls.
   bool arguments_not_null = true;
   for (const auto& arg_expr : arg_expr_list) {
@@ -1578,15 +1613,6 @@ std::shared_ptr<Analyzer::Expr> RelAlgTranslator::translateFunction(
     }
   }
   ret_ti.set_notnull(arguments_not_null);
-
-  // set encoding of certain Extension Function return values
-  if (func_resolve(rex_function->getName(),
-                   "reg_hex_horiz_pixel_bin_packed"sv,
-                   "reg_hex_vert_pixel_bin_packed"sv,
-                   "rect_pixel_bin_packed"sv)) {
-    CHECK(ret_ti.get_type() == kINT);
-    ret_ti.set_compression(kENCODING_PACKED_PIXEL_COORD);
-  }
 
   return makeExpr<Analyzer::FunctionOper>(ret_ti, rex_function->getName(), arg_expr_list);
 }

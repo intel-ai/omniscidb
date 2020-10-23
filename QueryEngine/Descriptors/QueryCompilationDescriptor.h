@@ -23,8 +23,19 @@
 
 #pragma once
 
-#include "../ColumnFetcher.h"
-#include "../Execute.h"
+#include "QueryEngine/CgenState.h"
+#include "QueryEngine/ColumnFetcher.h"
+#include "QueryEngine/CompilationContext.h"
+#include "QueryEngine/GpuSharedMemoryContext.h"
+#include "QueryEngine/PlanState.h"
+
+struct CompilationResult {
+  std::shared_ptr<CompilationContext> generated_code;
+  std::unordered_map<int, CgenState::LiteralValues> literal_values;
+  bool output_columnar;
+  std::string llvm_ir;
+  GpuSharedMemoryContext gpu_smem_context;
+};
 
 class QueryCompilationDescriptor {
  public:
@@ -39,6 +50,7 @@ class QueryCompilationDescriptor {
       const bool has_cardinality_estimation,
       const RelAlgExecutionUnit& ra_exe_unit,
       const std::vector<InputTableInfo>& table_infos,
+      const PlanState::DeletedColumnsMap& deleted_cols_map,
       const ColumnFetcher& column_fetcher,
       const CompilationOptions& co,
       const ExecutionOptions& eo,
@@ -67,7 +79,7 @@ class QueryCompilationDescriptor {
   int8_t getMinByteWidth() const { return actual_min_byte_width_; }
 
  private:
-  Executor::CompilationResult compilation_result_;
+  CompilationResult compilation_result_;
   ExecutorDeviceType compilation_device_type_;
   bool hoist_literals_;
   int8_t actual_min_byte_width_;

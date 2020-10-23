@@ -123,6 +123,7 @@ class CreateForeignTableCommand : public DdlCommand {
                        TableDescriptor& td,
                        const size_t column_count);
   void setColumnDetails(std::list<ColumnDescriptor>& columns);
+  void setRefreshOptions(foreign_storage::ForeignTable& foreign_table);
 };
 
 class DropForeignTableCommand : public DdlCommand {
@@ -157,6 +158,15 @@ class ShowDatabasesCommand : public DdlCommand {
   void execute(TQueryResult& _return) override;
 };
 
+class RefreshForeignTablesCommand : public DdlCommand {
+ public:
+  RefreshForeignTablesCommand(
+      const rapidjson::Value& ddl_payload,
+      std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr);
+
+  void execute(TQueryResult& _return) override;
+};
+
 class DdlCommandExecutor {
  public:
   DdlCommandExecutor(const std::string& ddl_statement,
@@ -174,6 +184,21 @@ class DdlCommandExecutor {
    * Returns true if this command is SHOW USER SESSIONS
    */
   bool isShowUserSessions();
+
+  /**
+   * Returns true if this command is SHOW QUERIES
+   */
+  bool isShowQueries();
+
+  /**
+   * Returns true if this command is KILL QUERY
+   */
+  bool isKillQuery();
+
+  /**
+   * Returns target query session if this command is KILL QUERY
+   */
+  const std::string getTargetQuerySessionToKill();
 
  private:
   rapidjson::Document ddl_query_;

@@ -57,6 +57,9 @@ class TemporaryTable {
 
   bool empty() const { return results_.empty(); }
 
+  void setKernelQueueTime(const int64_t kernel_queue_time);
+  void addCompilationQueueTime(const int64_t compilation_queue_time);
+
   ResultSetPtr& operator[](size_t idx) { return results_[idx]; }
   const ResultSetPtr& operator[](size_t idx) const { return results_[idx]; }
 

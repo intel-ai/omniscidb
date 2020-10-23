@@ -29,13 +29,13 @@
 #include <gperftools/heap-profiler.h>
 #endif  // HAVE_PROFILER
 
-#include "MapDRelease.h"
-
 #include "Calcite/Calcite.h"
 #include "Catalog/Catalog.h"
 #include "Fragmenter/InsertOrderFragmenter.h"
-#include "Import/Importer.h"
+#include "Geospatial/Transforms.h"
+#include "ImportExport/Importer.h"
 #include "LockMgr/LockMgr.h"
+#include "Logger/Logger.h"
 #include "Parser/ParserWrapper.h"
 #include "Parser/ReservedKeywords.h"
 #include "Parser/parser.h"
@@ -45,13 +45,10 @@
 #include "QueryEngine/ExtensionFunctionsWhitelist.h"
 #include "QueryEngine/GpuMemUtils.h"
 #include "QueryEngine/JsonAccessors.h"
+#include "QueryEngine/QueryDispatchQueue.h"
 #include "QueryEngine/TableGenerations.h"
-#include "QueryState.h"
-#include "Shared/GenericTypeUtilities.h"
-#include "Shared/Logger.h"
 #include "Shared/StringTransform.h"
 #include "Shared/SystemParameters.h"
-#include "Shared/geosupport.h"
 #include "Shared/mapd_shared_mutex.h"
 #include "Shared/mapd_shared_ptr.h"
 #include "Shared/measure.h"
@@ -107,14 +104,13 @@ class MapDLeafHandler;
 // request briefly takes a lock to make a copy of the appropriate SessionInfo object. Then
 // it releases the lock and uses the copy for the remainder of the request.
 using SessionMap = std::map<TSessionId, std::shared_ptr<Catalog_Namespace::SessionInfo>>;
-using permissionFuncPtr = bool (*)(const AccessPrivileges&, const TDBObjectPermissions&);
-using TableMap = std::map<std::string, bool>;
-using OptionalTableMap = boost::optional<TableMap&>;
+using PermissionFuncPtr = bool (*)(const AccessPrivileges&, const TDBObjectPermissions&);
 using query_state::QueryStateProxy;
 
 class TrackingProcessor : public OmniSciProcessor {
  public:
-  TrackingProcessor(mapd::shared_ptr<OmniSciIf> handler) : OmniSciProcessor(handler) {}
+  TrackingProcessor(mapd::shared_ptr<OmniSciIf> handler, const bool check_origin)
+      : OmniSciProcessor(handler), check_origin_(check_origin) {}
 
   bool process(mapd::shared_ptr<::apache::thrift::protocol::TProtocol> in,
                mapd::shared_ptr<::apache::thrift::protocol::TProtocol> out,
@@ -122,7 +118,7 @@ class TrackingProcessor : public OmniSciProcessor {
     using namespace ::apache::thrift;
 
     auto transport = in->getTransport();
-    if (transport) {
+    if (transport && check_origin_) {
       static std::mutex processor_mutex;
       std::lock_guard lock(processor_mutex);
       const auto origin_str = transport->getOrigin();
@@ -153,7 +149,12 @@ class TrackingProcessor : public OmniSciProcessor {
 
   static thread_local std::string client_address;
   static thread_local ClientProtocol client_protocol;
+
+ private:
+  const bool check_origin_;
 };
+
+struct DiskCacheConfig;
 
 class DBHandler : public OmniSciIf {
  public:
@@ -167,6 +168,7 @@ class DBHandler : public OmniSciIf {
             const bool read_only,
             const bool allow_loop_joins,
             const bool enable_rendering,
+            const bool renderer_use_vulkan_driver,
             const bool enable_auto_clear_render_mem,
             const int render_oom_retry_threshold,
             const size_t render_mem_bytes,
@@ -174,9 +176,10 @@ class DBHandler : public OmniSciIf {
             const int num_gpus,
             const int start_gpu,
             const size_t reserved_gpu_mem,
+            const bool render_compositor_use_last_gpu,
             const size_t num_reader_threads,
             const AuthMetadata& authMetadata,
-            const SystemParameters& mapd_parameters,
+            const SystemParameters& system_parameters,
             const bool legacy_syntax,
             const int idle_session_duration,
             const int max_session_duration,
@@ -184,6 +187,10 @@ class DBHandler : public OmniSciIf {
             const std::string& udf_filename,
             const std::string& clang_path,
             const std::vector<std::string>& clang_options,
+#ifdef ENABLE_GEOS
+            const std::string& libgeos_so_filename,
+#endif
+            const DiskCacheConfig& disk_cache_config,
             std::shared_ptr<ForeignStorageInterface> fsi = nullptr);
 
   ~DBHandler() override;
@@ -253,6 +260,14 @@ class DBHandler : public OmniSciIf {
                           const int32_t table_id) override;
   int32_t get_table_epoch_by_name(const TSessionId& session,
                                   const std::string& table_name) override;
+  void get_table_epochs(std::vector<TTableEpochInfo>& _return,
+                        const TSessionId& session,
+                        const int32_t db_id,
+                        const int32_t table_id) override;
+  void set_table_epochs(const TSessionId& session,
+                        const int32_t db_id,
+                        const std::vector<TTableEpochInfo>& table_epochs) override;
+
   void get_session_info(TSessionInfo& _return, const TSessionId& session) override;
   // query, render
   void sql_execute(TQueryResult& _return,
@@ -272,7 +287,8 @@ class DBHandler : public OmniSciIf {
                       const std::string& query,
                       const TDeviceType::type device_type,
                       const int32_t device_id,
-                      const int32_t first_n) override;
+                      const int32_t first_n,
+                      const TArrowTransport::type transport_method) override;
   void sql_execute_gdf(TDataFrame& _return,
                        const TSessionId& session,
                        const std::string& query,
@@ -325,12 +341,22 @@ class DBHandler : public OmniSciIf {
                          const std::string& image_hash,
                          const std::string& dashboard_metadata) override;
   void delete_dashboard(const TSessionId& session, const int32_t dashboard_id) override;
+  void share_dashboards(const TSessionId& session,
+                        const std::vector<int32_t>& dashboard_ids,
+                        const std::vector<std::string>& groups,
+                        const TDashboardPermissions& permissions) override;
+  void delete_dashboards(const TSessionId& session,
+                         const std::vector<int32_t>& dashboard_ids) override;
   void share_dashboard(const TSessionId& session,
                        const int32_t dashboard_id,
                        const std::vector<std::string>& groups,
                        const std::vector<std::string>& objects,
                        const TDashboardPermissions& permissions,
                        const bool grant_role) override;
+  void unshare_dashboards(const TSessionId& session,
+                          const std::vector<int32_t>& dashboard_ids,
+                          const std::vector<std::string>& groups,
+                          const TDashboardPermissions& permissions) override;
   void unshare_dashboard(const TSessionId& session,
                          const int32_t dashboard_id,
                          const std::vector<std::string>& groups,
@@ -357,8 +383,8 @@ class DBHandler : public OmniSciIf {
       const Catalog_Namespace::SessionInfo& session_info,
       const std::string& table_name,
       size_t num_cols,
-      std::unique_ptr<Importer_NS::Loader>* loader,
-      std::vector<std::unique_ptr<Importer_NS::TypedImportBuffer>>* import_buffers);
+      std::unique_ptr<import_export::Loader>* loader,
+      std::vector<std::unique_ptr<import_export::TypedImportBuffer>>* import_buffers);
 
   void load_table_binary_columnar(const TSessionId& session,
                                   const std::string& table_name,
@@ -518,12 +544,14 @@ class DBHandler : public OmniSciIf {
   std::mutex render_mutex_;
   int64_t start_time_;
   const AuthMetadata& authMetadata_;
-  const SystemParameters& mapd_parameters_;
+  const SystemParameters& system_parameters_;
   std::unique_ptr<RenderHandler> render_handler_;
   std::unique_ptr<MapDAggHandler> agg_handler_;
   std::unique_ptr<MapDLeafHandler> leaf_handler_;
   std::shared_ptr<Calcite> calcite_;
   const bool legacy_syntax_;
+
+  std::unique_ptr<QueryDispatchQueue> dispatch_queue_;
 
   template <typename... ARGS>
   std::shared_ptr<query_state::QueryState> create_query_state(ARGS&&... args) {
@@ -568,6 +596,14 @@ class DBHandler : public OmniSciIf {
                               const bool get_physical);
   void check_read_only(const std::string& str);
   void check_session_exp_unsafe(const SessionMap::iterator& session_it);
+  void validateGroups(const std::vector<std::string>& groups);
+  void validateDashboardIdsForSharing(const Catalog_Namespace::SessionInfo& session_info,
+                                      const std::vector<int32_t>& dashboard_ids);
+  void shareOrUnshareDashboards(const TSessionId& session,
+                                const std::vector<int32_t>& dashboard_ids,
+                                const std::vector<std::string>& groups,
+                                const TDashboardPermissions& permissions,
+                                const bool do_share);
 
   // Use get_session_copy() or get_session_copy_ptr() instead of get_const_session_ptr()
   // unless you know what you are doing. If you need to save a SessionInfo beyond the
@@ -592,7 +628,7 @@ class DBHandler : public OmniSciIf {
       const std::string& query_str,
       const std::vector<TFilterPushDownInfo>& filter_push_down_info,
       const bool acquire_locks,
-      const SystemParameters mapd_parameters,
+      const SystemParameters system_parameters,
       bool check_privileges = true);
 
   void sql_execute_impl(TQueryResult& _return,
@@ -610,7 +646,8 @@ class DBHandler : public OmniSciIf {
   void execute_distributed_copy_statement(
       Parser::CopyTableStmt*,
       const Catalog_Namespace::SessionInfo& session_info);
-  void validate_rel_alg(TRowDescriptor& _return, QueryStateProxy);
+
+  TQueryResult validate_rel_alg(const std::string& query_ra, QueryStateProxy);
 
   std::vector<PushedDownFilterInfo> execute_rel_alg(
       TQueryResult& _return,
@@ -622,7 +659,8 @@ class DBHandler : public OmniSciIf {
       const int32_t at_most_n,
       const bool just_validate,
       const bool find_push_down_candidates,
-      const ExplainInfo& explain_info) const;
+      const ExplainInfo& explain_info,
+      const std::optional<size_t> executor_index = std::nullopt) const;
 
   void execute_rel_alg_with_filter_push_down(
       TQueryResult& _return,
@@ -634,7 +672,7 @@ class DBHandler : public OmniSciIf {
       const int32_t at_most_n,
       const bool just_explain,
       const bool just_calcite_explain,
-      const std::vector<PushedDownFilterInfo> filter_push_down_requests);
+      const std::vector<PushedDownFilterInfo>& filter_push_down_requests);
 
   void execute_rel_alg_df(TDataFrame& _return,
                           const std::string& query_ra,
@@ -642,7 +680,8 @@ class DBHandler : public OmniSciIf {
                           const Catalog_Namespace::SessionInfo& session_info,
                           const ExecutorDeviceType device_type,
                           const size_t device_id,
-                          const int32_t first_n) const;
+                          const int32_t first_n,
+                          const TArrowTransport::type transport_method) const;
 
   void executeDdl(TQueryResult& _return,
                   const std::string& query_ra,
@@ -655,10 +694,10 @@ class DBHandler : public OmniSciIf {
   void set_execution_mode_nolock(Catalog_Namespace::SessionInfo* session_ptr,
                                  const TExecuteMode::type mode);
   char unescape_char(std::string str);
-  Importer_NS::CopyParams thrift_to_copyparams(const TCopyParams& cp);
-  TCopyParams copyparams_to_thrift(const Importer_NS::CopyParams& cp);
+  import_export::CopyParams thrift_to_copyparams(const TCopyParams& cp);
+  TCopyParams copyparams_to_thrift(const import_export::CopyParams& cp);
   void check_geospatial_files(const boost::filesystem::path file_path,
-                              const Importer_NS::CopyParams& copy_params);
+                              const import_export::CopyParams& copy_params);
   void render_rel_alg(TRenderResult& _return,
                       const std::string& query_ra,
                       const std::string& query_str,
@@ -755,7 +794,7 @@ class DBHandler : public OmniSciIf {
   struct GeoCopyFromState {
     std::string geo_copy_from_table;
     std::string geo_copy_from_file_name;
-    Importer_NS::CopyParams geo_copy_from_copy_params;
+    import_export::CopyParams geo_copy_from_copy_params;
     std::string geo_copy_from_partitions;
   };
 
@@ -797,7 +836,7 @@ class DBHandler : public OmniSciIf {
   friend class MapDAggHandler;
   friend class MapDLeafHandler;
 
-  std::map<const std::string, const permissionFuncPtr> permissionFuncMap_ = {
+  std::map<const std::string, const PermissionFuncPtr> permissionFuncMap_ = {
       {"database"s, has_database_permission},
       {"dashboard"s, has_dashboard_permission},
       {"table"s, has_table_permission},
@@ -836,4 +875,13 @@ class DBHandler : public OmniSciIf {
 
   void getUserSessions(const Catalog_Namespace::SessionInfo& session_info,
                        TQueryResult& _return);
+
+  // this function returns a set of queries queued in the DB
+  // that belongs to the same DB in the caller's session
+  void getQueries(const Catalog_Namespace::SessionInfo& session_info,
+                  TQueryResult& _return);
+
+  // this function passes the interrupt request to the DB executor
+  void interruptQuery(const Catalog_Namespace::SessionInfo& session_info,
+                      const std::string& target_session);
 };

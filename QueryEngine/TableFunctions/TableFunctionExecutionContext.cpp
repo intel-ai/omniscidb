@@ -17,10 +17,10 @@
 #include "QueryEngine/TableFunctions/TableFunctionExecutionContext.h"
 
 #include "Analyzer/Analyzer.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/ColumnFetcher.h"
 #include "QueryEngine/GpuMemUtils.h"
 #include "QueryEngine/TableFunctions/TableFunctionCompilationContext.h"
-#include "Shared/Logger.h"
 
 namespace {
 
@@ -65,13 +65,12 @@ size_t get_output_row_count(const TableFunctionExecutionUnit& exe_unit,
 
 ResultSetPtr TableFunctionExecutionContext::execute(
     const TableFunctionExecutionUnit& exe_unit,
-    const InputTableInfo& table_info,
+    const std::vector<InputTableInfo>& table_infos,
     const TableFunctionCompilationContext* compilation_context,
     const ColumnFetcher& column_fetcher,
     const ExecutorDeviceType device_type,
     Executor* executor) {
   CHECK(compilation_context);
-
   std::vector<std::shared_ptr<Chunk_NS::Chunk>> chunks_owner;
   std::vector<std::unique_ptr<char[]>> literals_owner;
 
@@ -81,24 +80,30 @@ ResultSetPtr TableFunctionExecutionContext::execute(
     auto& data_mgr = executor->catalog_->getDataMgr();
     device_allocator.reset(new CudaAllocator(&data_mgr, device_id));
   }
-
   std::vector<const int8_t*> col_buf_ptrs;
-  ssize_t element_count = -1;
+  std::optional<size_t> element_count;
   for (const auto& input_expr : exe_unit.input_exprs) {
     if (auto col_var = dynamic_cast<Analyzer::ColumnVar*>(input_expr)) {
+      auto table_id = col_var->get_table_id();
+      auto table_info_it = std::find_if(
+          table_infos.begin(), table_infos.end(), [&table_id](const auto& table_info) {
+            return table_info.table_id == table_id;
+          });
+      CHECK(table_info_it != table_infos.end());
       auto [col_buf, buf_elem_count] = ColumnFetcher::getOneColumnFragment(
           executor,
           *col_var,
-          table_info.info.fragments.front(),
+          table_info_it->info.fragments.front(),
           device_type == ExecutorDeviceType::CPU ? Data_Namespace::MemoryLevel::CPU_LEVEL
                                                  : Data_Namespace::MemoryLevel::GPU_LEVEL,
           device_id,
+          device_allocator.get(),
           chunks_owner,
           column_fetcher.columnarized_table_cache_);
-      if (element_count < 0) {
-        element_count = static_cast<ssize_t>(buf_elem_count);
+      if (!element_count) {
+        element_count = buf_elem_count;
       } else {
-        CHECK_EQ(static_cast<ssize_t>(buf_elem_count), element_count);
+        CHECK(element_count && (buf_elem_count == *element_count));
       }
       col_buf_ptrs.push_back(col_buf);
     } else if (const auto& constant_val = dynamic_cast<Analyzer::Constant*>(input_expr)) {
@@ -160,19 +165,16 @@ ResultSetPtr TableFunctionExecutionContext::execute(
   }
   CHECK_EQ(col_buf_ptrs.size(), exe_unit.input_exprs.size());
 
-  CHECK_GE(element_count, ssize_t(0));
+  CHECK(element_count);
   switch (device_type) {
     case ExecutorDeviceType::CPU:
-      return launchCpuCode(exe_unit,
-                           compilation_context,
-                           col_buf_ptrs,
-                           static_cast<size_t>(element_count),
-                           executor);
+      return launchCpuCode(
+          exe_unit, compilation_context, col_buf_ptrs, *element_count, executor);
     case ExecutorDeviceType::GPU:
       return launchGpuCode(exe_unit,
                            compilation_context,
                            col_buf_ptrs,
-                           static_cast<size_t>(element_count),
+                           *element_count,
                            /*device_id=*/0,
                            executor);
   }
@@ -191,11 +193,12 @@ ResultSetPtr TableFunctionExecutionContext::launchCpuCode(
   CHECK(byte_stream_ptr);
 
   // initialize output memory
+  auto num_out_columns = exe_unit.target_exprs.size();
   QueryMemoryDescriptor query_mem_desc(
       executor, elem_count, QueryDescriptionType::Projection, /*is_table_function=*/true);
   query_mem_desc.setOutputColumnar(true);
 
-  for (size_t i = 0; i < exe_unit.target_exprs.size(); i++) {
+  for (size_t i = 0; i < num_out_columns; i++) {
     // All outputs padded to 8 bytes
     query_mem_desc.addColSlotInfo({std::make_tuple(8, 8)});
   }
@@ -218,22 +221,41 @@ ResultSetPtr TableFunctionExecutionContext::launchCpuCode(
   auto group_by_buffers_ptr = query_buffers->getGroupByBuffersPtr();
   CHECK(group_by_buffers_ptr);
 
+  auto output_buffers_ptr = reinterpret_cast<int64_t*>(group_by_buffers_ptr[0]);
+  std::vector<int64_t*> output_col_buf_ptrs;
+  for (size_t i = 0; i < num_out_columns; i++) {
+    output_col_buf_ptrs.emplace_back(output_buffers_ptr + i * allocated_output_row_count);
+  }
+
   // execute
   const auto kernel_element_count = static_cast<int64_t>(elem_count);
-  const auto err =
-      compilation_context->getFuncPtr()(byte_stream_ptr,
-                                        &kernel_element_count,
-                                        query_buffers->getGroupByBuffersPtr(),
-                                        &output_row_count);
+  const auto err = compilation_context->getFuncPtr()(byte_stream_ptr,
+                                                     &kernel_element_count,
+                                                     output_col_buf_ptrs.data(),
+                                                     &output_row_count);
   if (err) {
     throw std::runtime_error("Error executing table function: " + std::to_string(err));
   }
-  if (output_row_count < 0) {
-    throw std::runtime_error("Table function did not properly set output row count.");
+  if (output_row_count < 0 || (size_t)output_row_count > allocated_output_row_count) {
+    output_row_count = allocated_output_row_count;
   }
 
   // Update entry count, it may differ from allocated mem size
   query_buffers->getResultSet(0)->updateStorageEntryCount(output_row_count);
+
+  const size_t column_size = output_row_count * sizeof(int64_t);
+  const size_t allocated_column_size = allocated_output_row_count * sizeof(int64_t);
+
+  int8_t* src = reinterpret_cast<int8_t*>(output_buffers_ptr);
+  int8_t* dst = reinterpret_cast<int8_t*>(output_buffers_ptr);
+  for (size_t i = 0; i < num_out_columns; i++) {
+    if (src != dst) {
+      auto t = memmove(dst, src, column_size);
+      CHECK_EQ(dst, t);
+    }
+    src += allocated_column_size;
+    dst += column_size;
+  }
 
   return query_buffers->getResultSetOwned(0);
 }
@@ -257,10 +279,10 @@ ResultSetPtr TableFunctionExecutionContext::launchGpuCode(
     const int device_id,
     Executor* executor) {
 #ifdef HAVE_CUDA
+  auto num_out_columns = exe_unit.target_exprs.size();
   auto& data_mgr = executor->catalog_->getDataMgr();
   auto gpu_allocator = std::make_unique<CudaAllocator>(&data_mgr, device_id);
   CHECK(gpu_allocator);
-
   std::vector<CUdeviceptr> kernel_params(KERNEL_PARAM_COUNT, 0);
   // setup the inputs
   auto byte_stream_ptr = gpu_allocator->alloc(col_buf_ptrs.size() * sizeof(int64_t));
@@ -268,22 +290,19 @@ ResultSetPtr TableFunctionExecutionContext::launchGpuCode(
                               reinterpret_cast<int8_t*>(col_buf_ptrs.data()),
                               col_buf_ptrs.size() * sizeof(int64_t));
   kernel_params[COL_BUFFERS] = reinterpret_cast<CUdeviceptr>(byte_stream_ptr);
-
   kernel_params[INPUT_ROW_COUNT] =
       reinterpret_cast<CUdeviceptr>(gpu_allocator->alloc(sizeof(elem_count)));
   gpu_allocator->copyToDevice(reinterpret_cast<int8_t*>(kernel_params[INPUT_ROW_COUNT]),
                               reinterpret_cast<const int8_t*>(&elem_count),
                               sizeof(elem_count));
-
   kernel_params[ERROR_BUFFER] =
       reinterpret_cast<CUdeviceptr>(gpu_allocator->alloc(sizeof(int32_t)));
-
   // initialize output memory
   QueryMemoryDescriptor query_mem_desc(
       executor, elem_count, QueryDescriptionType::Projection, /*is_table_function=*/true);
   query_mem_desc.setOutputColumnar(true);
 
-  for (size_t i = 0; i < exe_unit.target_exprs.size(); i++) {
+  for (size_t i = 0; i < num_out_columns; i++) {
     // All outputs padded to 8 bytes
     query_mem_desc.addColSlotInfo({std::make_tuple(8, 8)});
   }
@@ -302,24 +321,25 @@ ResultSetPtr TableFunctionExecutionContext::launchGpuCode(
 
   // setup the output
   int64_t output_row_count = -1;
+
   kernel_params[OUTPUT_ROW_COUNT] =
       reinterpret_cast<CUdeviceptr>(gpu_allocator->alloc(sizeof(int64_t*)));
   gpu_allocator->copyToDevice(reinterpret_cast<int8_t*>(kernel_params[OUTPUT_ROW_COUNT]),
                               reinterpret_cast<int8_t*>(&output_row_count),
                               sizeof(output_row_count));
 
-  auto group_by_buffers_ptr = query_buffers->getGroupByBuffersPtr();
-  CHECK(group_by_buffers_ptr);
-
-  const unsigned block_size_x = executor->blockSize();
+  // const unsigned block_size_x = executor->blockSize();
+  const unsigned block_size_x = 1;
   const unsigned block_size_y = 1;
   const unsigned block_size_z = 1;
-  const unsigned grid_size_x = executor->gridSize();
+  // const unsigned grid_size_x = executor->gridSize();
+  const unsigned grid_size_x = 1;
   const unsigned grid_size_y = 1;
   const unsigned grid_size_z = 1;
 
   auto gpu_output_buffers = query_buffers->setupTableFunctionGpuBuffers(
       query_mem_desc, device_id, block_size_x, grid_size_x);
+
   kernel_params[OUTPUT_BUFFERS] = reinterpret_cast<CUdeviceptr>(gpu_output_buffers.first);
 
   // execute
@@ -331,11 +351,10 @@ ResultSetPtr TableFunctionExecutionContext::launchGpuCode(
   }
 
   // Get cu func
-  const auto gpu_code_ptr = compilation_context->getGpuCode();
-  CHECK(gpu_code_ptr);
-  CHECK_LT(static_cast<size_t>(device_id), gpu_code_ptr->native_functions.size());
-  const auto native_function_pointer = gpu_code_ptr->native_functions[device_id].first;
-  auto cu_func = static_cast<CUfunction>(native_function_pointer);
+  const auto gpu_context = compilation_context->getGpuCode();
+  CHECK(gpu_context);
+  const auto native_code = gpu_context->getNativeCode(device_id);
+  auto cu_func = static_cast<CUfunction>(native_code.first);
   checkCudaErrors(cuLaunchKernel(cu_func,
                                  grid_size_x,
                                  grid_size_y,
@@ -350,28 +369,25 @@ ResultSetPtr TableFunctionExecutionContext::launchGpuCode(
   // TODO(adb): read errors
 
   // read output row count from GPU
-  int64_t new_output_row_count = -1;
   gpu_allocator->copyFromDevice(
-      reinterpret_cast<int8_t*>(&new_output_row_count),
+      reinterpret_cast<int8_t*>(&output_row_count),
       reinterpret_cast<int8_t*>(kernel_params[OUTPUT_ROW_COUNT]),
       sizeof(int64_t));
-  if (new_output_row_count < 0) {
-    new_output_row_count = allocated_output_row_count;
+  if (output_row_count < 0 || (size_t)output_row_count > allocated_output_row_count) {
+    output_row_count = allocated_output_row_count;
   }
 
   // Update entry count, it may differ from allocated mem size
-  query_buffers->getResultSet(0)->updateStorageEntryCount(new_output_row_count);
+  query_buffers->getResultSet(0)->updateStorageEntryCount(output_row_count);
 
   // Copy back to CPU storage
-  query_buffers->copyGroupByBuffersFromGpu(&data_mgr,
-                                           query_mem_desc,
-                                           new_output_row_count,
-                                           gpu_output_buffers,
-                                           nullptr,
-                                           block_size_x,
-                                           grid_size_x,
-                                           device_id,
-                                           false);
+  query_buffers->copyFromTableFunctionGpuBuffers(&data_mgr,
+                                                 query_mem_desc,
+                                                 output_row_count,
+                                                 gpu_output_buffers,
+                                                 device_id,
+                                                 block_size_x,
+                                                 grid_size_x);
 
   return query_buffers->getResultSetOwned(0);
 #else

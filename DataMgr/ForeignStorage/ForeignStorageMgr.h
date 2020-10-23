@@ -1,3 +1,4 @@
+
 /*
  * Copyright 2020 OmniSci, Inc.
  *
@@ -20,10 +21,33 @@
 
 #include "DataMgr/AbstractBufferMgr.h"
 #include "ForeignDataWrapper.h"
+#include "Shared/mapd_shared_mutex.h"
 
 using namespace Data_Namespace;
 
+class PostEvictionRefreshException : public std::runtime_error {
+ public:
+  PostEvictionRefreshException() = delete;
+  PostEvictionRefreshException(const PostEvictionRefreshException&) = delete;
+  PostEvictionRefreshException& operator=(const PostEvictionRefreshException&) = delete;
+  PostEvictionRefreshException(const std::runtime_error& exception)
+      : std::runtime_error(""), original_exception_(exception){};
+
+  std::runtime_error getOriginalException() { return original_exception_; }
+
+ private:
+  std::runtime_error original_exception_;
+};
+
 namespace foreign_storage {
+
+// For testing purposes only
+class MockForeignDataWrapper : public ForeignDataWrapper {
+ public:
+  virtual void setParentWrapper(
+      std::shared_ptr<ForeignDataWrapper> parent_data_wrapper) = 0;
+};
+
 class ForeignStorageMgr : public AbstractBufferMgr {
  public:
   ForeignStorageMgr();
@@ -41,7 +65,10 @@ class ForeignStorageMgr : public AbstractBufferMgr {
   AbstractBuffer* putBuffer(const ChunkKey& chunk_key,
                             AbstractBuffer* source_buffer,
                             const size_t num_bytes) override;
-  void getChunkMetadataVec(ChunkMetadataVector& chunk_metadata) override;
+  /*
+    Obtains chunk-metadata relating to a prefix.  Will create and use new
+    datawrappers if none are found for the given prefix.
+   */
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunk_metadata,
                                        const ChunkKey& chunk_key_prefix) override;
   bool isBufferOnDevice(const ChunkKey& chunk_key) override;
@@ -59,12 +86,35 @@ class ForeignStorageMgr : public AbstractBufferMgr {
   std::string getStringMgrType() override;
   size_t getNumChunks() override;
   void removeTableRelatedDS(const int db_id, const int table_id) override;
+  bool hasDataWrapperForChunk(const ChunkKey& chunk_key);
 
- private:
-  void createDataWrapperIfNotExists(const ChunkKey& chunk_key);
+  // For testing, is datawrapper state recovered from disk
+  bool isDatawrapperRestored(const ChunkKey& chunk_key);
+  void setDataWrapper(const ChunkKey& table_key,
+                      std::shared_ptr<MockForeignDataWrapper> data_wrapper);
+
+  virtual void refreshTable(const ChunkKey& table_key, const bool evict_cached_entries);
+
+ protected:
+  bool createDataWrapperIfNotExists(const ChunkKey& chunk_key);
   std::shared_ptr<ForeignDataWrapper> getDataWrapper(const ChunkKey& chunk_key);
+  bool fetchBufferIfTempBufferMapEntryExists(const ChunkKey& chunk_key,
+                                             AbstractBuffer* destination_buffer,
+                                             const size_t num_bytes);
+  void createAndPopulateDataWrapperIfNotExists(const ChunkKey& chunk_key);
+  std::map<ChunkKey, AbstractBuffer*> allocateTempBuffersForChunks(
+      const std::set<ChunkKey>& chunk_keys);
+  void clearTempChunkBufferMapEntriesForTable(const ChunkKey& table_key);
 
   std::shared_mutex data_wrapper_mutex_;
   std::map<ChunkKey, std::shared_ptr<ForeignDataWrapper>> data_wrapper_map_;
+
+  // TODO: Remove below map, which is used to temporarily hold chunk buffers,
+  // when buffer mgr interface is updated to accept multiple buffers in one call
+  std::map<ChunkKey, std::unique_ptr<AbstractBuffer>> temp_chunk_buffer_map_;
+  std::shared_mutex temp_chunk_buffer_map_mutex_;
 };
+
+std::vector<ChunkKey> get_keys_vec_from_table(const ChunkKey& destination_chunk_key);
+std::set<ChunkKey> get_keys_set_from_table(const ChunkKey& destination_chunk_key);
 }  // namespace foreign_storage

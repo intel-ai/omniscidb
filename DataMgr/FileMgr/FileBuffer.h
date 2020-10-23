@@ -28,7 +28,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 using namespace Data_Namespace;
 
@@ -83,6 +83,8 @@ class FileBuffer : public AbstractBuffer {
   void reserve(const size_t numBytes) override;
 
   void freePages();
+  size_t freeChunkPages();
+  void freeMetadataPages();
 
   void read(int8_t* const dst,
             const size_t numBytes = 0,
@@ -136,17 +138,11 @@ class FileBuffer : public AbstractBuffer {
   /// Returns vector of MultiPages in the FileBuffer.
   inline virtual std::vector<MultiPage> getMultiPage() const { return multiPages_; }
 
-  inline size_t size() const override { return size_; }
-
   /// Returns the total number of bytes allocated for the FileBuffer.
   inline size_t reservedSize() const override { return multiPages_.size() * pageSize_; }
 
   /// Returns the total number of used bytes in the FileBuffer.
   // inline virtual size_t used() const {
-
-  /// Returns whether or not the FileBuffer has been modified since the last
-  /// flush/checkpoint.
-  bool isDirty() const override { return is_dirty_; }
 
  private:
   // FileBuffer(const FileBuffer&);      // private copy constructor

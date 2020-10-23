@@ -15,10 +15,16 @@
  */
 
 #include "StringTransform.h"
+#include "Logger/Logger.h"
 
 #include <numeric>
 #include <random>
 #include <regex>
+
+#ifndef __CUDACC__
+#include <boost/filesystem.hpp>
+#include <iomanip>
+#endif
 
 void apply_shim(std::string& result,
                 const boost::regex& reg_expr,
@@ -33,8 +39,8 @@ void apply_shim(std::string& result,
     }
     const auto next_start =
         inside_string_literal(what.position(), what.length(), lit_pos);
-    if (next_start >= 0) {
-      start_it = result.cbegin() + next_start;
+    if (next_start) {
+      start_it = result.cbegin() + *next_start;
     } else {
       shim_fn(result, what);
       lit_pos = find_string_literals(result);
@@ -74,19 +80,6 @@ std::string hide_sensitive_data_from_query(std::string const& query_str) {
       rules.begin(), rules.end(), query_str, [](auto& str, auto& rule) {
         return std::regex_replace(str, rule.first, rule.second);
       });
-}
-
-ssize_t inside_string_literal(
-    const size_t start,
-    const size_t length,
-    const std::vector<std::pair<size_t, size_t>>& literal_positions) {
-  const auto end = start + length;
-  for (const auto& literal_position : literal_positions) {
-    if (literal_position.first <= start && end <= literal_position.second) {
-      return literal_position.second;
-    }
-  }
-  return -1;
 }
 
 template <>
@@ -177,6 +170,20 @@ std::string strip(std::string_view str) {
   }
   return std::string(str.substr(i, j - i));
 }
+
+std::optional<size_t> inside_string_literal(
+    const size_t start,
+    const size_t length,
+    const std::vector<std::pair<size_t, size_t>>& literal_positions) {
+  const auto end = start + length;
+  for (const auto& literal_position : literal_positions) {
+    if (literal_position.first <= start && end <= literal_position.second) {
+      return literal_position.second;
+    }
+  }
+  return std::nullopt;
+}
+
 #endif  // __CUDACC__
 
 bool remove_unquoted_newlines_linefeeds_and_tabs_from_sql_string(
@@ -218,12 +225,10 @@ bool remove_unquoted_newlines_linefeeds_and_tabs_from_sql_string(
   return (inside_quote == 0);
 }
 
-bool unquote(std::string& str) {
-  if (1 < str.size() && (str.front() == '\'' || str.front() == '"') &&
-      str.front() == str.back()) {
-    str.erase(str.size() - 1, 1);
-    str.erase(0, 1);
-    return true;
-  }
-  return false;
+#ifndef __CUDACC__
+std::string get_quoted_string(const std::string& filename, char quote, char escape) {
+  std::stringstream ss;
+  ss << std::quoted(filename, quote, escape);  // TODO: prevents string_view Jun 2020
+  return ss.str();
 }
+#endif  // __CUDACC__

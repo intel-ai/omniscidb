@@ -126,7 +126,7 @@ class DBEngineImpl : public DBEngine {
     auto data_path = db_path + +"/mapd_data";
     data_mgr_ =
         std::make_shared<Data_Namespace::DataMgr>(data_path, fsi_, mapd_parms, false, 0);
-    calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000);
+    calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000, true);
 
     ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
     if (!udf_filename.empty()) {
@@ -199,12 +199,12 @@ class DBEngineImpl : public DBEngine {
     if (pw.isCalcitePathPermissable()) {
       const auto execution_result =
           QR::get()->runSelectQuery(query, ExecutorDeviceType::CPU, true, true);
-      auto targets = execution_result.getTargetsMeta();
+      auto targets = execution_result->getTargetsMeta();
       std::vector<std::string> col_names;
       for (const auto target : targets) {
         col_names.push_back(target.get_resname());
       }
-      return std::make_shared<CursorImpl>(execution_result.getRows(), col_names);
+      return std::make_shared<CursorImpl>(execution_result->getRows(), col_names);
     }
 
     auto session_info = QR::get()->getSession();
@@ -229,12 +229,12 @@ class DBEngineImpl : public DBEngine {
     }
     const auto execution_result =
         QR::get()->runSelectQueryRA(query, ExecutorDeviceType::CPU, true, true);
-    auto targets = execution_result.getTargetsMeta();
+    auto targets = execution_result->getTargetsMeta();
     std::vector<std::string> col_names;
     for (const auto target : targets) {
       col_names.push_back(target.get_resname());
     }
-    return std::make_shared<CursorImpl>(execution_result.getRows(), col_names);
+    return std::make_shared<CursorImpl>(execution_result->getRows(), col_names);
   }
 
   std::vector<std::string> getTables() {

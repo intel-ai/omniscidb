@@ -23,12 +23,12 @@
 
 #include "Calcite.h"
 #include "Catalog/Catalog.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
+#include "OSDependent/omnisci_path.h"
 #include "Shared/SystemParameters.h"
 #include "Shared/ThriftClient.h"
 #include "Shared/fixautotools.h"
 #include "Shared/mapd_shared_ptr.h"
-#include "Shared/mapdpath.h"
 #include "Shared/measure.h"
 #include "ThriftHandler/QueryState.h"
 
@@ -76,15 +76,16 @@ static void start_calcite_server_as_daemon(const int db_port,
                                            const std::string& ssl_key_file,
                                            const std::string& db_config_file,
                                            const std::string& udf_filename) {
+  auto root_abs_path = omnisci::get_root_abs_path();
   std::string const xDebug = "-Xdebug";
   std::string const remoteDebug =
       "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005";
   std::string xmxP = "-Xmx" + std::to_string(calcite_max_mem) + "m";
   std::string jarP = "-jar";
   std::string jarD =
-      mapd_root_abs_path() + "/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar";
+      root_abs_path + "/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar";
   std::string extensionsP = "-e";
-  std::string extensionsD = mapd_root_abs_path() + "/QueryEngine/";
+  std::string extensionsD = root_abs_path + "/QueryEngine/";
   std::string dataP = "-d";
   std::string dataD = data_dir;
   std::string localPortP = "-p";
@@ -184,8 +185,14 @@ static void start_calcite_server_as_daemon(const int db_port,
 
 std::pair<mapd::shared_ptr<CalciteServerClient>, mapd::shared_ptr<TTransport>>
 Calcite::getClient(int port) {
-  const auto transport = connMgr_->open_buffered_client_transport(
-      "localhost", port, ssl_ca_file_, true, 2000, service_timeout_, service_timeout_);
+  const auto transport = connMgr_->open_buffered_client_transport("localhost",
+                                                                  port,
+                                                                  ssl_ca_file_,
+                                                                  true,
+                                                                  service_keepalive_,
+                                                                  2000,
+                                                                  service_timeout_,
+                                                                  service_timeout_);
   try {
     transport->open();
 
@@ -285,8 +292,11 @@ Calcite::Calcite(const int db_port,
                  const std::string& data_dir,
                  const size_t calcite_max_mem,
                  const size_t service_timeout,
+                 const bool service_keepalive,
                  const std::string& udf_filename)
-    : server_available_(false), service_timeout_(service_timeout) {
+    : server_available_(false)
+    , service_timeout_(service_timeout)
+    , service_keepalive_(service_keepalive) {
   init(db_port, calcite_port, data_dir, calcite_max_mem, udf_filename);
 }
 
@@ -316,6 +326,7 @@ Calcite::Calcite(const SystemParameters& system_parameters,
                  const std::string& data_dir,
                  const std::string& udf_filename)
     : service_timeout_(system_parameters.calcite_timeout)
+    , service_keepalive_(system_parameters.calcite_keepalive)
     , ssl_trust_store_(system_parameters.ssl_trust_store)
     , ssl_trust_password_(system_parameters.ssl_trust_password)
     , ssl_key_file_(system_parameters.ssl_key_file)

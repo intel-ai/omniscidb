@@ -107,7 +107,9 @@ class ExtensionFunctionSignatureParser {
     List<String> json_sigs = new ArrayList<String>();
     if (sigs != null) {
       for (Map.Entry<String, ExtensionFunction> sig : sigs.entrySet()) {
-        json_sigs.add(sig.getValue().toJson(sig.getKey()));
+        if (sig.getValue().isRowUdf()) {
+          json_sigs.add(sig.getValue().toJson(sig.getKey()));
+        }
       }
     }
     return "[" + join(json_sigs, ",") + "]";
@@ -146,7 +148,8 @@ class ExtensionFunctionSignatureParser {
         args.add(arg_type);
       }
     }
-    return new ExtensionFunction(args, deserializeType(ret), is_row_func);
+    assert is_row_func;
+    return new ExtensionFunction(args, deserializeType(ret));
   }
   private static ExtensionFunction.ExtArgumentType deserializeType(
           final String type_name) {
@@ -215,6 +218,28 @@ class ExtensionFunctionSignatureParser {
     }
     if (type_name.equals("Array<double>")) {
       return ExtensionFunction.ExtArgumentType.ArrayDouble;
+    }
+    if (type_name.equals("Array<bool>")) {
+      return ExtensionFunction.ExtArgumentType.ArrayBool;
+    }
+    if (type_name.equals("Column<int8_t>") || type_name.equals("Column<char>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnInt8;
+    }
+    if (type_name.equals("Column<int16_t>") || type_name.equals("Column<short>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnInt16;
+    }
+    if (type_name.equals("Column<int32_t>") || type_name.equals("Column<int>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnInt32;
+    }
+    if (type_name.equals("Column<int64_t>") || type_name.equals("Column<size_t>")
+            || type_name.equals("Column<long>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnInt64;
+    }
+    if (type_name.equals("Column<float>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnFloat;
+    }
+    if (type_name.equals("Column<double>")) {
+      return ExtensionFunction.ExtArgumentType.ColumnDouble;
     }
     if (type_name.equals("Cursor")) {
       return ExtensionFunction.ExtArgumentType.Cursor;

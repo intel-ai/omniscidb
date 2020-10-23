@@ -28,7 +28,7 @@
 #include "RuntimeFunctions.h"
 
 #include "../Shared/sqltypes.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
@@ -77,7 +77,7 @@ inline std::string datum_to_string(const TargetValue& tv,
     return "NULL";
   }
   const auto scalar_tv = boost::get<ScalarTargetValue>(&tv);
-  if (ti.is_time()) {
+  if (ti.is_time() || ti.is_decimal()) {
     Datum datum;
     datum.bigintval = *boost::get<int64_t>(scalar_tv);
     if (datum.bigintval == NULL_BIGINT) {
@@ -128,7 +128,8 @@ class GroupByAndAggregate {
                       const ExecutorDeviceType device_type,
                       const RelAlgExecutionUnit& ra_exe_unit,
                       const std::vector<InputTableInfo>& query_infos,
-                      std::shared_ptr<RowSetMemoryOwner>);
+                      std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+                      const std::optional<int64_t>& group_cardinality_estimation);
 
   // returns true iff checking the error code after every row
   // is required -- slow path group by queries for now
@@ -146,7 +147,6 @@ class GroupByAndAggregate {
   static size_t shard_count_for_top_groups(const RelAlgExecutionUnit& ra_exe_unit,
                                            const Catalog_Namespace::Catalog& catalog);
 
- private:
   struct DiamondCodegen {
     DiamondCodegen(llvm::Value* cond,
                    Executor* executor,
@@ -166,6 +166,7 @@ class GroupByAndAggregate {
     DiamondCodegen* parent_;
   };
 
+ private:
   bool gpuCanHandleOrderEntries(const std::list<Analyzer::OrderEntry>& order_entries);
 
   std::unique_ptr<QueryMemoryDescriptor> initQueryMemoryDescriptor(
@@ -294,8 +295,12 @@ class GroupByAndAggregate {
   bool output_columnar_;
   const ExecutorDeviceType device_type_;
 
+  const std::optional<int64_t> group_cardinality_estimation_;
+
   friend class Executor;
   friend class QueryMemoryDescriptor;
+  friend class CodeGenerator;
+  friend class ExecutionKernel;
   friend struct TargetExprCodegen;
   friend struct TargetExprCodegenBuilder;
 };
@@ -350,7 +355,7 @@ inline size_t get_count_distinct_sub_bitmap_count(const size_t bitmap_sz_bits,
 template <class T>
 inline std::vector<int8_t> get_col_byte_widths(
     const T& col_expr_list,
-    const std::vector<ssize_t>& col_exprs_to_not_project) {
+    const std::vector<int64_t>& col_exprs_to_not_project) {
   // Note that non-projected col exprs could be projected cols that we can lazy fetch or
   // grouped cols with keyless hash
   if (!col_exprs_to_not_project.empty()) {

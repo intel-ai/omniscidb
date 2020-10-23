@@ -35,6 +35,7 @@ std::string numeric_or_time_interval_type_name(const SQLTypeInfo& ti1,
 
 llvm::Value* CodeGenerator::codegenArith(const Analyzer::BinOper* bin_oper,
                                          const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto optype = bin_oper->get_optype();
   CHECK(IS_ARITHMETIC(optype));
   const auto lhs = bin_oper->get_left_operand();
@@ -75,6 +76,7 @@ llvm::Value* CodeGenerator::codegenIntArith(const Analyzer::BinOper* bin_oper,
                                             llvm::Value* lhs_lv,
                                             llvm::Value* rhs_lv,
                                             const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto lhs = bin_oper->get_left_operand();
   const auto rhs = bin_oper->get_right_operand();
   const auto& lhs_type = lhs->get_type_info();
@@ -130,6 +132,7 @@ llvm::Value* CodeGenerator::codegenIntArith(const Analyzer::BinOper* bin_oper,
 llvm::Value* CodeGenerator::codegenFpArith(const Analyzer::BinOper* bin_oper,
                                            llvm::Value* lhs_lv,
                                            llvm::Value* rhs_lv) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto lhs = bin_oper->get_left_operand();
   const auto rhs = bin_oper->get_right_operand();
   const auto& lhs_type = lhs->get_type_info();
@@ -194,15 +197,18 @@ bool CodeGenerator::checkExpressionRanges(const Analyzer::BinOper* bin_oper,
     return false;
   }
 
-  auto expr_range_info =
-      cgen_state_->query_infos_.size() > 0
-          ? getExpressionRange(bin_oper, cgen_state_->query_infos_, executor())
-          : ExpressionRange::makeInvalidRange();
-  if (expr_range_info.getType() != ExpressionRangeType::Integer) {
-    return false;
-  }
-  if (expr_range_info.getIntMin() >= min && expr_range_info.getIntMax() <= max) {
-    return true;
+  CHECK(plan_state_);
+  if (executor_) {
+    auto expr_range_info =
+        plan_state_->query_infos_.size() > 0
+            ? getExpressionRange(bin_oper, plan_state_->query_infos_, executor())
+            : ExpressionRange::makeInvalidRange();
+    if (expr_range_info.getType() != ExpressionRangeType::Integer) {
+      return false;
+    }
+    if (expr_range_info.getIntMin() >= min && expr_range_info.getIntMax() <= max) {
+      return true;
+    }
   }
 
   return false;
@@ -215,6 +221,7 @@ llvm::Value* CodeGenerator::codegenAdd(const Analyzer::BinOper* bin_oper,
                                        const std::string& null_check_suffix,
                                        const SQLTypeInfo& ti,
                                        const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(lhs_lv->getType(), rhs_lv->getType());
   CHECK(ti.is_integer() || ti.is_decimal() || ti.is_timeinterval());
   llvm::Value* chosen_max{nullptr};
@@ -234,13 +241,13 @@ llvm::Value* CodeGenerator::codegenAdd(const Analyzer::BinOper* bin_oper,
   llvm::BasicBlock* add_fail{nullptr};
   if (need_overflow_check) {
     cgen_state_->needs_error_check_ = true;
-    add_ok =
-        llvm::BasicBlock::Create(cgen_state_->context_, "add_ok", cgen_state_->row_func_);
+    add_ok = llvm::BasicBlock::Create(
+        cgen_state_->context_, "add_ok", cgen_state_->current_func_);
     if (!null_check_suffix.empty()) {
       codegenSkipOverflowCheckForNull(lhs_lv, rhs_lv, add_ok, ti);
     }
     add_fail = llvm::BasicBlock::Create(
-        cgen_state_->context_, "add_fail", cgen_state_->row_func_);
+        cgen_state_->context_, "add_fail", cgen_state_->current_func_);
     llvm::Value* detected{nullptr};
     auto const_zero = llvm::ConstantInt::get(lhs_lv->getType(), 0, true);
     auto overflow = cgen_state_->ir_builder_.CreateAnd(
@@ -276,6 +283,7 @@ llvm::Value* CodeGenerator::codegenSub(const Analyzer::BinOper* bin_oper,
                                        const std::string& null_check_suffix,
                                        const SQLTypeInfo& ti,
                                        const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(lhs_lv->getType(), rhs_lv->getType());
   CHECK(ti.is_integer() || ti.is_decimal() || ti.is_timeinterval());
   llvm::Value* chosen_max{nullptr};
@@ -295,13 +303,13 @@ llvm::Value* CodeGenerator::codegenSub(const Analyzer::BinOper* bin_oper,
   llvm::BasicBlock* sub_fail{nullptr};
   if (need_overflow_check) {
     cgen_state_->needs_error_check_ = true;
-    sub_ok =
-        llvm::BasicBlock::Create(cgen_state_->context_, "sub_ok", cgen_state_->row_func_);
+    sub_ok = llvm::BasicBlock::Create(
+        cgen_state_->context_, "sub_ok", cgen_state_->current_func_);
     if (!null_check_suffix.empty()) {
       codegenSkipOverflowCheckForNull(lhs_lv, rhs_lv, sub_ok, ti);
     }
     sub_fail = llvm::BasicBlock::Create(
-        cgen_state_->context_, "sub_fail", cgen_state_->row_func_);
+        cgen_state_->context_, "sub_fail", cgen_state_->current_func_);
     llvm::Value* detected{nullptr};
     auto const_zero = llvm::ConstantInt::get(lhs_lv->getType(), 0, true);
     auto overflow = cgen_state_->ir_builder_.CreateAnd(
@@ -342,7 +350,7 @@ void CodeGenerator::codegenSkipOverflowCheckForNull(llvm::Value* lhs_lv,
                                                  codegenIsNullNumber(rhs_lv, ti))
              : lhs_is_null_lv;
   auto operands_not_null = llvm::BasicBlock::Create(
-      cgen_state_->context_, "operands_not_null", cgen_state_->row_func_);
+      cgen_state_->context_, "operands_not_null", cgen_state_->current_func_);
   cgen_state_->ir_builder_.CreateCondBr(
       has_null_operand_lv, no_overflow_bb, operands_not_null);
   cgen_state_->ir_builder_.SetInsertPoint(operands_not_null);
@@ -356,6 +364,7 @@ llvm::Value* CodeGenerator::codegenMul(const Analyzer::BinOper* bin_oper,
                                        const SQLTypeInfo& ti,
                                        const CompilationOptions& co,
                                        bool downscale) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(lhs_lv->getType(), rhs_lv->getType());
   CHECK(ti.is_integer() || ti.is_decimal() || ti.is_timeinterval());
   llvm::Value* chosen_max{nullptr};
@@ -375,15 +384,15 @@ llvm::Value* CodeGenerator::codegenMul(const Analyzer::BinOper* bin_oper,
   llvm::BasicBlock* mul_fail{nullptr};
   if (need_overflow_check) {
     cgen_state_->needs_error_check_ = true;
-    mul_ok =
-        llvm::BasicBlock::Create(cgen_state_->context_, "mul_ok", cgen_state_->row_func_);
+    mul_ok = llvm::BasicBlock::Create(
+        cgen_state_->context_, "mul_ok", cgen_state_->current_func_);
     if (!null_check_suffix.empty()) {
       codegenSkipOverflowCheckForNull(lhs_lv, rhs_lv, mul_ok, ti);
     }
     mul_fail = llvm::BasicBlock::Create(
-        cgen_state_->context_, "mul_fail", cgen_state_->row_func_);
+        cgen_state_->context_, "mul_fail", cgen_state_->current_func_);
     auto mul_check = llvm::BasicBlock::Create(
-        cgen_state_->context_, "mul_check", cgen_state_->row_func_);
+        cgen_state_->context_, "mul_check", cgen_state_->current_func_);
     auto const_zero = llvm::ConstantInt::get(rhs_lv->getType(), 0, true);
     cgen_state_->ir_builder_.CreateCondBr(
         cgen_state_->ir_builder_.CreateICmpEQ(rhs_lv, const_zero), mul_ok, mul_check);
@@ -425,6 +434,7 @@ llvm::Value* CodeGenerator::codegenDiv(llvm::Value* lhs_lv,
                                        const std::string& null_check_suffix,
                                        const SQLTypeInfo& ti,
                                        bool upscale) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(lhs_lv->getType(), rhs_lv->getType());
   if (ti.is_decimal()) {
     if (upscale) {
@@ -438,12 +448,12 @@ llvm::Value* CodeGenerator::codegenDiv(llvm::Value* lhs_lv,
       llvm::Value* chosen_min{nullptr};
       std::tie(chosen_max, chosen_min) = cgen_state_->inlineIntMaxMin(8, true);
       auto decimal_div_ok = llvm::BasicBlock::Create(
-          cgen_state_->context_, "decimal_div_ok", cgen_state_->row_func_);
+          cgen_state_->context_, "decimal_div_ok", cgen_state_->current_func_);
       if (!null_check_suffix.empty()) {
         codegenSkipOverflowCheckForNull(lhs_lv, rhs_lv, decimal_div_ok, ti);
       }
       auto decimal_div_fail = llvm::BasicBlock::Create(
-          cgen_state_->context_, "decimal_div_fail", cgen_state_->row_func_);
+          cgen_state_->context_, "decimal_div_fail", cgen_state_->current_func_);
       auto lhs_max = static_cast<llvm::ConstantInt*>(chosen_max)->getSExtValue() /
                      exp_to_scale(ti.get_scale());
       auto lhs_max_lv =
@@ -494,13 +504,13 @@ llvm::Value* CodeGenerator::codegenDiv(llvm::Value* lhs_lv,
                                  {lhs_lv, rhs_lv, null_lv});
   }
   cgen_state_->needs_error_check_ = true;
-  auto div_ok =
-      llvm::BasicBlock::Create(cgen_state_->context_, "div_ok", cgen_state_->row_func_);
+  auto div_ok = llvm::BasicBlock::Create(
+      cgen_state_->context_, "div_ok", cgen_state_->current_func_);
   if (!null_check_suffix.empty()) {
     codegenSkipOverflowCheckForNull(lhs_lv, rhs_lv, div_ok, ti);
   }
-  auto div_zero =
-      llvm::BasicBlock::Create(cgen_state_->context_, "div_zero", cgen_state_->row_func_);
+  auto div_zero = llvm::BasicBlock::Create(
+      cgen_state_->context_, "div_zero", cgen_state_->current_func_);
   auto zero_const = rhs_lv->getType()->isIntegerTy()
                         ? llvm::ConstantInt::get(rhs_lv->getType(), 0, true)
                         : llvm::ConstantFP::get(rhs_lv->getType(), 0.);
@@ -541,6 +551,7 @@ llvm::Value* CodeGenerator::codegenDiv(llvm::Value* lhs_lv,
 // It is both more efficient and avoids the overflow for a lot of practical cases.
 llvm::Value* CodeGenerator::codegenDeciDiv(const Analyzer::BinOper* bin_oper,
                                            const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   auto lhs = bin_oper->get_left_operand();
   auto rhs = bin_oper->get_right_operand();
   const auto& lhs_type = lhs->get_type_info();
@@ -567,8 +578,8 @@ llvm::Value* CodeGenerator::codegenDeciDiv(const Analyzer::BinOper* bin_oper,
   if (rhs_constant) {
     const auto rhs_lit = Parser::IntLiteral::analyzeValue(
         rhs_constant->get_constval().bigintval / exp_to_scale(rhs_type.get_scale()));
-    auto rhs_lit_lv =
-        codegenIntConst(dynamic_cast<const Analyzer::Constant*>(rhs_lit.get()));
+    auto rhs_lit_lv = CodeGenerator::codegenIntConst(
+        dynamic_cast<const Analyzer::Constant*>(rhs_lit.get()), cgen_state_);
     rhs_lv = codegenCastBetweenIntTypes(
         rhs_lit_lv, rhs_lit->get_type_info(), lhs_type, /*upscale*/ false);
   } else if (rhs_cast) {
@@ -595,14 +606,15 @@ llvm::Value* CodeGenerator::codegenMod(llvm::Value* lhs_lv,
                                        const std::string& null_typename,
                                        const std::string& null_check_suffix,
                                        const SQLTypeInfo& ti) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(lhs_lv->getType(), rhs_lv->getType());
   CHECK(ti.is_integer());
   cgen_state_->needs_error_check_ = true;
   // Generate control flow for division by zero error handling.
-  auto mod_ok =
-      llvm::BasicBlock::Create(cgen_state_->context_, "mod_ok", cgen_state_->row_func_);
-  auto mod_zero =
-      llvm::BasicBlock::Create(cgen_state_->context_, "mod_zero", cgen_state_->row_func_);
+  auto mod_ok = llvm::BasicBlock::Create(
+      cgen_state_->context_, "mod_ok", cgen_state_->current_func_);
+  auto mod_zero = llvm::BasicBlock::Create(
+      cgen_state_->context_, "mod_zero", cgen_state_->current_func_);
   auto zero_const = llvm::ConstantInt::get(rhs_lv->getType(), 0, true);
   cgen_state_->ir_builder_.CreateCondBr(
       cgen_state_->ir_builder_.CreateICmp(llvm::ICmpInst::ICMP_NE, rhs_lv, zero_const),
@@ -628,15 +640,18 @@ bool CodeGenerator::checkExpressionRanges(const Analyzer::UOper* uoper,
     return false;
   }
 
-  auto expr_range_info =
-      cgen_state_->query_infos_.size() > 0
-          ? getExpressionRange(uoper, cgen_state_->query_infos_, executor())
-          : ExpressionRange::makeInvalidRange();
-  if (expr_range_info.getType() != ExpressionRangeType::Integer) {
-    return false;
-  }
-  if (expr_range_info.getIntMin() >= min && expr_range_info.getIntMax() <= max) {
-    return true;
+  CHECK(plan_state_);
+  if (executor_) {
+    auto expr_range_info =
+        plan_state_->query_infos_.size() > 0
+            ? getExpressionRange(uoper, plan_state_->query_infos_, executor())
+            : ExpressionRange::makeInvalidRange();
+    if (expr_range_info.getType() != ExpressionRangeType::Integer) {
+      return false;
+    }
+    if (expr_range_info.getIntMin() >= min && expr_range_info.getIntMax() <= max) {
+      return true;
+    }
   }
 
   return false;
@@ -644,6 +659,7 @@ bool CodeGenerator::checkExpressionRanges(const Analyzer::UOper* uoper,
 
 llvm::Value* CodeGenerator::codegenUMinus(const Analyzer::UOper* uoper,
                                           const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(uoper->get_optype(), kUMINUS);
   const auto operand_lv = codegen(uoper->get_operand(), true, co).front();
   const auto& ti = uoper->get_type_info();
@@ -662,12 +678,12 @@ llvm::Value* CodeGenerator::codegenUMinus(const Analyzer::UOper* uoper,
   if (need_overflow_check) {
     cgen_state_->needs_error_check_ = true;
     uminus_ok = llvm::BasicBlock::Create(
-        cgen_state_->context_, "uminus_ok", cgen_state_->row_func_);
+        cgen_state_->context_, "uminus_ok", cgen_state_->current_func_);
     if (!ti.get_notnull()) {
       codegenSkipOverflowCheckForNull(operand_lv, nullptr, uminus_ok, ti);
     }
     uminus_fail = llvm::BasicBlock::Create(
-        cgen_state_->context_, "uminus_fail", cgen_state_->row_func_);
+        cgen_state_->context_, "uminus_fail", cgen_state_->current_func_);
     auto const_min = llvm::ConstantInt::get(
         operand_lv->getType(),
         static_cast<llvm::ConstantInt*>(chosen_min)->getSExtValue(),
@@ -721,12 +737,13 @@ llvm::Value* CodeGenerator::codegenBinOpWithOverflowForCPU(
     llvm::Value* rhs_lv,
     const std::string& null_check_suffix,
     const SQLTypeInfo& ti) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   cgen_state_->needs_error_check_ = true;
 
-  llvm::BasicBlock* check_ok =
-      llvm::BasicBlock::Create(cgen_state_->context_, "ovf_ok", cgen_state_->row_func_);
+  llvm::BasicBlock* check_ok = llvm::BasicBlock::Create(
+      cgen_state_->context_, "ovf_ok", cgen_state_->current_func_);
   llvm::BasicBlock* check_fail = llvm::BasicBlock::Create(
-      cgen_state_->context_, "ovf_detected", cgen_state_->row_func_);
+      cgen_state_->context_, "ovf_detected", cgen_state_->current_func_);
   llvm::BasicBlock* null_check{nullptr};
 
   if (!null_check_suffix.empty()) {

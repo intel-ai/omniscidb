@@ -17,8 +17,8 @@
 #include "TableOptimizer.h"
 
 #include "Analyzer/Analyzer.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/Execute.h"
-#include "Shared/Logger.h"
 #include "Shared/scope.h"
 
 TableOptimizer::TableOptimizer(const TableDescriptor* td,
@@ -114,7 +114,7 @@ inline ExecutionOptions get_execution_options() {
 
 void TableOptimizer::recomputeMetadata() const {
   INJECT_TIMER(optimizeMetadata);
-  std::lock_guard<std::mutex> lock(executor_->execute_mutex_);
+  mapd_unique_lock<mapd_shared_mutex> lock(executor_->execute_mutex_);
 
   LOG(INFO) << "Recomputing metadata for " << td_->tableName;
 

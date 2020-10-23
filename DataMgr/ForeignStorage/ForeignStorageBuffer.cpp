@@ -16,26 +16,26 @@
 
 #include "ForeignStorageBuffer.h"
 
-#include <iostream>
-
 namespace foreign_storage {
 ForeignStorageBuffer::ForeignStorageBuffer()
-    : AbstractBuffer(0), buffer(nullptr), byte_count(0), reserved_byte_count(0) {}
+    : AbstractBuffer(0), buffer_(nullptr), reserved_byte_count_(0) {}
 
 void ForeignStorageBuffer::read(int8_t* const destination,
                                 const size_t num_bytes,
                                 const size_t offset,
                                 const MemoryLevel destination_buffer_type,
                                 const int destination_device_id) {
-  memcpy(destination, buffer.get() + offset, num_bytes);
+  memcpy(destination, buffer_.get() + offset, num_bytes);
 }
 
 void ForeignStorageBuffer::reserve(size_t additional_num_bytes) {
-  auto old_buffer = std::move(buffer);
-  reserved_byte_count += additional_num_bytes;
-  buffer = std::make_unique<int8_t[]>(reserved_byte_count);
-  if (old_buffer) {
-    memcpy(buffer.get(), old_buffer.get(), byte_count);
+  if (size_ + additional_num_bytes > reserved_byte_count_) {
+    auto old_buffer = std::move(buffer_);
+    reserved_byte_count_ += additional_num_bytes;
+    buffer_ = std::make_unique<int8_t[]>(reserved_byte_count_);
+    if (old_buffer) {
+      memcpy(buffer_.get(), old_buffer.get(), size_);
+    }
   }
 }
 
@@ -43,27 +43,23 @@ void ForeignStorageBuffer::append(int8_t* source,
                                   const size_t num_bytes,
                                   const MemoryLevel source_buffer_type,
                                   const int device_id) {
-  if (byte_count + num_bytes > reserved_byte_count) {
+  if (size_ + num_bytes > reserved_byte_count_) {
     reserve(num_bytes);
   }
-  memcpy(buffer.get() + byte_count, source, num_bytes);
-  byte_count += num_bytes;
+  memcpy(buffer_.get() + size_, source, num_bytes);
+  size_ += num_bytes;
 }
 
 int8_t* ForeignStorageBuffer::getMemoryPtr() {
-  return buffer.get();
-}
-
-size_t ForeignStorageBuffer::size() const {
-  return byte_count;
+  return buffer_.get();
 }
 
 size_t ForeignStorageBuffer::reservedSize() const {
-  return reserved_byte_count;
+  return reserved_byte_count_;
 }
 
 MemoryLevel ForeignStorageBuffer::getType() const {
-  return DISK_LEVEL;
+  return CPU_LEVEL;
 }
 
 void ForeignStorageBuffer::write(int8_t* source,

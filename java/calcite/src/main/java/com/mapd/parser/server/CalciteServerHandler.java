@@ -83,6 +83,7 @@ import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.runtime.CalciteContextException;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.validate.SqlMoniker;
 import org.apache.calcite.sql.validate.SqlMonikerType;
@@ -90,6 +91,7 @@ import org.apache.calcite.tools.Program;
 import org.apache.calcite.tools.Programs;
 import org.apache.calcite.tools.RelConversionException;
 import org.apache.calcite.tools.ValidationException;
+import org.apache.calcite.util.Pair;
 import org.apache.commons.pool.PoolableObjectFactory;
 import org.apache.commons.pool.impl.GenericObjectPool;
 import org.apache.thrift.TException;
@@ -119,6 +121,8 @@ public class CalciteServerHandler implements CalciteServer.Iface {
   private volatile long callCount;
 
   private final GenericObjectPool parserPool;
+
+  private final CalciteParserFactory calciteParserFactory;
 
   private final String extSigsJson;
 
@@ -166,10 +170,10 @@ public class CalciteServerHandler implements CalciteServer.Iface {
       extSigs.putAll(udfSigs);
     }
 
-    PoolableObjectFactory parserFactory =
-            new CalciteParserFactory(dataDir, extSigs, mapdPort, skT);
+    calciteParserFactory = new CalciteParserFactory(dataDir, extSigs, mapdPort, skT);
+
     // GenericObjectPool::setFactory is deprecated
-    this.parserPool = new GenericObjectPool(parserFactory);
+    this.parserPool = new GenericObjectPool(calciteParserFactory);
   }
 
   @Override
@@ -228,27 +232,30 @@ public class CalciteServerHandler implements CalciteServer.Iface {
         filterPushDownInfo.add(new MapDParserOptions.FilterPushDownInfo(
                 req.input_prev, req.input_start, req.input_next));
       }
+      Pair<String, SqlIdentifierCapturer> res;
+      SqlNode node;
       try {
         if (!is_calcite) {
           MapDParserOptions parserOptions = new MapDParserOptions(
                   filterPushDownInfo, legacySyntax, isExplain, isViewOptimize);
-          jsonResult = parser.processSql(sqlText, parserOptions);
-          capturer = parser.captureIdentifiers(sqlText, legacySyntax);
+          res = parser.process(sqlText, parserOptions);
+          jsonResult = res.left;
+          capturer = res.right;
 
           primaryAccessedObjects.tables_selected_from = new ArrayList<>(capturer.selects);
           primaryAccessedObjects.tables_inserted_into = new ArrayList<>(capturer.inserts);
           primaryAccessedObjects.tables_updated_in = new ArrayList<>(capturer.updates);
           primaryAccessedObjects.tables_deleted_from = new ArrayList<>(capturer.deletes);
-
+    
           // also resolve all the views in the select part
           // resolution of the other parts is not
           // necessary as these cannot be views
           resolvedAccessedObjects.tables_selected_from =
                   new ArrayList<>(parser.resolveSelectIdentifiers(capturer));
-          resolvedAccessedObjects.tables_inserted_into =
-                  new ArrayList<>(capturer.inserts);
+          resolvedAccessedObjects.tables_inserted_into = new ArrayList<>(capturer.inserts);
           resolvedAccessedObjects.tables_updated_in = new ArrayList<>(capturer.updates);
           resolvedAccessedObjects.tables_deleted_from = new ArrayList<>(capturer.deletes);
+          
         } else {
           MapDSchema schema = new MapDSchema(dataDir,
                   parser,
@@ -533,9 +540,12 @@ public class CalciteServerHandler implements CalciteServer.Iface {
       }
     }
 
+    // udfRTSigsJson will contain only the signatures of UDFs:
     udfRTSigsJson = ExtensionFunctionSignatureParser.signaturesToJson(udfRTSigs);
     // Expose RT UDFs to Calcite server:
     extSigs.putAll(udfRTSigs);
+
+    calciteParserFactory.updateOperatorTable();
   }
 
   private static ExtensionFunction toExtensionFunction(TUserDefinedFunction udf) {
@@ -547,7 +557,7 @@ public class CalciteServerHandler implements CalciteServer.Iface {
         args.add(arg_type);
       }
     }
-    return new ExtensionFunction(args, toExtArgumentType(udf.retType), true);
+    return new ExtensionFunction(args, toExtArgumentType(udf.retType));
   }
 
   private static ExtensionFunction toExtensionFunction(TUserDefinedTableFunction udtf) {
@@ -556,7 +566,12 @@ public class CalciteServerHandler implements CalciteServer.Iface {
     for (TExtArgumentType atype : udtf.sqlArgTypes) {
       args.add(toExtArgumentType(atype));
     }
-    return new ExtensionFunction(args, ExtensionFunction.ExtArgumentType.Void, false);
+    List<ExtensionFunction.ExtArgumentType> outs =
+            new ArrayList<ExtensionFunction.ExtArgumentType>();
+    for (TExtArgumentType otype : udtf.outputArgTypes) {
+      outs.add(toExtArgumentType(otype));
+    }
+    return new ExtensionFunction(args, outs);
   }
 
   private static ExtensionFunction.ExtArgumentType toExtArgumentType(
@@ -606,6 +621,20 @@ public class CalciteServerHandler implements CalciteServer.Iface {
         return ExtensionFunction.ExtArgumentType.ArrayDouble;
       case ArrayBool:
         return ExtensionFunction.ExtArgumentType.ArrayBool;
+      case ColumnInt8:
+        return ExtensionFunction.ExtArgumentType.ColumnInt8;
+      case ColumnInt16:
+        return ExtensionFunction.ExtArgumentType.ColumnInt16;
+      case ColumnInt32:
+        return ExtensionFunction.ExtArgumentType.ColumnInt32;
+      case ColumnInt64:
+        return ExtensionFunction.ExtArgumentType.ColumnInt64;
+      case ColumnFloat:
+        return ExtensionFunction.ExtArgumentType.ColumnFloat;
+      case ColumnDouble:
+        return ExtensionFunction.ExtArgumentType.ColumnDouble;
+      case ColumnBool:
+        return ExtensionFunction.ExtArgumentType.ColumnBool;
       case GeoPoint:
         return ExtensionFunction.ExtArgumentType.GeoPoint;
       case GeoLineString:

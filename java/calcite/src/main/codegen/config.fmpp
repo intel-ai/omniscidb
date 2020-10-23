@@ -31,8 +31,13 @@ data: {
         "com.mapd.parser.extension.ddl.SqlAlterServer"
         "com.mapd.parser.extension.ddl.SqlCreateForeignTable"
         "com.mapd.parser.extension.ddl.SqlDropForeignTable"
+        "com.mapd.parser.extension.ddl.SqlRefreshForeignTables"
+        "com.mapd.parser.extension.ddl.SqlCreateUserMapping"
+        "com.mapd.parser.extension.ddl.SqlDropUserMapping"
         "com.mapd.parser.extension.ddl.SqlShowUserSessions"
         "com.mapd.parser.extension.ddl.SqlShowForeignServers"
+        "com.mapd.parser.extension.ddl.SqlShowQueries"
+        "com.mapd.parser.extension.ddl.SqlKillQuery"
         "com.mapd.parser.extension.ddl.omnisql.*"
         "java.util.Map"
         "java.util.HashMap"
@@ -50,12 +55,17 @@ data: {
         "LINESTRING"
         "MULTIPOLYGON"
         "TEXT"
+        "REFRESH"
         "SESSIONS"
         "TABLES"
         "DATABASES"
         "SERVERS"
+        "MAPPING"
         "OWNER"
         "RENAME"
+        "KILL"
+        "QUERY"
+        "QUERIES"
       ]
 
       # List of keywords from "keywords" section that are not reserved.
@@ -401,6 +411,9 @@ data: {
         "SqlShowDatabases(span())"
         "SqlShowForeignServers(span())"
         "SqlAlterServer(span())"
+        "SqlRefreshForeignTables(span())"
+        "SqlShowQueries(span())"
+        "SqlKillQuery(span())"
       ]
 
       # List of methods for parsing custom literals.
@@ -430,6 +443,7 @@ data: {
       createStatementParserMethods: [
         "SqlCreateServer"
         "SqlCreateForeignTable"
+        "SqlCreateUserMapping"
       ]
 
       # List of methods for parsing extensions to "DROP" calls.
@@ -437,6 +451,7 @@ data: {
       dropStatementParserMethods: [
         "SqlDropServer"
         "SqlDropForeignTable"
+        "SqlDropUserMapping"
       ]
 
 
@@ -456,6 +471,8 @@ data: {
         "foreignServerParser.ftl"
         "foreignTableParser.ftl"
         "showCommandsParser.ftl"
+        "userMappingParser.ftl"
+        "interruptQueryParser.ftl"
       ]
 
       includePosixOperators: false

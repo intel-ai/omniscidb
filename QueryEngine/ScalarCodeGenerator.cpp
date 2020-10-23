@@ -74,7 +74,8 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
     const Analyzer::Expr* expr,
     const bool fetch_columns,
     const CompilationOptions& co) {
-  own_plan_state_ = std::make_unique<PlanState>(false, nullptr);
+  own_plan_state_ = std::make_unique<PlanState>(
+      false, std::vector<InputTableInfo>{}, PlanState::DeletedColumnsMap{}, nullptr);
   plan_state_ = own_plan_state_.get();
   const auto used_columns = prepare(expr);
   std::vector<llvm::Type*> arg_types(plan_state_->global_to_local_col_ids_.size() + 1);
@@ -95,11 +96,12 @@ ScalarCodeGenerator::CompiledExpression ScalarCodeGenerator::compile(
   auto scalar_expr_func = llvm::Function::Create(
       ft, llvm::Function::ExternalLinkage, "scalar_expr", module_.get());
   auto bb_entry = llvm::BasicBlock::Create(ctx, ".entry", scalar_expr_func, 0);
-  own_cgen_state_ = std::make_unique<CgenState>(g_table_infos, false);
+  own_cgen_state_ = std::make_unique<CgenState>(g_table_infos.size(), false);
   own_cgen_state_->module_ = module_.get();
-  own_cgen_state_->row_func_ = scalar_expr_func;
+  own_cgen_state_->row_func_ = own_cgen_state_->current_func_ = scalar_expr_func;
   own_cgen_state_->ir_builder_.SetInsertPoint(bb_entry);
   cgen_state_ = own_cgen_state_.get();
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto expr_lvs = codegen(expr, fetch_columns, co);
   CHECK_EQ(expr_lvs.size(), size_t(1));
   cgen_state_->ir_builder_.CreateStore(expr_lvs.front(),
@@ -186,14 +188,7 @@ std::vector<void*> ScalarCodeGenerator::generateNativeGPUCode(
   gpu_target.block_size = block_size;
   gpu_target.cgen_state = cgen_state_;
   gpu_target.row_func_not_inlined = false;
-  const auto gpu_code = CodeGenerator::generateNativeGPUCode(
+  gpu_compilation_context_ = CodeGenerator::generateNativeGPUCode(
       func, wrapper_func, {func, wrapper_func}, co, gpu_target);
-  for (const auto& cached_function : gpu_code.cached_functions) {
-    gpu_compilation_contexts_.emplace_back(std::get<1>(cached_function));
-  }
-  std::vector<void*> native_function_pointers;
-  for (const auto& cached_function : gpu_code.cached_functions) {
-    native_function_pointers.push_back(std::get<0>(cached_function));
-  }
-  return native_function_pointers;
+  return gpu_compilation_context_->getNativeFunctionPointers();
 }

@@ -25,7 +25,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/process.hpp>
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 #include "TestHelpers.h"
 
 namespace bp = boost::process;
@@ -145,7 +145,7 @@ Logging:
                                         WARNING ERROR FATAL
   --log-severity-clog arg (=ERROR)      Log to console severity level: INFO 
                                         WARNING ERROR FATAL
-  --log-channels arg                    Log channel debug info: IR PTX
+  --log-channels arg                    Log channel debug info: IR PTX ASM
   --log-auto-flush arg (=1)             Flush logging buffer to file after each
                                         message.
   --log-max-files arg (=100)            Maximum number of log files to keep.

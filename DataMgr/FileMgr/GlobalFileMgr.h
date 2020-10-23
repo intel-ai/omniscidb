@@ -121,7 +121,6 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
 
   void init();
 
-  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) override;
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
                                        const ChunkKey& keyPrefix) override {
     return getFileMgr(keyPrefix)->getChunkMetadataVecForKeyPrefix(chunkMetadataVec,
@@ -185,7 +184,7 @@ class GlobalFileMgr : public AbstractBufferMgr {  // implements
   bool dbConvert_;  /// true if conversion should be done between different
                     /// "mapd_db_version_"
 
-  std::map<std::pair<int, int>, std::shared_ptr<AbstractBufferMgr>> ownedFileMgrs_;
+  std::map<std::pair<int, int>, std::shared_ptr<FileMgr>> ownedFileMgrs_;
   std::map<std::pair<int, int>, AbstractBufferMgr*> allFileMgrs_;
   std::shared_ptr<ForeignStorageInterface> fsi_;
 

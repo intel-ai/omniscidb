@@ -19,42 +19,42 @@
 #include "Execute.h"
 #include "GpuInitGroups.h"
 #include "GpuMemUtils.h"
+#include "Logger/Logger.h"
 #include "OutputBufferInitialization.h"
 #include "ResultSet.h"
-#include "Shared/Logger.h"
 #include "StreamingTopN.h"
 
 #include <Shared/checked_alloc.h>
+
+// 8 GB, the limit of perfect hash group by under normal conditions
+int64_t g_bitmap_memory_limit{8 * 1000 * 1000 * 1000L};
 
 namespace {
 
 inline void check_total_bitmap_memory(const QueryMemoryDescriptor& query_mem_desc) {
   const int32_t groups_buffer_entry_count = query_mem_desc.getEntryCount();
-  if (g_enable_watchdog) {
-    checked_int64_t total_bytes_per_group = 0;
-    const size_t num_count_distinct_descs =
-        query_mem_desc.getCountDistinctDescriptorsSize();
-    for (size_t i = 0; i < num_count_distinct_descs; i++) {
-      const auto count_distinct_desc = query_mem_desc.getCountDistinctDescriptor(i);
-      if (count_distinct_desc.impl_type_ != CountDistinctImplType::Bitmap) {
-        continue;
-      }
-      total_bytes_per_group += count_distinct_desc.bitmapPaddedSizeBytes();
+  checked_int64_t total_bytes_per_group = 0;
+  const size_t num_count_distinct_descs =
+      query_mem_desc.getCountDistinctDescriptorsSize();
+  for (size_t i = 0; i < num_count_distinct_descs; i++) {
+    const auto count_distinct_desc = query_mem_desc.getCountDistinctDescriptor(i);
+    if (count_distinct_desc.impl_type_ != CountDistinctImplType::Bitmap) {
+      continue;
     }
-    int64_t total_bytes{0};
-    // Using OutOfHostMemory until we can verify that SlabTooBig would also be properly
-    // caught
-    try {
-      total_bytes =
-          static_cast<int64_t>(total_bytes_per_group * groups_buffer_entry_count);
-    } catch (...) {
-      // Absurd amount of memory, merely computing the number of bits overflows int64_t.
-      // Don't bother to report the real amount, this is unlikely to ever happen.
-      throw OutOfHostMemory(std::numeric_limits<int64_t>::max() / 8);
-    }
-    if (total_bytes >= 2 * 1000 * 1000 * 1000L) {
-      throw OutOfHostMemory(total_bytes);
-    }
+    total_bytes_per_group += count_distinct_desc.bitmapPaddedSizeBytes();
+  }
+  int64_t total_bytes{0};
+  // Using OutOfHostMemory until we can verify that SlabTooBig would also be properly
+  // caught
+  try {
+    total_bytes = static_cast<int64_t>(total_bytes_per_group * groups_buffer_entry_count);
+  } catch (...) {
+    // Absurd amount of memory, merely computing the number of bits overflows int64_t.
+    // Don't bother to report the real amount, this is unlikely to ever happen.
+    throw OutOfHostMemory(std::numeric_limits<int64_t>::max() / 8);
+  }
+  if (total_bytes >= g_bitmap_memory_limit) {
+    throw OutOfHostMemory(total_bytes);
   }
 }
 
@@ -75,7 +75,7 @@ int64_t* alloc_group_by_buffer(const size_t numBytes,
 
 inline int64_t get_consistent_frag_size(const std::vector<uint64_t>& frag_offsets) {
   if (frag_offsets.size() < 2) {
-    return ssize_t(-1);
+    return int64_t(-1);
   }
   const auto frag_size = frag_offsets[1] - frag_offsets[0];
   for (size_t i = 2; i < frag_offsets.size(); ++i) {
@@ -315,7 +315,6 @@ QueryMemoryInitializer::QueryMemoryInitializer(
     , count_distinct_bitmap_host_mem_(nullptr)
     , device_allocator_(device_allocator) {
   // Table functions output columnar, basically treat this as a projection
-
   const auto& consistent_frag_sizes = get_consistent_frags_sizes(frag_offsets);
   if (consistent_frag_sizes.empty()) {
     // No fragments in the input, no underlying buffers will be needed.
@@ -323,9 +322,8 @@ QueryMemoryInitializer::QueryMemoryInitializer(
   }
 
   size_t group_buffer_size{0};
-  // TODO(adb): this is going to give us an index buffer and then the target buffers. this
-  // might not be desireable -- revisit
-  group_buffer_size = query_mem_desc.getBufferSizeBytes(device_type, num_rows_);
+  const size_t num_columns = query_mem_desc.getBufferColSlotCount();
+  group_buffer_size = num_rows_ * num_columns * sizeof(int64_t);
   CHECK_GE(group_buffer_size, size_t(0));
 
   const auto index_buffer_qw =
@@ -524,12 +522,12 @@ void QueryMemoryInitializer::initColumnPerRow(const QueryMemoryDescriptor& query
                                               int8_t* row_ptr,
                                               const size_t bin,
                                               const std::vector<int64_t>& init_vals,
-                                              const std::vector<ssize_t>& bitmap_sizes) {
+                                              const std::vector<int64_t>& bitmap_sizes) {
   int8_t* col_ptr = row_ptr;
   size_t init_vec_idx = 0;
   for (size_t col_idx = 0; col_idx < query_mem_desc.getSlotCount();
        col_ptr += query_mem_desc.getNextColOffInBytes(col_ptr, bin, col_idx++)) {
-    const ssize_t bm_sz{bitmap_sizes[col_idx]};
+    const int64_t bm_sz{bitmap_sizes[col_idx]};
     int64_t init_val{0};
     if (!bm_sz || !query_mem_desc.isGroupBy()) {
       if (query_mem_desc.getPaddedSlotWidthBytes(col_idx) > 0) {
@@ -596,12 +594,12 @@ void QueryMemoryInitializer::allocateCountDistinctGpuMem(
 
 // deferred is true for group by queries; initGroups will allocate a bitmap
 // for each group slot
-std::vector<ssize_t> QueryMemoryInitializer::allocateCountDistinctBuffers(
+std::vector<int64_t> QueryMemoryInitializer::allocateCountDistinctBuffers(
     const QueryMemoryDescriptor& query_mem_desc,
     const bool deferred,
     const Executor* executor) {
   const size_t agg_col_count{query_mem_desc.getSlotCount()};
-  std::vector<ssize_t> agg_bitmap_size(deferred ? agg_col_count : 0);
+  std::vector<int64_t> agg_bitmap_size(deferred ? agg_col_count : 0);
 
   CHECK_GE(agg_col_count, executor->plan_state_->target_exprs_.size());
   for (size_t target_idx = 0; target_idx < executor->plan_state_->target_exprs_.size();
@@ -809,18 +807,73 @@ GpuGroupByBuffers QueryMemoryInitializer::setupTableFunctionGpuBuffers(
     const int device_id,
     const unsigned block_size_x,
     const unsigned grid_size_x) {
-  return create_dev_group_by_buffers(device_allocator_,
-                                     group_by_buffers_,
-                                     query_mem_desc,
-                                     block_size_x,
-                                     grid_size_x,
-                                     device_id,
-                                     ExecutorDispatchMode::MultifragmentKernel,
-                                     num_rows_,
-                                     false,
-                                     false,
-                                     false,
-                                     nullptr);
+  const size_t num_columns = query_mem_desc.getBufferColSlotCount();
+  CHECK_GT(num_columns, size_t(0));
+
+  const size_t column_size = num_rows_ * sizeof(int64_t);
+  const size_t groups_buffer_size = num_columns * column_size;
+  const size_t mem_size =
+      groups_buffer_size * (query_mem_desc.blocksShareMemory() ? 1 : grid_size_x);
+
+  int8_t* dev_buffers_allocation{nullptr};
+  dev_buffers_allocation = device_allocator_->alloc(mem_size);
+  CHECK(dev_buffers_allocation);
+
+  CUdeviceptr dev_buffers_mem = reinterpret_cast<CUdeviceptr>(dev_buffers_allocation);
+  const size_t step{block_size_x};
+  const size_t num_ptrs{block_size_x * grid_size_x};
+  std::vector<CUdeviceptr> dev_buffers(num_columns * num_ptrs);
+  auto dev_buffer = dev_buffers_mem;
+  for (size_t i = 0; i < num_ptrs; i += step) {
+    for (size_t j = 0; j < step; j += 1) {
+      for (size_t k = 0; k < num_columns; k++) {
+        dev_buffers[(i + j) * num_columns + k] = dev_buffer + k * column_size;
+      }
+    }
+    if (!query_mem_desc.blocksShareMemory()) {
+      dev_buffer += groups_buffer_size;
+    }
+  }
+
+  auto dev_ptr = device_allocator_->alloc(num_columns * num_ptrs * sizeof(CUdeviceptr));
+  device_allocator_->copyToDevice(dev_ptr,
+                                  reinterpret_cast<int8_t*>(dev_buffers.data()),
+                                  num_columns * num_ptrs * sizeof(CUdeviceptr));
+
+  return {reinterpret_cast<CUdeviceptr>(dev_ptr), dev_buffers_mem, (size_t)num_rows_};
+}
+
+void QueryMemoryInitializer::copyFromTableFunctionGpuBuffers(
+    Data_Namespace::DataMgr* data_mgr,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const size_t entry_count,
+    const GpuGroupByBuffers& gpu_group_by_buffers,
+    const int device_id,
+    const unsigned block_size_x,
+    const unsigned grid_size_x) {
+  const size_t num_columns = query_mem_desc.getBufferColSlotCount();
+  const size_t column_size = entry_count * sizeof(int64_t);
+  const size_t orig_column_size = gpu_group_by_buffers.entry_count * sizeof(int64_t);
+  int8_t* dev_buffer = reinterpret_cast<int8_t*>(gpu_group_by_buffers.second);
+  int8_t* host_buffer = reinterpret_cast<int8_t*>(group_by_buffers_[0]);
+  CHECK_LE(column_size, orig_column_size);
+  if (orig_column_size == column_size) {
+    copy_from_gpu(data_mgr,
+                  host_buffer,
+                  reinterpret_cast<CUdeviceptr>(dev_buffer),
+                  column_size * num_columns,
+                  device_id);
+  } else {
+    for (size_t k = 0; k < num_columns; ++k) {
+      copy_from_gpu(data_mgr,
+                    host_buffer,
+                    reinterpret_cast<CUdeviceptr>(dev_buffer),
+                    column_size,
+                    device_id);
+      dev_buffer += orig_column_size;
+      host_buffer += column_size;
+    }
+  }
 }
 
 #endif

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "Allocators/DeviceAllocator.h"
+#include "DataMgr/Allocators/DeviceAllocator.h"
 
 #include "Descriptors/QueryMemoryDescriptor.h"
 #include "GpuMemUtils.h"
@@ -108,6 +108,13 @@ class QueryMemoryInitializer {
       const int device_id,
       const unsigned block_size_x,
       const unsigned grid_size_x);
+  void copyFromTableFunctionGpuBuffers(Data_Namespace::DataMgr* data_mgr,
+                                       const QueryMemoryDescriptor& query_mem_desc,
+                                       const size_t entry_count,
+                                       const GpuGroupByBuffers& gpu_group_by_buffers,
+                                       const int device_id,
+                                       const unsigned block_size_x,
+                                       const unsigned grid_size_x);
 #endif
 
   void copyGroupByBuffersFromGpu(Data_Namespace::DataMgr* data_mgr,
@@ -144,11 +151,11 @@ class QueryMemoryInitializer {
                         int8_t* row_ptr,
                         const size_t bin,
                         const std::vector<int64_t>& init_vals,
-                        const std::vector<ssize_t>& bitmap_sizes);
+                        const std::vector<int64_t>& bitmap_sizes);
 
   void allocateCountDistinctGpuMem(const QueryMemoryDescriptor& query_mem_desc);
 
-  std::vector<ssize_t> allocateCountDistinctBuffers(
+  std::vector<int64_t> allocateCountDistinctBuffers(
       const QueryMemoryDescriptor& query_mem_desc,
       const bool deferred,
       const Executor* executor);
@@ -202,7 +209,6 @@ class QueryMemoryInitializer {
                                    const int device_id);
 
   const int64_t num_rows_;
-
   std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner_;
   std::vector<std::unique_ptr<ResultSet>> result_sets_;
 
@@ -217,6 +223,7 @@ class QueryMemoryInitializer {
   int8_t* count_distinct_bitmap_host_mem_;
 
   DeviceAllocator* device_allocator_{nullptr};
+  std::vector<Data_Namespace::AbstractBuffer*> temporary_buffers_;
 
   friend class Executor;  // Accesses result_sets_
   friend class QueryExecutionContext;

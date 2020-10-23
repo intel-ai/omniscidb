@@ -36,6 +36,8 @@
 // Should the ColumnInfo and FragmentInfo structs be in
 // AbstractFragmenter?
 
+class Executor;
+
 namespace Chunk_NS {
 class Chunk;
 };
@@ -45,7 +47,7 @@ class AbstractBuffer;
 class AbstractDataMgr;
 };  // namespace Data_Namespace
 
-namespace Importer_NS {
+namespace import_export {
 class TypedImportBuffer;
 };
 
@@ -163,7 +165,8 @@ class AbstractFragmenter {
                              const RowDataProvider& sourceDataProvider,
                              const size_t indexOffFragmentOffsetColumn,
                              const Data_Namespace::MemoryLevel memoryLevel,
-                             UpdelRoll& updelRoll) = 0;
+                             UpdelRoll& updelRoll,
+                             Executor* executor) = 0;
 
   virtual void updateColumn(const Catalog_Namespace::Catalog* catalog,
                             const TableDescriptor* td,
@@ -204,6 +207,18 @@ class AbstractFragmenter {
 
   //! Iterates through chunk metadata to return whether any rows have been deleted.
   virtual bool hasDeletedRows(const int delete_column_id) = 0;
+
+  /**
+   * @brief Updates the metadata for a column chunk
+   *
+   * @param cd - ColumnDescriptor for the column
+   * @param fragment_id - Fragment id of the chunk within the column
+   * @param metadata -  shared_ptr  of the metadata to update column chunk with
+   */
+  virtual void updateColumnChunkMetadata(
+      const ColumnDescriptor* cd,
+      const int fragment_id,
+      const std::shared_ptr<ChunkMetadata> metadata) = 0;
 };
 
 }  // namespace Fragmenter_Namespace

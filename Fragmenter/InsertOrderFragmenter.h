@@ -34,6 +34,8 @@
 #include "Shared/mapd_shared_mutex.h"
 #include "Shared/types.h"
 
+class Executor;
+
 namespace Data_Namespace {
 class DataMgr;
 }
@@ -88,6 +90,10 @@ class InsertOrderFragmenter : public AbstractFragmenter {
 
   void dropFragmentsToSize(const size_t maxRows) override;
 
+  void updateColumnChunkMetadata(const ColumnDescriptor* cd,
+                                 const int fragment_id,
+                                 const std::shared_ptr<ChunkMetadata> metadata) override;
+
   void updateChunkStats(
       const ColumnDescriptor* cd,
       std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) override;
@@ -105,16 +111,6 @@ class InsertOrderFragmenter : public AbstractFragmenter {
   inline std::string getFragmenterType() override { return fragmenterType_; }
   size_t getNumRows() override { return numTuples_; }
   void setNumRows(const size_t numTuples) override { numTuples_ = numTuples; }
-
-  static void updateColumn(const Catalog_Namespace::Catalog* catalog,
-                           const std::string& tab_name,
-                           const std::string& col_name,
-                           const int fragment_id,
-                           const std::vector<uint64_t>& frag_offsets,
-                           const std::vector<ScalarTargetValue>& rhs_values,
-                           const SQLTypeInfo& rhs_type,
-                           const Data_Namespace::MemoryLevel memory_level,
-                           UpdelRoll& updel_roll);
 
   void updateColumn(const Catalog_Namespace::Catalog* catalog,
                     const TableDescriptor* td,
@@ -134,7 +130,8 @@ class InsertOrderFragmenter : public AbstractFragmenter {
                      const RowDataProvider& sourceDataProvider,
                      const size_t indexOffFragmentOffsetColumn,
                      const Data_Namespace::MemoryLevel memoryLevel,
-                     UpdelRoll& updelRoll) override;
+                     UpdelRoll& updelRoll,
+                     Executor* executor) override;
 
   void updateColumn(const Catalog_Namespace::Catalog* catalog,
                     const TableDescriptor* td,

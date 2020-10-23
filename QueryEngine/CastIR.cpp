@@ -19,6 +19,7 @@
 
 llvm::Value* CodeGenerator::codegenCast(const Analyzer::UOper* uoper,
                                         const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK_EQ(uoper->get_optype(), kCAST);
   const auto& ti = uoper->get_type_info();
   const auto operand = uoper->get_operand();
@@ -55,6 +56,7 @@ llvm::Value* CodeGenerator::codegenCast(llvm::Value* operand_lv,
                                         const SQLTypeInfo& ti,
                                         const bool operand_is_const,
                                         const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (byte_array_cast(operand_ti, ti)) {
     auto* byte_array_type = get_int_array_type(8, ti.get_size(), cgen_state_->context_);
     return cgen_state_->ir_builder_.CreatePointerCast(operand_lv,
@@ -116,36 +118,45 @@ llvm::Value* CodeGenerator::codegenCast(llvm::Value* operand_lv,
 llvm::Value* CodeGenerator::codegenCastTimestampToDate(llvm::Value* ts_lv,
                                                        const int dimen,
                                                        const bool nullable) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   CHECK(ts_lv->getType()->isIntegerTy(64));
-  std::vector<llvm::Value*> datetrunc_args{ts_lv};
   if (dimen > 0) {
-    static const std::string hptodate_fname = "DateTruncateHighPrecisionToDate";
-    static const std::string hptodate_null_fname =
-        "DateTruncateHighPrecisionToDateNullable";
-    datetrunc_args.push_back(
-        cgen_state_->llInt(DateTimeUtils::get_timestamp_precision_scale(dimen)));
     if (nullable) {
-      datetrunc_args.push_back(cgen_state_->inlineIntNull(SQLTypeInfo(kBIGINT, false)));
+      return cgen_state_->emitExternalCall(
+          "DateTruncateHighPrecisionToDateNullable",
+          get_int_type(64, cgen_state_->context_),
+          {{ts_lv,
+            cgen_state_->llInt(DateTimeUtils::get_timestamp_precision_scale(dimen)),
+            cgen_state_->inlineIntNull(SQLTypeInfo(kBIGINT, false))}});
     }
-    return cgen_state_->emitExternalCall(nullable ? hptodate_null_fname : hptodate_fname,
-                                         get_int_type(64, cgen_state_->context_),
-                                         datetrunc_args);
+    return cgen_state_->emitExternalCall(
+        "DateTruncateHighPrecisionToDate",
+        get_int_type(64, cgen_state_->context_),
+        {{ts_lv,
+          cgen_state_->llInt(DateTimeUtils::get_timestamp_precision_scale(dimen))}});
   }
-  std::string datetrunc_fname{"DateTruncate"};
-  datetrunc_args.insert(datetrunc_args.begin(),
-                        cgen_state_->llInt(static_cast<int32_t>(dtDAY)));
+  std::unique_ptr<CodeGenerator::NullCheckCodegen> nullcheck_codegen;
   if (nullable) {
-    datetrunc_args.push_back(cgen_state_->inlineIntNull(SQLTypeInfo(kBIGINT, false)));
-    datetrunc_fname += "Nullable";
+    nullcheck_codegen =
+        std::make_unique<NullCheckCodegen>(cgen_state_,
+                                           executor(),
+                                           ts_lv,
+                                           SQLTypeInfo(kTIMESTAMP, dimen, 0, !nullable),
+                                           "cast_timestamp_nullcheck");
   }
-  return cgen_state_->emitExternalCall(
-      datetrunc_fname, get_int_type(64, cgen_state_->context_), datetrunc_args);
+  auto ret = cgen_state_->emitExternalCall(
+      "datetrunc_day", get_int_type(64, cgen_state_->context_), {ts_lv});
+  if (nullcheck_codegen) {
+    ret = nullcheck_codegen->finalize(ll_int(NULL_BIGINT, cgen_state_->context_), ret);
+  }
+  return ret;
 }
 
 llvm::Value* CodeGenerator::codegenCastBetweenTimestamps(llvm::Value* ts_lv,
                                                          const SQLTypeInfo& operand_ti,
                                                          const SQLTypeInfo& target_ti,
                                                          const bool nullable) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto operand_dimen = operand_ti.get_dimension();
   const auto target_dimen = target_ti.get_dimension();
   if (operand_dimen == target_dimen) {
@@ -165,7 +176,7 @@ llvm::Value* CodeGenerator::codegenCastBetweenTimestamps(llvm::Value* ts_lv,
                      ts_lv, cgen_state_->llInt(static_cast<int64_t>(scale)));
   }
   return nullable
-             ? cgen_state_->emitCall("div_int64_t_nullable_lhs",
+             ? cgen_state_->emitCall("floor_div_nullable_lhs",
                                      {ts_lv,
                                       cgen_state_->llInt(static_cast<int64_t>(scale)),
                                       cgen_state_->inlineIntNull(operand_ti)})
@@ -178,6 +189,7 @@ llvm::Value* CodeGenerator::codegenCastFromString(llvm::Value* operand_lv,
                                                   const SQLTypeInfo& ti,
                                                   const bool operand_is_const,
                                                   const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (!ti.is_string()) {
     throw std::runtime_error("Cast from " + operand_ti.get_type_name() + " to " +
                              ti.get_type_name() + " not supported");
@@ -245,6 +257,7 @@ llvm::Value* CodeGenerator::codegenCastBetweenIntTypes(llvm::Value* operand_lv,
                                                        const SQLTypeInfo& operand_ti,
                                                        const SQLTypeInfo& ti,
                                                        bool upscale) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (ti.is_decimal() &&
       (!operand_ti.is_decimal() || operand_ti.get_scale() <= ti.get_scale())) {
     if (upscale) {
@@ -318,16 +331,17 @@ void CodeGenerator::codegenCastBetweenIntTypesOverflowChecks(
     const SQLTypeInfo& operand_ti,
     const SQLTypeInfo& ti,
     const int64_t scale) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   llvm::Value* chosen_max{nullptr};
   llvm::Value* chosen_min{nullptr};
   std::tie(chosen_max, chosen_min) =
       cgen_state_->inlineIntMaxMin(ti.get_logical_size(), true);
 
   cgen_state_->needs_error_check_ = true;
-  auto cast_ok =
-      llvm::BasicBlock::Create(cgen_state_->context_, "cast_ok", cgen_state_->row_func_);
+  auto cast_ok = llvm::BasicBlock::Create(
+      cgen_state_->context_, "cast_ok", cgen_state_->current_func_);
   auto cast_fail = llvm::BasicBlock::Create(
-      cgen_state_->context_, "cast_fail", cgen_state_->row_func_);
+      cgen_state_->context_, "cast_fail", cgen_state_->current_func_);
   auto operand_max = static_cast<llvm::ConstantInt*>(chosen_max)->getSExtValue() / scale;
   auto operand_min = static_cast<llvm::ConstantInt*>(chosen_min)->getSExtValue() / scale;
   const auto ti_llvm_type =
@@ -373,6 +387,7 @@ void CodeGenerator::codegenCastBetweenIntTypesOverflowChecks(
 llvm::Value* CodeGenerator::codegenCastToFp(llvm::Value* operand_lv,
                                             const SQLTypeInfo& operand_ti,
                                             const SQLTypeInfo& ti) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (!ti.is_fp()) {
     throw std::runtime_error("Cast from " + operand_ti.get_type_name() + " to " +
                              ti.get_type_name() + " not supported");
@@ -404,6 +419,7 @@ llvm::Value* CodeGenerator::codegenCastToFp(llvm::Value* operand_lv,
 llvm::Value* CodeGenerator::codegenCastFromFp(llvm::Value* operand_lv,
                                               const SQLTypeInfo& operand_ti,
                                               const SQLTypeInfo& ti) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   if (!operand_ti.is_fp() || !ti.is_number() || ti.is_decimal()) {
     throw std::runtime_error("Cast from " + operand_ti.get_type_name() + " to " +
                              ti.get_type_name() + " not supported");

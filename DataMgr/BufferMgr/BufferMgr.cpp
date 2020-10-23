@@ -26,7 +26,7 @@
 #include <limits>
 
 #include "DataMgr/BufferMgr/Buffer.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 #include "Shared/measure.h"
 
 using namespace std;
@@ -45,23 +45,33 @@ std::string BufferMgr::keyToString(const ChunkKey& key) {
 
 /// Allocates memSize bytes for the buffer pool and initializes the free memory map.
 BufferMgr::BufferMgr(const int device_id,
-                     const size_t max_buffer_size,
+                     const size_t max_buffer_pool_size,
+                     const size_t min_slab_size,
                      const size_t max_slab_size,
                      const size_t page_size,
                      AbstractBufferMgr* parent_mgr)
     : AbstractBufferMgr(device_id)
-    , page_size_(page_size)
+    , max_buffer_pool_size_(max_buffer_pool_size)
+    , min_slab_size_(min_slab_size)
     , max_slab_size_(max_slab_size)
-    , max_buffer_size_(max_buffer_size)
+    , page_size_(page_size)
     , num_pages_allocated_(0)
     , allocations_capped_(false)
     , parent_mgr_(parent_mgr)
     , max_buffer_id_(0)
     , buffer_epoch_(0) {
-  CHECK(max_buffer_size_ > 0 && max_slab_size_ > 0 && page_size_ > 0 &&
-        max_slab_size_ % page_size_ == 0);
-  max_num_pages_ = max_buffer_size_ / page_size_;
+  CHECK(max_buffer_pool_size_ > 0);
+  CHECK(page_size_ > 0);
+  // TODO change checks on run-time configurable slab size variables to exceptions
+  CHECK(min_slab_size_ > 0);
+  CHECK(max_slab_size_ > 0);
+  CHECK(min_slab_size_ <= max_slab_size_);
+  CHECK(min_slab_size_ % page_size_ == 0);
+  CHECK(max_slab_size_ % page_size_ == 0);
+
+  max_buffer_pool_num_pages_ = max_buffer_pool_size_ / page_size_;
   max_num_pages_per_slab_ = max_slab_size_ / page_size_;
+  min_num_pages_per_slab_ = min_slab_size_ / page_size_;
   current_max_slab_page_size_ =
       max_num_pages_per_slab_;  // current_max_slab_page_size_ will drop as allocations
                                 // fail - this is the high water mark
@@ -279,9 +289,9 @@ BufferList::iterator BufferMgr::findFreeBuffer(size_t num_bytes) {
 
   // If we're here then we didn't find a free segment of sufficient size
   // First we see if we can add another slab
-  while (!allocations_capped_ && num_pages_allocated_ < max_num_pages_) {
+  while (!allocations_capped_ && num_pages_allocated_ < max_buffer_pool_num_pages_) {
     try {
-      size_t pagesLeft = max_num_pages_ - num_pages_allocated_;
+      size_t pagesLeft = max_buffer_pool_num_pages_ - num_pages_allocated_;
       if (pagesLeft < current_max_slab_page_size_) {
         current_max_slab_page_size_ = pagesLeft;
       }
@@ -317,11 +327,11 @@ BufferList::iterator BufferMgr::findFreeBuffer(size_t num_bytes) {
       } else {
         current_max_slab_page_size_ /= 2;
         if (current_max_slab_page_size_ <
-            (max_num_pages_per_slab_ / 8)) {  // should be a constant
+            (min_num_pages_per_slab_)) {  // should be a constant
           allocations_capped_ = true;
           // dump out the slabs and their sizes
           LOG(INFO) << "ALLOCATION Capped " << current_max_slab_page_size_
-                    << " Minimum size = " << (max_num_pages_per_slab_ / 8) << " "
+                    << " Minimum size = " << (min_num_pages_per_slab_) << " "
                     << getStringMgrType() << ":" << device_id_;
         }
       }
@@ -476,7 +486,7 @@ void BufferMgr::clearSlabs() {
 
 // return the maximum size this buffer can be in bytes
 size_t BufferMgr::getMaxSize() {
-  return page_size_ * max_num_pages_;
+  return page_size_ * max_buffer_pool_num_pages_;
 }
 
 // return how large the buffer are currently allocated
@@ -663,7 +673,7 @@ void BufferMgr::checkpoint() {
   for (auto& chunk_itr : chunk_index_) {
     // checks that buffer is actual chunk (not just buffer) and is dirty
     auto& buffer_itr = chunk_itr.second;
-    if (buffer_itr->chunk_key[0] != -1 && buffer_itr->buffer->is_dirty_) {
+    if (buffer_itr->chunk_key[0] != -1 && buffer_itr->buffer->isDirty()) {
       parent_mgr_->putBuffer(buffer_itr->chunk_key, buffer_itr->buffer);
       buffer_itr->buffer->clearDirtyBits();
     }
@@ -689,7 +699,7 @@ void BufferMgr::checkpoint(const int db_id, const int tb_id) {
                      key_prefix.begin(),
                      key_prefix.end()) != buffer_it->first.begin() + key_prefix.size()) {
     if (buffer_it->second->chunk_key[0] != -1 &&
-        buffer_it->second->buffer->is_dirty_) {  // checks that buffer is actual chunk
+        buffer_it->second->buffer->isDirty()) {  // checks that buffer is actual chunk
                                                  // (not just buffer) and is dirty
 
       parent_mgr_->putBuffer(buffer_it->second->chunk_key, buffer_it->second->buffer);
@@ -768,24 +778,8 @@ void BufferMgr::fetchBuffer(const ChunkKey& key,
     }
     sized_segs_lock.unlock();
   }
-  size_t chunk_size = num_bytes == 0 ? buffer->size() : num_bytes;
   lock.unlock();
-  dest_buffer->reserve(chunk_size);
-  if (buffer->isUpdated()) {
-    buffer->read(dest_buffer->getMemoryPtr(),
-                 chunk_size,
-                 0,
-                 dest_buffer->getType(),
-                 dest_buffer->getDeviceId());
-  } else {
-    buffer->read(dest_buffer->getMemoryPtr() + dest_buffer->size(),
-                 chunk_size - dest_buffer->size(),
-                 dest_buffer->size(),
-                 dest_buffer->getType(),
-                 dest_buffer->getDeviceId());
-  }
-  dest_buffer->setSize(chunk_size);
-  dest_buffer->syncEncoder(buffer);
+  buffer->copyTo(dest_buffer, num_bytes);
   buffer->unPin();
 }
 
@@ -820,6 +814,8 @@ AbstractBuffer* BufferMgr::putBuffer(const ChunkKey& key,
                    new_buffer_size - old_buffer_size,
                    src_buffer->getType(),
                    src_buffer->getDeviceId());
+  } else {
+    UNREACHABLE();
   }
   src_buffer->clearDirtyBits();
   buffer->syncEncoder(src_buffer);
@@ -857,15 +853,11 @@ size_t BufferMgr::size() {
 }
 
 size_t BufferMgr::getMaxBufferSize() {
-  return max_buffer_size_;
+  return max_buffer_pool_size_;
 }
 
 size_t BufferMgr::getMaxSlabSize() {
   return max_slab_size_;
-}
-
-void BufferMgr::getChunkMetadataVec(ChunkMetadataVector& chunk_metadata_vec) {
-  LOG(FATAL) << "getChunkMetadataVec not supported for BufferMgr.";
 }
 
 void BufferMgr::getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunk_metadata_vec,

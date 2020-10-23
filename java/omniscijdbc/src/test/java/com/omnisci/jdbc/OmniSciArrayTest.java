@@ -10,6 +10,7 @@ import org.junit.Test;
 import java.math.BigDecimal;
 import java.sql.*;
 import java.util.Properties;
+import java.util.TimeZone;
 
 // Create Array and validate
 // Insert arrays and validate it is the same
@@ -39,6 +40,7 @@ public class OmniSciArrayTest {
     pt.setProperty("user", user);
     pt.setProperty("password", password);
     m_conn = DriverManager.getConnection(url, pt);
+    TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
   }
 
   @After
@@ -107,7 +109,7 @@ public class OmniSciArrayTest {
     ps.setArray(4, m_conn.createArrayOf("DECIMAL", da));
     ps.setArray(5, m_conn.createArrayOf("STR", sa));
     ps.setArray(6, m_conn.createArrayOf("TIMESTAMP", ta));
-    assertEquals(ps.executeUpdate(), 1);
+    ps.executeUpdate();
 
     ResultSet rs = stmt.executeQuery("SELECT i, ia, fa, da, sa, ta FROM arrays_tbl");
     assertTrue(rs.next());

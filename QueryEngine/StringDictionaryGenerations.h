@@ -14,27 +14,23 @@
  * limitations under the License.
  */
 
-#ifndef QUERYENGINE_STRINGDICTIONARYGENERATION_H
-#define QUERYENGINE_STRINGDICTIONARYGENERATION_H
+#pragma once
 
-#include <unistd.h>
 #include <cstdint>
 #include <unordered_map>
 
 class StringDictionaryGenerations {
  public:
-  void setGeneration(const uint32_t id, const size_t generation);
+  void setGeneration(const uint32_t id, const uint64_t generation);
 
-  void updateGeneration(const uint32_t id, const size_t generation);
+  void updateGeneration(const uint32_t id, const uint64_t generation);
 
-  ssize_t getGeneration(const uint32_t id) const;
+  int64_t getGeneration(const uint32_t id) const;
 
-  const std::unordered_map<uint32_t, size_t>& asMap() const;
+  const std::unordered_map<uint32_t, uint64_t>& asMap() const;
 
   void clear();
 
  private:
-  std::unordered_map<uint32_t, size_t> id_to_generation_;
+  std::unordered_map<uint32_t, uint64_t> id_to_generation_;
 };
-
-#endif  // QUERYENGINE_STRINGDICTIONARYGENERATION_H

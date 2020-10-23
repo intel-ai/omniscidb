@@ -77,6 +77,7 @@ struct RelAlgExecutionUnit {
 };
 
 std::ostream& operator<<(std::ostream& os, const RelAlgExecutionUnit& ra_exe_unit);
+std::string ra_exec_unit_desc_for_caching(const RelAlgExecutionUnit& ra_exe_unit);
 
 struct TableFunctionExecutionUnit {
   const std::vector<InputDescriptor> input_descs;
@@ -86,6 +87,15 @@ struct TableFunctionExecutionUnit {
   std::vector<Analyzer::Expr*> target_exprs;
   const std::optional<size_t> output_buffer_multiplier;
   const std::string table_func_name;
+
+ public:
+  std::string toString() const {
+    return typeName(this) + "(" + "input_exprs=" + ::toString(input_exprs) +
+           ", table_func_inputs=" + ::toString(table_func_inputs) +
+           ", target_exprs=" + ::toString(target_exprs) +
+           ", output_buffer_multiplier=" + ::toString(output_buffer_multiplier) +
+           ", table_func_name=" + ::toString(table_func_name) + ")";
+  }
 };
 
 class ResultSet;

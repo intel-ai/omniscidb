@@ -51,7 +51,6 @@
 #include "Catalog/TableDescriptor.h"
 #include "Catalog/Types.h"
 #include "DataMgr/DataMgr.h"
-#include "LockMgr/LockMgrImpl.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "Shared/mapd_shared_mutex.h"
 #include "SqliteConnector/SqliteConnector.h"
@@ -76,6 +75,18 @@ class TableArchiver;
   (SPIMAP_MAGIC1 + (unsigned)(SPIMAP_MAGIC2 * ((c) + 1) + (i)))
 
 namespace Catalog_Namespace {
+struct TableEpochInfo {
+  int32_t table_id, table_epoch, leaf_index{-1};
+
+  TableEpochInfo(const int32_t table_id_param, const int32_t table_epoch_param)
+      : table_id(table_id_param), table_epoch(table_epoch_param) {}
+  TableEpochInfo(const int32_t table_id_param,
+                 const int32_t table_epoch_param,
+                 const size_t leaf_index_param)
+      : table_id(table_id_param)
+      , table_epoch(table_epoch_param)
+      , leaf_index(leaf_index_param) {}
+};
 
 /**
  * @type Catalog
@@ -131,6 +142,9 @@ class Catalog final {
   void addColumn(const TableDescriptor& td, ColumnDescriptor& cd);
   void dropColumn(const TableDescriptor& td, const ColumnDescriptor& cd);
   void removeChunks(const int table_id);
+  void removeFragmenterForTable(const int table_id);
+
+  const std::map<int, const ColumnDescriptor*> getDictionaryToColumnMapping();
 
   /**
    * @brief Returns a pointer to a const TableDescriptor struct matching
@@ -144,11 +158,13 @@ class Catalog final {
                                              const bool populateFragmenter = true) const;
   const TableDescriptor* getMetadataForTableImpl(int tableId,
                                                  const bool populateFragmenter) const;
-  const TableDescriptor* getMetadataForTable(int tableId) const;
+  const TableDescriptor* getMetadataForTable(int tableId,
+                                             bool populateFragmenter = true) const;
 
   const ColumnDescriptor* getMetadataForColumn(int tableId,
                                                const std::string& colName) const;
   const ColumnDescriptor* getMetadataForColumn(int tableId, int columnId) const;
+  const ColumnDescriptor* getMetadataForColumnUnlocked(int tableId, int columnId) const;
 
   const int getColumnIdBySpi(const int tableId, const size_t spi) const;
   const ColumnDescriptor* getMetadataForColumnBySpi(const int tableId,
@@ -156,13 +172,15 @@ class Catalog final {
 
   const DashboardDescriptor* getMetadataForDashboard(const std::string& userId,
                                                      const std::string& dashName) const;
-  void deleteMetadataForDashboard(const std::string& userId, const std::string& dashName);
 
   const DashboardDescriptor* getMetadataForDashboard(const int32_t dashboard_id) const;
-  void deleteMetadataForDashboard(const int32_t dashboard_id);
+  void deleteMetadataForDashboards(const std::vector<int32_t> ids,
+                                   const UserMetadata& user);
 
   const LinkDescriptor* getMetadataForLink(const std::string& link) const;
   const LinkDescriptor* getMetadataForLink(int linkId) const;
+
+  const foreign_storage::ForeignTable* getForeignTableUnlocked(int tableId) const;
 
   /**
    * @brief Returns a list of pointers to constant ColumnDescriptor structs for all the
@@ -177,6 +195,14 @@ class Catalog final {
       const bool fetchSystemColumns,
       const bool fetchVirtualColumns,
       const bool fetchPhysicalColumns) const;
+  /**
+   * Same as above, but without first taking a catalog read lock.
+   */
+  std::list<const ColumnDescriptor*> getAllColumnMetadataForTableUnlocked(
+      const int tableId,
+      const bool fetchSystemColumns,
+      const bool fetchVirtualColumns,
+      const bool fetchPhysicalColumns) const;
 
   std::list<const TableDescriptor*> getAllTableMetadata() const;
   std::list<const DashboardDescriptor*> getAllDashboardsMetadata() const;
@@ -186,6 +212,7 @@ class Catalog final {
   const std::string& getBasePath() const { return basePath_; }
 
   const DictDescriptor* getMetadataForDict(int dict_ref, bool loadDict = true) const;
+  const DictDescriptor* getMetadataForDictUnlocked(int dict_ref, bool loadDict) const;
 
   const std::vector<LeafHostInfo>& getStringDictionaryHosts() const;
 
@@ -208,6 +235,12 @@ class Catalog final {
 
   int32_t getTableEpoch(const int32_t db_id, const int32_t table_id) const;
   void setTableEpoch(const int db_id, const int table_id, const int new_epoch);
+
+  std::vector<TableEpochInfo> getTableEpochs(const int32_t db_id,
+                                             const int32_t table_id) const;
+  void setTableEpochs(const int32_t db_id,
+                      const std::vector<TableEpochInfo>& table_epochs);
+
   int getDatabaseId() const { return currentDB_.dbId; }
   SqliteConnector& getSqliteConnector() { return sqliteConnector_; }
   void roll(const bool forward);
@@ -219,6 +252,7 @@ class Catalog final {
   static void set(const std::string& dbName, std::shared_ptr<Catalog> cat);
   static std::shared_ptr<Catalog> get(const std::string& dbName);
   static std::shared_ptr<Catalog> get(const int32_t db_id);
+  static std::shared_ptr<Catalog> checkedGet(const int32_t db_id);
   static std::shared_ptr<Catalog> get(const std::string& basePath,
                                       std::shared_ptr<ForeignStorageInterface> fsi,
                                       const DBMetadata& curDB,
@@ -253,6 +287,24 @@ class Catalog final {
                               bool dump_defaults = false) const;
 
   /**
+   * Gets the DDL statement used to create a foreign table schema.
+   *
+   * @param if_not_exists - flag that indicates whether or not to include
+   * the "IF NOT EXISTS" phrase in the DDL statement
+   * @return string containing DDL statement
+   */
+  static const std::string getForeignTableSchema(bool if_not_exists = false);
+
+  /**
+   * Gets the DDL statement used to create a foreign server schema.
+   *
+   * @param if_not_exists - flag that indicates whether or not to include
+   * the "IF NOT EXISTS" phrase in the DDL statement
+   * @return string containing DDL statement
+   */
+  static const std::string getForeignServerSchema(bool if_not_exists = false);
+
+  /**
    * Creates a new foreign server DB object.
    *
    * @param foreign_server - unique pointer to struct containing foreign server details
@@ -275,15 +327,15 @@ class Catalog final {
       const std::string& server_name) const;
 
   /**
-   * Gets a pointer to a struct containing foreign server details.
-   * Skip in-memory cache of foreign server struct when attempting to fetch foreign server
-   * details. This is mainly used for testing.
+   * Gets a pointer to a struct containing foreign server details fetched from storage.
+   * This is mainly used for testing when asserting that expected catalog data is
+   * persisted.
    *
    * @param server_name - Name of foreign server whose details will be fetched
    * @return pointer to a struct containing foreign server details. nullptr is returned if
    * no foreign server exists with the given name
    */
-  const foreign_storage::ForeignServer* getForeignServerSkipCache(
+  const std::unique_ptr<const foreign_storage::ForeignServer> getForeignServerFromStorage(
       const std::string& server_name);
 
   /**
@@ -347,6 +399,35 @@ class Catalog final {
    */
   void createDefaultServersIfNotExists();
 
+  /**
+   * Validates that a table or view with given name does not already exist.
+   * An exception is thrown if a table or view with given name already exists and
+   * "if_not_exists" is false.
+   *
+   * @param name - Name of table or view whose existence is checked
+   * @param if_not_exists - flag indicating whether or not existence of a table or view
+   * with given name is an exception
+   * @return true if table or view with name does not exist. Otherwise, return false
+   */
+  bool validateNonExistentTableOrView(const std::string& name, const bool if_not_exists);
+
+  /**
+   * Gets all the foreign tables that are pending refreshes. The list of tables
+   * includes tables that are configured for scheduled refreshes with next
+   * refresh timestamps that are in the past.
+   *
+   * @return foreign tables pending refreshes
+   */
+  std::vector<const TableDescriptor*> getAllForeignTablesForRefresh() const;
+
+  /**
+   * Updates the last and next (if applicable) refresh times of the foreign table
+   * with the given table id.
+   *
+   * @param table_id - id of table to apply updates to
+   */
+  void updateForeignTableRefreshTimes(const int32_t table_id);
+
  protected:
   void CheckAndExecuteMigrations();
   void CheckAndExecuteMigrationsPostBuildMaps();
@@ -396,11 +477,11 @@ class Catalog final {
   void doTruncateTable(const TableDescriptor* td);
   void renamePhysicalTable(const TableDescriptor* td, const std::string& newTableName);
   void instantiateFragmenter(TableDescriptor* td) const;
-  void getAllColumnMetadataForTable(const TableDescriptor* td,
-                                    std::list<const ColumnDescriptor*>& colDescs,
-                                    const bool fetchSystemColumns,
-                                    const bool fetchVirtualColumns,
-                                    const bool fetchPhysicalColumns) const;
+  void getAllColumnMetadataForTableImpl(const TableDescriptor* td,
+                                        std::list<const ColumnDescriptor*>& colDescs,
+                                        const bool fetchSystemColumns,
+                                        const bool fetchVirtualColumns,
+                                        const bool fetchPhysicalColumns) const;
   std::string calculateSHA1(const std::string& data);
   std::string generatePhysicalTableName(const std::string& logicalTableName,
                                         const int32_t& shardNumber);

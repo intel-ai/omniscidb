@@ -2,7 +2,7 @@
 Logger
 ======
 
-``#include "Shared/Logger.h"``
+``#include "Logger/Logger.h"``
 
 The OmniSci Logger is based on `Boost.Log`_ with a design goal of being largely, though not completely, backward
 compatible with `glog`_ in usage, but with additional control over the logging format and other features.
@@ -47,7 +47,7 @@ Program Options
                                           WARNING ERROR FATAL
     --log-severity-clog arg (=ERROR)      Log to console severity level: INFO
                                           WARNING ERROR FATAL
-    --log-channels arg                    Log channel debug info: IR PTX
+    --log-channels arg                    Log channel debug info: IR PTX ASM
     --log-auto-flush arg (=1)              Flush logging buffer to file after each
                                           message.
     --log-max-files arg (=100)             Maximum number of log files to keep.
@@ -161,11 +161,11 @@ Format
 
 The general format of a log entry is::
 
-    (timestamp) (severity) (process_id) (filename:line_number) (message)
+    (timestamp) (severity) (process_id) (thread_id) (filename:line_number) (message)
 
 Example::
 
-    2019-09-18T16:25:25.659248 I 26481 DBHandler.cpp:181 OmniSci Server 4.9.0dev-20190918-bd97353685
+    2019-09-18T16:25:25.659248 I 26481 5 DBHandler.cpp:181 OmniSci Server 4.9.0dev-20190918-bd97353685
 
 Field descriptions:
 
@@ -173,9 +173,10 @@ Field descriptions:
 | 2. Single-character severity level. In same order as above severity levels:
 |    ``F`` ``E`` ``W`` ``I`` ``1`` ``2`` ``3`` ``4``
 |    For instance the ``I`` implies that the above log entry is of ``INFO`` severity.
-| 3. The process id assigned by the operating system.
-| 4. Source filename:Line number.
-| 5. Custom message sent to ``LOG()`` via the insertion ``<<`` operator.
+| 3. The `process_id` assigned by the operating system.
+| 4. The `thread_id` is a unique 64-bit integer incrementally assigned to each new thread. `thread_id=1` is assigned to the first thread each time the program starts.
+| 5. Source filename:Line number.
+| 6. Custom message sent to ``LOG()`` via the insertion ``<<`` operator.
 
 Note that log entries can contain line breaks, thus not all log lines will begin with these fields if
 the message itself contains multiple lines.
@@ -186,7 +187,7 @@ Channel
 Channels are similar to severities, but exist outside of the severity hierarchy, have no ordering of their own,
 and can only be activated by explicitly including them in the ``--log-channels`` program option.
 
-Currently there are 2 channels: ``IR`` ``PTX``
+Currently there are 3 channels: ``IR`` ``PTX`` ``ASM``
 
 which log intermediate representation, and parallel thread execution code, respectively. Scripts may be
 used for other purposes that parse and analyze these logs, therefore using channels outside of the severity
@@ -226,7 +227,7 @@ STDLOG
 ``DBHandler`` uses a logging helper class ``StdLog`` for logging query-specific information in
 a standard format::
 
- (timestamp) (severity) (process_id) (filename:line_number) stdlog (function_name) (match_id)
+ (timestamp) (severity) (process_id) (thread_id) (filename:line_number) stdlog (function_name) (match_id)
  (time_ms) (username) (dbname) (public_session_id) (array of names) (array of values)
 
 Since this contains timing information, it is logged at the end of query execution.  If the ``DEBUG1`` severity is

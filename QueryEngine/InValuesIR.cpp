@@ -18,9 +18,11 @@
 #include "Execute.h"
 
 #include <future>
+#include <memory>
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::InValues* expr,
                                     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto in_arg = expr->get_arg();
   if (is_unnest(in_arg)) {
     throw std::runtime_error("IN not supported for unnested expressions");
@@ -69,6 +71,7 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InValues* expr,
 
 llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set,
                                     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto in_arg = in_integer_set->get_arg();
   if (is_unnest(in_arg)) {
     throw std::runtime_error("IN not supported for unnested expressions");
@@ -82,7 +85,7 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set
         "IN subquery with many right-hand side values not supported when literal "
         "hoisting is disabled");
   }
-  auto in_vals_bitmap = boost::make_unique<InValuesBitmap>(
+  auto in_vals_bitmap = std::make_unique<InValuesBitmap>(
       in_integer_set->get_value_list(),
       needle_null_val,
       co.device_type == ExecutorDeviceType::GPU ? Data_Namespace::GPU_LEVEL
@@ -108,6 +111,7 @@ llvm::Value* CodeGenerator::codegen(const Analyzer::InIntegerSet* in_integer_set
 std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
     const Analyzer::InValues* in_values,
     const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_);
   const auto& value_list = in_values->get_value_list();
   const auto val_count = value_list.size();
   const auto& ti = in_values->get_arg()->get_type_info();
@@ -155,7 +159,8 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
               out_vals.push_back(string_id);
             }
           } else {
-            out_vals.push_back(codegenIntConst(in_val_const)->getSExtValue());
+            out_vals.push_back(CodeGenerator::codegenIntConst(in_val_const, cgen_state_)
+                                   ->getSExtValue());
           }
         }
         return true;
@@ -185,13 +190,13 @@ std::unique_ptr<InValuesBitmap> CodeGenerator::createInValuesBitmap(
       }
     }
     try {
-      return boost::make_unique<InValuesBitmap>(values,
-                                                needle_null_val,
-                                                co.device_type == ExecutorDeviceType::GPU
-                                                    ? Data_Namespace::GPU_LEVEL
-                                                    : Data_Namespace::CPU_LEVEL,
-                                                executor()->deviceCount(co.device_type),
-                                                &executor()->getCatalog()->getDataMgr());
+      return std::make_unique<InValuesBitmap>(values,
+                                              needle_null_val,
+                                              co.device_type == ExecutorDeviceType::GPU
+                                                  ? Data_Namespace::GPU_LEVEL
+                                                  : Data_Namespace::CPU_LEVEL,
+                                              executor()->deviceCount(co.device_type),
+                                              &executor()->getCatalog()->getDataMgr());
     } catch (...) {
       return nullptr;
     }

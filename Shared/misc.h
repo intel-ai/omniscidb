@@ -17,8 +17,12 @@
 #ifndef SHARED_MISC_H
 #define SHARED_MISC_H
 
+#include <cstdint>
 #include <deque>
+#include <iterator>
 #include <list>
+#include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace shared {
@@ -64,11 +68,15 @@ PrintContainer<CONTAINER> printContainer(CONTAINER& container) {
 template <typename CONTAINER>
 struct is_std_container : std::false_type {};
 template <typename T, typename A>
-struct is_std_container<std::vector<T, A> > : std::true_type {};
+struct is_std_container<std::deque<T, A> > : std::true_type {};
 template <typename T, typename A>
 struct is_std_container<std::list<T, A> > : std::true_type {};
 template <typename T, typename A>
-struct is_std_container<std::deque<T, A> > : std::true_type {};
+struct is_std_container<std::set<T, A> > : std::true_type {};
+template <typename T, typename A>
+struct is_std_container<std::unordered_set<T, A> > : std::true_type {};
+template <typename T, typename A>
+struct is_std_container<std::vector<T, A> > : std::true_type {};
 
 template <typename OSTREAM, typename CONTAINER>
 OSTREAM& operator<<(OSTREAM& os, PrintContainer<CONTAINER> pc) {
@@ -91,6 +99,48 @@ OSTREAM& operator<<(OSTREAM& os, PrintContainer<CONTAINER> pc) {
     }
     return os << ')';
   }
+}
+
+// Same as strftime(buf, max, "%F", tm) but guarantees that the year is
+// zero-padded to a minimum length of 4. Return the number of characters
+// written, not including null byte. If max is not large enough, return 0.
+size_t formatDate(char* buf, size_t const max, int64_t const unixtime);
+
+// Same as strftime(buf, max, "%F %T", tm) but guarantees that the year is
+// zero-padded to a minimum length of 4. Return the number of characters
+// written, not including null byte. If max is not large enough, return 0.
+// Requirement: 0 <= dimension <= 9.
+size_t formatDateTime(char* buf,
+                      size_t const max,
+                      int64_t const timestamp,
+                      int const dimension);
+
+// Write unixtime in seconds since epoch as "HH:MM:SS" format.
+size_t formatHMS(char* buf, size_t const max, int64_t const unixtime);
+
+// Result of division where quot is floored and rem is unsigned.
+struct DivUMod {
+  int64_t quot;
+  int64_t rem;
+};
+
+// Requirement: 0 < den
+inline DivUMod divUMod(int64_t num, int64_t den) {
+  DivUMod div{num / den, num % den};
+  if (div.rem < 0) {
+    --div.quot;
+    div.rem += den;
+  }
+  return div;
+}
+
+// Requirement: 0 < den.
+inline uint64_t unsignedMod(int64_t num, int64_t den) {
+  int64_t mod = num % den;
+  if (mod < 0) {
+    mod += den;
+  }
+  return mod;
 }
 
 }  // namespace shared

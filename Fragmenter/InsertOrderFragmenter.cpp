@@ -29,7 +29,7 @@
 #include "DataMgr/AbstractBuffer.h"
 #include "DataMgr/DataMgr.h"
 #include "LockMgr/LockMgr.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/thread_count.h"
 
@@ -39,6 +39,8 @@
 using Chunk_NS::Chunk;
 using Data_Namespace::AbstractBuffer;
 using Data_Namespace::DataMgr;
+
+bool g_use_table_device_offset{true};
 
 using namespace std;
 
@@ -89,6 +91,24 @@ InsertOrderFragmenter::InsertOrderFragmenter(
 
 InsertOrderFragmenter::~InsertOrderFragmenter() {}
 
+namespace {
+
+/**
+ * Offset the fragment ID by the table ID, meaning single fragment tables end up balanced
+ * across multiple GPUs instead of all falling to GPU 0.
+ */
+int compute_device_for_fragment(const int table_id,
+                                const int fragment_id,
+                                const int num_devices) {
+  if (g_use_table_device_offset) {
+    return (table_id + fragment_id) % num_devices;
+  } else {
+    return fragment_id % num_devices;
+  }
+}
+
+}  // namespace
+
 void InsertOrderFragmenter::getChunkMetadata() {
   if (uses_foreign_storage_ ||
       defaultInsertLevel_ == Data_Namespace::MemoryLevel::DISK_LEVEL) {
@@ -120,7 +140,8 @@ void InsertOrderFragmenter::getChunkMetadata() {
         new_fragment_info->setPhysicalNumTuples(chunk_itr->second->numElements);
         numTuples_ += new_fragment_info->getPhysicalNumTuples();
         for (const auto level_size : dataMgr_->levelSizes_) {
-          new_fragment_info->deviceIds.push_back(cur_fragment_id % level_size);
+          new_fragment_info->deviceIds.push_back(
+              compute_device_for_fragment(physicalTableId_, cur_fragment_id, level_size));
         }
         new_fragment_info->shadowNumTuples = new_fragment_info->getPhysicalNumTuples();
         new_fragment_info->physicalTableId = physicalTableId_;
@@ -143,16 +164,17 @@ void InsertOrderFragmenter::getChunkMetadata() {
     }
   }
 
-  ssize_t maxFixedColSize = 0;
+  size_t maxFixedColSize = 0;
 
   for (auto colIt = columnMap_.begin(); colIt != columnMap_.end(); ++colIt) {
-    ssize_t size = colIt->second.getColumnDesc()->columnType.get_size();
+    auto size = colIt->second.getColumnDesc()->columnType.get_size();
     if (size == -1) {  // variable length
       varLenColInfo_.insert(std::make_pair(colIt->first, 0));
       size = 8;  // b/c we use this for string and array indices - gross to have magic
                  // number here
     }
-    maxFixedColSize = std::max(maxFixedColSize, size);
+    CHECK_GE(size, 0);
+    maxFixedColSize = std::max(maxFixedColSize, static_cast<size_t>(size));
   }
 
   // this is maximum number of rows assuming everything is fixed length
@@ -238,6 +260,19 @@ void InsertOrderFragmenter::deleteFragments(const vector<int>& dropFragIds) {
   }
 }
 
+void InsertOrderFragmenter::updateColumnChunkMetadata(
+    const ColumnDescriptor* cd,
+    const int fragment_id,
+    const std::shared_ptr<ChunkMetadata> metadata) {
+  // synchronize concurrent accesses to fragmentInfoVec_
+  mapd_unique_lock<mapd_shared_mutex> writeLock(fragmentInfoMutex_);
+
+  CHECK(metadata.get());
+  auto fragment_info = getFragmentInfo(fragment_id);
+  CHECK(fragment_info);
+  fragment_info->setChunkMetadata(cd->columnId, metadata);
+}
+
 void InsertOrderFragmenter::updateChunkStats(
     const ColumnDescriptor* cd,
     std::unordered_map</*fragment_id*/ int, ChunkStats>& stats_map) {
@@ -275,10 +310,10 @@ void InsertOrderFragmenter::updateChunkStats(
                                              chunk_meta_it->second->numElements);
       auto buf = chunk->getBuffer();
       CHECK(buf);
-      auto encoder = buf->encoder.get();
-      if (!encoder) {
-        throw std::runtime_error("No encoder for chunk " + showChunk(chunk_key));
+      if (!buf->hasEncoder()) {
+        throw std::runtime_error("No encoder for chunk " + show_chunk(chunk_key));
       }
+      auto encoder = buf->getEncoder();
 
       auto chunk_stats = stats_itr->second;
 
@@ -292,7 +327,7 @@ void InsertOrderFragmenter::updateChunkStats(
                                   ? SQLTypeInfo(kBIGINT)
                                   : get_logical_type_info(cd->columnType);
       if (!didResetStats) {
-        VLOG(3) << "Skipping chunk stats reset for " << showChunk(chunk_key);
+        VLOG(3) << "Skipping chunk stats reset for " << show_chunk(chunk_key);
         VLOG(3) << "Max: " << DatumToString(old_chunk_stats.max, logical_ti) << " -> "
                 << DatumToString(chunk_stats.max, logical_ti);
         VLOG(3) << "Min: " << DatumToString(old_chunk_stats.min, logical_ti) << " -> "
@@ -301,7 +336,7 @@ void InsertOrderFragmenter::updateChunkStats(
         continue;  // move to next fragment
       }
 
-      VLOG(2) << "Resetting chunk stats for " << showChunk(chunk_key);
+      VLOG(2) << "Resetting chunk stats for " << show_chunk(chunk_key);
       VLOG(2) << "Max: " << DatumToString(old_chunk_stats.max, logical_ti) << " -> "
               << DatumToString(chunk_stats.max, logical_ti);
       VLOG(2) << "Min: " << DatumToString(old_chunk_stats.min, logical_ti) << " -> "
@@ -666,7 +701,8 @@ FragmentInfo* InsertOrderFragmenter::createNewFragment(
   newFragmentInfo->shadowNumTuples = 0;
   newFragmentInfo->setPhysicalNumTuples(0);
   for (const auto levelSize : dataMgr_->levelSizes_) {
-    newFragmentInfo->deviceIds.push_back(newFragmentInfo->fragmentId % levelSize);
+    newFragmentInfo->deviceIds.push_back(compute_device_for_fragment(
+        physicalTableId_, newFragmentInfo->fragmentId, levelSize));
   }
   newFragmentInfo->physicalTableId = physicalTableId_;
   newFragmentInfo->shard = shard_;

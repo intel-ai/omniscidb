@@ -45,6 +45,10 @@ Debug/
 .vscode/
 *.code-workspace
 
+# VS settings files
+.vs
+CMakeSettings.json
+
 # VIM editor files
 .*.swp
 
@@ -84,4 +88,7 @@ data/
 # IntelliJ/CLion settings files
 .idea
 *.iml
-.ccls-cache
+=======
+
+# Python
+*.egg-info/

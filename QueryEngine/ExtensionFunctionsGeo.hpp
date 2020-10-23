@@ -1,13 +1,4 @@
-#define COMPRESSION_NONE 0
-#define COMPRESSION_GEOINT32 1
-#define COMPRESSION_GEOBBINT32 2
-#define COMPRESSION_GEOBBINT16 3
-#define COMPRESSION_GEOBBINT8 4
-
-#define TOLERANCE_DEFAULT 0.000000001
-#define TOLERANCE_GEOINT32 0.0000001
-
-#include "../Shared/geo_compression_runtime.h"
+#include "Geospatial/CompressionRuntime.h"
 
 // Adjustable tolerance, determined by compression mode.
 // The criteria is to still recognize a compressed+decompressed number.
@@ -57,9 +48,9 @@ DEVICE ALWAYS_INLINE double decompress_coord(int8_t* data,
     auto compressed_coords = reinterpret_cast<int32_t*>(data);
     auto compressed_coord = compressed_coords[index];
     if (x) {
-      return Geo_namespace::decompress_longitude_coord_geoint32(compressed_coord);
+      return Geospatial::decompress_longitude_coord_geoint32(compressed_coord);
     } else {
-      return Geo_namespace::decompress_lattitude_coord_geoint32(compressed_coord);
+      return Geospatial::decompress_lattitude_coord_geoint32(compressed_coord);
     }
   }
   auto double_coords = reinterpret_cast<double*>(data);
@@ -1057,6 +1048,351 @@ double ST_Area_MultiPolygon_Geodesic(int8_t* mpoly_coords,
                               ic,
                               isr,
                               osr);
+}
+
+//
+// ST_Centroid
+//
+
+// Point centroid
+// - calculate average coordinates for all points
+// LineString centroid
+// - take midpoint of each line segment
+// - calculate average coordinates of all midpoints weighted by segment length
+// Polygon, MultiPolygon centroid, holes..
+// - weighted sum of centroids of triangles coming out of area decomposition
+//
+// On zero area fall back to linestring centroid
+// On zero length fall back to point centroid
+
+EXTENSION_NOINLINE
+double ST_Centroid_Point(int8_t* p,
+                         int64_t psize,
+                         int32_t ic,
+                         int32_t isr,
+                         int32_t osr,
+                         bool ycoord) {
+  if (ycoord) {
+    return coord_y(p, 1, ic, isr, osr);
+  }
+  return coord_x(p, 0, ic, isr, osr);
+}
+
+DEVICE ALWAYS_INLINE bool centroid_add_segment(double x1,
+                                               double y1,
+                                               double x2,
+                                               double y2,
+                                               double* length,
+                                               double* linestring_centroid_sum) {
+  double ldist = distance_point_point(x1, y1, x2, y2);
+  *length += ldist;
+  double segment_midpoint_x = (x1 + x2) / 2.0;
+  double segment_midpoint_y = (y1 + y2) / 2.0;
+  linestring_centroid_sum[0] += ldist * segment_midpoint_x;
+  linestring_centroid_sum[1] += ldist * segment_midpoint_y;
+  return true;
+}
+
+DEVICE ALWAYS_INLINE bool centroid_add_linestring(int8_t* l,
+                                                  int64_t lsize,
+                                                  int32_t ic,
+                                                  int32_t isr,
+                                                  int32_t osr,
+                                                  bool closed,
+                                                  double* total_length,
+                                                  double* linestring_centroid_sum,
+                                                  int64_t* num_points,
+                                                  double* point_centroid_sum) {
+  auto l_num_coords = lsize / compression_unit_size(ic);
+  double length = 0.0;
+  double l0x = coord_x(l, 0, ic, isr, osr);
+  double l0y = coord_y(l, 1, ic, isr, osr);
+  double l2x = l0x;
+  double l2y = l0y;
+  for (int32_t i = 2; i < l_num_coords; i += 2) {
+    double l1x = l2x;
+    double l1y = l2y;
+    l2x = coord_x(l, i, ic, isr, osr);
+    l2y = coord_y(l, i + 1, ic, isr, osr);
+    centroid_add_segment(l1x, l1y, l2x, l2y, &length, linestring_centroid_sum);
+  }
+  if (l_num_coords > 4 && closed) {
+    // Also add the closing segment between the last and the first points
+    centroid_add_segment(l2x, l2y, l0x, l0y, &length, linestring_centroid_sum);
+  }
+  *total_length += length;
+  if (length == 0.0 && l_num_coords > 0) {
+    *num_points += 1;
+    point_centroid_sum[0] += l0x;
+    point_centroid_sum[1] += l0y;
+  }
+  return true;
+}
+
+EXTENSION_NOINLINE
+double ST_Centroid_LineString(int8_t* coords,
+                              int64_t coords_sz,
+                              int32_t ic,
+                              int32_t isr,
+                              int32_t osr,
+                              bool ycoord) {
+  double length = 0.0;
+  double linestring_centroid_sum[2] = {0.0, 0.0};
+  int64_t num_points = 0;
+  double point_centroid_sum[2] = {0.0, 0.0};
+  centroid_add_linestring(coords,
+                          coords_sz,
+                          ic,
+                          isr,
+                          osr,
+                          false,  // not closed
+                          &length,
+                          &linestring_centroid_sum[0],
+                          &num_points,
+                          &point_centroid_sum[0]);
+  double linestring_centroid[2] = {0.0, 0.0};
+  if (length > 0) {
+    linestring_centroid[0] = linestring_centroid_sum[0] / length;
+    linestring_centroid[1] = linestring_centroid_sum[1] / length;
+  } else if (num_points > 0) {
+    linestring_centroid[0] = point_centroid_sum[0] / num_points;
+    linestring_centroid[1] = point_centroid_sum[1] / num_points;
+  }
+  if (ycoord) {
+    return linestring_centroid[1];
+  }
+  return linestring_centroid[0];
+}
+
+DEVICE ALWAYS_INLINE bool centroid_add_triangle(double x1,
+                                                double y1,
+                                                double x2,
+                                                double y2,
+                                                double x3,
+                                                double y3,
+                                                double sign,
+                                                double* total_area2,
+                                                double* cg3) {
+  double cx = x1 + x2 + x3;
+  double cy = y1 + y2 + y3;
+  double area2 = x1 * y2 - x2 * y1 + x3 * y1 - x1 * y3 + x2 * y3 - x3 * y2;
+  cg3[0] += sign * area2 * cx;
+  cg3[1] += sign * area2 * cy;
+  *total_area2 += sign * area2;
+  return true;
+}
+
+DEVICE ALWAYS_INLINE bool centroid_add_ring(int8_t* ring,
+                                            int64_t ringsize,
+                                            int32_t ic,
+                                            int32_t isr,
+                                            int32_t osr,
+                                            double sign,
+                                            double* total_area2,
+                                            double* cg3,
+                                            double* total_length,
+                                            double* linestring_centroid_sum,
+                                            int64_t* num_points,
+                                            double* point_centroid_sum) {
+  auto ring_num_coords = ringsize / compression_unit_size(ic);
+
+  if (ring_num_coords < 6) {
+    return false;
+  }
+
+  double x1 = coord_x(ring, 0, ic, isr, osr);
+  double y1 = coord_y(ring, 1, ic, isr, osr);
+  double x2 = coord_x(ring, 2, ic, isr, osr);
+  double y2 = coord_y(ring, 3, ic, isr, osr);
+  for (int32_t i = 4; i < ring_num_coords; i += 2) {
+    double x3 = coord_x(ring, i, ic, isr, osr);
+    double y3 = coord_y(ring, i + 1, ic, isr, osr);
+    centroid_add_triangle(x1, y1, x2, y2, x3, y3, sign, total_area2, cg3);
+    x2 = x3;
+    y2 = y3;
+  }
+
+  centroid_add_linestring(ring,
+                          ringsize,
+                          ic,
+                          isr,
+                          osr,
+                          true,  // closed
+                          total_length,
+                          linestring_centroid_sum,
+                          num_points,
+                          point_centroid_sum);
+  return true;
+}
+
+DEVICE ALWAYS_INLINE bool centroid_add_polygon(int8_t* poly_coords,
+                                               int64_t poly_coords_size,
+                                               int32_t* poly_ring_sizes,
+                                               int64_t poly_num_rings,
+                                               int32_t ic,
+                                               int32_t isr,
+                                               int32_t osr,
+                                               double* total_area2,
+                                               double* cg3,
+                                               double* total_length,
+                                               double* linestring_centroid_sum,
+                                               int64_t* num_points,
+                                               double* point_centroid_sum) {
+  if (poly_num_rings <= 0) {
+    return false;
+  }
+
+  auto ring_coords = poly_coords;
+
+  for (auto r = 0; r < poly_num_rings; r++) {
+    auto ring_coords_size = poly_ring_sizes[r] * 2 * compression_unit_size(ic);
+    // Shape - positive area, holes - negative areas
+    double sign = (r == 0) ? 1.0 : -1.0;
+    centroid_add_ring(ring_coords,
+                      ring_coords_size,
+                      ic,
+                      isr,
+                      osr,
+                      sign,
+                      total_area2,
+                      cg3,
+                      total_length,
+                      linestring_centroid_sum,
+                      num_points,
+                      point_centroid_sum);
+    // Advance to the next ring.
+    ring_coords += ring_coords_size;
+  }
+  return true;
+}
+
+EXTENSION_NOINLINE
+double ST_Centroid_Polygon(int8_t* poly_coords,
+                           int64_t poly_coords_size,
+                           int32_t* poly_ring_sizes,
+                           int64_t poly_num_rings,
+                           int32_t ic,
+                           int32_t isr,
+                           int32_t osr,
+                           bool ycoord) {
+  if (poly_num_rings <= 0) {
+    return 0.0;
+  }
+  double total_area2 = 0.0;
+  double cg3[2] = {0.0, 0.0};
+  double total_length = 0.0;
+  double linestring_centroid_sum[2] = {0.0, 0.0};
+  int64_t num_points = 0;
+  double point_centroid_sum[2] = {0.0, 0.0};
+  centroid_add_polygon(poly_coords,
+                       poly_coords_size,
+                       poly_ring_sizes,
+                       poly_num_rings,
+                       ic,
+                       isr,
+                       osr,
+                       &total_area2,
+                       &cg3[0],
+                       &total_length,
+                       &linestring_centroid_sum[0],
+                       &num_points,
+                       &point_centroid_sum[0]);
+
+  double x1 = coord_x(poly_coords, 0, ic, isr, osr);
+  double y1 = coord_y(poly_coords, 1, ic, isr, osr);
+  double poly_centroid[2] = {x1, y1};
+  if (total_area2 != 0.0) {
+    poly_centroid[0] = cg3[0] / 3 / total_area2;
+    poly_centroid[1] = cg3[1] / 3 / total_area2;
+  } else if (total_length > 0.0) {
+    // zero-area polygon, fall back to linear centroid
+    poly_centroid[0] = linestring_centroid_sum[0] / total_length;
+    poly_centroid[1] = linestring_centroid_sum[1] / total_length;
+  } else if (num_points > 0) {
+    // zero-area zero-length polygon, fall further back to point centroid
+    poly_centroid[0] = point_centroid_sum[0] / num_points;
+    poly_centroid[1] = point_centroid_sum[1] / num_points;
+  }
+
+  if (ycoord) {
+    return poly_centroid[1];
+  }
+  return poly_centroid[0];
+}
+
+EXTENSION_NOINLINE
+double ST_Centroid_MultiPolygon(int8_t* mpoly_coords,
+                                int64_t mpoly_coords_size,
+                                int32_t* mpoly_ring_sizes,
+                                int64_t mpoly_num_rings,
+                                int32_t* mpoly_poly_sizes,
+                                int64_t mpoly_num_polys,
+                                int32_t ic,
+                                int32_t isr,
+                                int32_t osr,
+                                bool ycoord) {
+  if (mpoly_num_rings <= 0 || mpoly_num_polys <= 0) {
+    return 0.0;
+  }
+
+  double total_area2 = 0.0;
+  double cg3[2] = {0.0, 0.0};
+  double total_length = 0.0;
+  double linestring_centroid_sum[2] = {0.0, 0.0};
+  int64_t num_points = 0;
+  double point_centroid_sum[2] = {0.0, 0.0};
+
+  // Set specific poly pointers as we move through the coords/ringsizes/polyrings arrays.
+  auto next_poly_coords = mpoly_coords;
+  auto next_poly_ring_sizes = mpoly_ring_sizes;
+
+  for (auto poly = 0; poly < mpoly_num_polys; poly++) {
+    auto poly_coords = next_poly_coords;
+    auto poly_ring_sizes = next_poly_ring_sizes;
+    auto poly_num_rings = mpoly_poly_sizes[poly];
+    // Count number of coords in all of poly's rings, advance ring size pointer.
+    int32_t poly_num_coords = 0;
+    for (auto ring = 0; ring < poly_num_rings; ring++) {
+      poly_num_coords += 2 * *next_poly_ring_sizes++;
+    }
+    auto poly_coords_size = poly_num_coords * compression_unit_size(ic);
+    next_poly_coords += poly_coords_size;
+
+    centroid_add_polygon(poly_coords,
+                         poly_coords_size,
+                         poly_ring_sizes,
+                         poly_num_rings,
+                         ic,
+                         isr,
+                         osr,
+                         &total_area2,
+                         &cg3[0],
+                         &total_length,
+                         &linestring_centroid_sum[0],
+                         &num_points,
+                         &point_centroid_sum[0]);
+  }
+
+  double x1 = coord_x(mpoly_coords, 0, ic, isr, osr);
+  double y1 = coord_y(mpoly_coords, 1, ic, isr, osr);
+  double mpoly_centroid[2] = {x1, y1};
+  if (total_area2 != 0.0) {
+    mpoly_centroid[0] = cg3[0] / 3 / total_area2;
+    mpoly_centroid[1] = cg3[1] / 3 / total_area2;
+  } else if (total_length > 0.0) {
+    // zero-area multipolygon, fall back to linear centroid
+    mpoly_centroid[0] = linestring_centroid_sum[0] / total_length;
+    mpoly_centroid[1] = linestring_centroid_sum[1] / total_length;
+  } else if (num_points > 0) {
+    // zero-area zero-length multipolygon, fall further back to point centroid
+    mpoly_centroid[0] = point_centroid_sum[0] / num_points;
+    mpoly_centroid[1] = point_centroid_sum[1] / num_points;
+  }
+
+  if (ycoord) {
+    return mpoly_centroid[1];
+  }
+  return mpoly_centroid[0];
 }
 
 EXTENSION_INLINE

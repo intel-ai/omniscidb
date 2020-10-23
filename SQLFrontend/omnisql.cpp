@@ -47,15 +47,16 @@
 #include <thrift/transport/TBufferTransports.h>
 #include <thrift/transport/TSocket.h>
 #include "../Fragmenter/InsertOrderFragmenter.h"
+#include "Logger/Logger.h"
 #include "MapDRelease.h"
 #include "MapDServer.h"
-#include "Shared/Logger.h"
 #include "Shared/StringTransform.h"
 #include "Shared/ThriftClient.h"
 #include "Shared/ThriftTypesConvert.h"
 #include "Shared/base64.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/mapd_shared_ptr.h"
+#include "Shared/misc.h"
 #include "gen-cpp/OmniSci.h"
 
 #include "linenoise.h"
@@ -394,6 +395,8 @@ void process_backslash_commands(char* command, ClientContext& context) {
 }
 
 std::string scalar_datum_to_string(const TDatum& datum, const TTypeInfo& type_info) {
+  constexpr size_t buf_size = 32;
+  char buf[buf_size];  // Hold "2000-03-01 12:34:56.123456789" and large years.
   if (datum.is_null) {
     return "NULL";
   }
@@ -424,40 +427,19 @@ std::string scalar_datum_to_string(const TDatum& datum, const TTypeInfo& type_in
     case TDatumType::STR:
       return datum.val.str_val;
     case TDatumType::TIME: {
-      time_t t = static_cast<time_t>(datum.val.int_val);
-      std::tm tm_struct;
-      gmtime_r(&t, &tm_struct);
-      char buf[9];
-      strftime(buf, 9, "%T", &tm_struct);
+      size_t const len = shared::formatHMS(buf, buf_size, datum.val.int_val);
+      CHECK_EQ(8u, len);  // 8 == strlen("HH:MM:SS")
       return buf;
     }
     case TDatumType::TIMESTAMP: {
-      std::tm tm_struct;
-      if (type_info.precision > 0) {
-        auto scale = static_cast<int64_t>(std::pow(10, type_info.precision));
-        auto dv = std::div(datum.val.int_val, scale);
-        auto modulus = (dv.rem + scale) % scale;
-        time_t sec = static_cast<time_t>(dv.quot - (dv.quot < 0 && modulus > 0));
-        gmtime_r(&sec, &tm_struct);
-        char buf[21];
-        strftime(buf, 21, "%F %T.", &tm_struct);
-        auto subsecond = std::to_string(modulus);
-        return std::string(buf) +
-               std::string(type_info.precision - subsecond.length(), '0') + subsecond;
-      } else {
-        time_t sec = static_cast<time_t>(datum.val.int_val);
-        gmtime_r(&sec, &tm_struct);
-        char buf[20];
-        strftime(buf, 20, "%F %T", &tm_struct);
-        return std::string(buf);
-      }
+      unsigned const dim = type_info.precision;  // assumes dim <= 9
+      size_t const len = shared::formatDateTime(buf, buf_size, datum.val.int_val, dim);
+      CHECK_LE(19u + bool(dim) + dim, len);  // 19 = strlen("YYYY-MM-DD HH:MM:SS")
+      return buf;
     }
     case TDatumType::DATE: {
-      time_t t = static_cast<time_t>(datum.val.int_val);
-      std::tm tm_struct;
-      gmtime_r(&t, &tm_struct);
-      char buf[11];
-      strftime(buf, 11, "%F", &tm_struct);
+      size_t const len = shared::formatDate(buf, buf_size, datum.val.int_val);
+      CHECK_LE(10u, len);  // 10 == strlen("YYYY-MM-DD")
       return buf;
     }
     case TDatumType::BOOL:

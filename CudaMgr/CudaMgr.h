@@ -20,24 +20,14 @@
 #include <string>
 #include <vector>
 
-#include "Shared/Logger.h"
-#include "Shared/uuid.h"
+#include "Logger/Logger.h"
+#include "Shared/DeviceGroup.h"
 
 #ifdef HAVE_CUDA
 #include <cuda.h>
 #else
 #include "Shared/nocuda.h"
 #endif  // HAVE_CUDA
-
-namespace omnisci {
-struct DeviceIdentifier {
-  const int index;    //!< index into device group (currently num_gpus - start_gpu)
-  const int cuda_id;  //!< Cuda ID for device (ignores start_gpu)
-  const UUID uuid;    //!< UUID for device (hardware invariant)
-};
-
-using DeviceGroup = std::vector<DeviceIdentifier>;
-}  // namespace omnisci
 
 namespace CudaMgr_Namespace {
 
@@ -46,7 +36,8 @@ enum class NvidiaDeviceArch {
   Maxwell,  // compute major = 5
   Pascal,   // compute major = 6
   Volta,    // compute major = 7, compute minor = 0
-  Turing    // compute major = 7, compute minor = 5
+  Turing,   // compute major = 7, compute minor = 5
+  Ampere    // compute major = 8
 };
 
 #ifdef HAVE_CUDA
@@ -54,8 +45,7 @@ std::string errorMessage(CUresult const);
 
 class CudaErrorException : public std::runtime_error {
  public:
-  CudaErrorException(CUresult status)
-      : std::runtime_error(errorMessage(status)), status_(status) {}
+  CudaErrorException(CUresult status);
 
   CUresult getStatus() const { return status_; }
 
@@ -153,7 +143,7 @@ class CudaMgr {
     return (getDeviceCount() > 0 && device_properties_[0].computeMajor >= 6);
   }
   bool isArchMaxwellOrLaterForAll() const;
-  bool isArchVoltaForAll() const;
+  bool isArchVoltaOrGreaterForAll() const;
 
   static std::string deviceArchToSM(const NvidiaDeviceArch arch) {
     // Must match ${CUDA_COMPILATION_ARCH} CMAKE flag
@@ -167,6 +157,8 @@ class CudaMgr {
       case NvidiaDeviceArch::Volta:
         return "sm_70";
       case NvidiaDeviceArch::Turing:
+        return "sm_75";
+      case NvidiaDeviceArch::Ampere:
         return "sm_75";
       default:
         LOG(WARNING) << "Unrecognized Nvidia device architecture, falling back to "
@@ -193,6 +185,8 @@ class CudaMgr {
           } else {
             return NvidiaDeviceArch::Turing;
           }
+        case 8:
+          return NvidiaDeviceArch::Ampere;
         default:
           return NvidiaDeviceArch::Kepler;
       }

@@ -18,13 +18,14 @@
 #define LEAFAGGREGATOR_H
 
 #include "../AggregatedResult.h"
+#include "Catalog/Catalog.h"
 #include "DataMgr/MemoryLevel.h"
 #include "LeafHostInfo.h"
 #include "QueryEngine/CompilationOptions.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "gen-cpp/OmniSci.h"
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 namespace Catalog_Namespace {
 class SessionInfo;
@@ -86,6 +87,21 @@ class LeafAggregator {
                            const int32_t db_id,
                            const int32_t table_id,
                            const int32_t new_epoch) {
+    CHECK(false);
+  }
+
+  std::vector<Catalog_Namespace::TableEpochInfo> get_leaf_table_epochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const int32_t table_id) {
+    CHECK(false);
+    return {};
+  }
+
+  void set_leaf_table_epochs(
+      const Catalog_Namespace::SessionInfo& parent_session_info,
+      const int32_t db_id,
+      const std::vector<Catalog_Namespace::TableEpochInfo>& table_epochs) {
     CHECK(false);
   }
 

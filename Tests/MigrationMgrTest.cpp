@@ -22,9 +22,9 @@
 
 #include "Catalog/Catalog.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
+#include "Logger/Logger.h"
 #include "MigrationMgr/MigrationMgr.h"
 #include "QueryRunner/QueryRunner.h"
-#include "Shared/Logger.h"
 #include "Shared/scope.h"
 
 #ifndef BASE_PATH

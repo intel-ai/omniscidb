@@ -66,9 +66,10 @@
 #include "Parser/ParserNode.h"
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/TableOptimizer.h"
+#include "RefreshTimeCalculator.h"
+#include "Shared/DateTimeParser.h"
 #include "Shared/File.h"
 #include "Shared/StringTransform.h"
-#include "Shared/TimeGM.h"
 #include "Shared/measure.h"
 #include "StringDictionary/StringDictionaryClient.h"
 
@@ -611,22 +612,9 @@ void Catalog::createFsiSchemasAndDefaultServers() {
   cat_sqlite_lock sqlite_lock(this);
   sqliteConnector_.query("BEGIN TRANSACTION");
   try {
-    sqliteConnector_.query(
-        "CREATE TABLE IF NOT EXISTS omnisci_foreign_servers("
-        "id integer primary key, "
-        "name text unique, "
-        "data_wrapper_type text, "
-        "owner_user_id integer, "
-        "creation_time integer, "
-        "options text)");
+    sqliteConnector_.query(getForeignServerSchema(true));
     createDefaultServersIfNotExists();
-    sqliteConnector_.query(
-        "CREATE TABLE IF NOT EXISTS omnisci_foreign_tables("
-        "table_id integer unique, "
-        "server_id integer, "
-        "options text, "
-        "FOREIGN KEY(table_id) REFERENCES mapd_tables(tableid), "
-        "FOREIGN KEY(server_id) REFERENCES omnisci_foreign_servers(id))");
+    sqliteConnector_.query(getForeignTableSchema(true));
   } catch (std::exception& e) {
     sqliteConnector_.query("ROLLBACK TRANSACTION");
     throw;
@@ -642,7 +630,8 @@ void Catalog::dropFsiSchemasAndTables() {
     try {
       sqliteConnector_.query(
           "SELECT name FROM sqlite_master WHERE type='table' AND "
-          "name IN ('omnisci_foreign_servers', 'omnisci_foreign_tables')");
+          "name IN ('omnisci_foreign_servers', 'omnisci_foreign_tables', "
+          "'omnisci_user_mappings')");
       if (sqliteConnector_.getNumRows() > 0) {
         sqliteConnector_.query(
             "SELECT tableid, name, isview, storage_type FROM mapd_tables "
@@ -681,6 +670,21 @@ void Catalog::dropFsiSchemasAndTables() {
     tableDescriptorMap_.erase(to_upper(foreign_table.tableName));
     tableDescriptorMapById_.erase(foreign_table.tableId);
   }
+}
+
+const std::string Catalog::getForeignServerSchema(bool if_not_exists) {
+  return "CREATE TABLE " + (if_not_exists ? std::string{"IF NOT EXISTS "} : "") +
+         "omnisci_foreign_servers(id integer primary key, name text unique, " +
+         "data_wrapper_type text, owner_user_id integer, creation_time integer, " +
+         "options text)";
+}
+
+const std::string Catalog::getForeignTableSchema(bool if_not_exists) {
+  return "CREATE TABLE " + (if_not_exists ? std::string{"IF NOT EXISTS "} : "") +
+         "omnisci_foreign_tables(table_id integer unique, server_id integer, " +
+         "options text, last_refresh_time integer, next_refresh_time integer, " +
+         "FOREIGN KEY(table_id) REFERENCES mapd_tables(tableid), " +
+         "FOREIGN KEY(server_id) REFERENCES omnisci_foreign_servers(id))";
 }
 
 void Catalog::recordOwnershipOfObjectsInObjectPermissions() {
@@ -1372,7 +1376,7 @@ void Catalog::instantiateFragmenter(TableDescriptor* td) const {
     CHECK_EQ(td->fragType, Fragmenter_Namespace::FragmenterType::INSERT_ORDER);
     vector<Chunk> chunkVec;
     list<const ColumnDescriptor*> columnDescs;
-    getAllColumnMetadataForTable(td, columnDescs, true, false, true);
+    getAllColumnMetadataForTableImpl(td, columnDescs, true, false, true);
     Chunk::translateColumnDescriptorsToChunkVec(columnDescs, chunkVec);
     ChunkKey chunkKeyPrefix = {currentDB_.dbId, td->tableId};
     if (td->sortedColumnId > 0) {
@@ -1426,7 +1430,6 @@ const TableDescriptor* Catalog::getMetadataForTable(const string& tableName,
 const TableDescriptor* Catalog::getMetadataForTableImpl(
     int tableId,
     const bool populateFragmenter) const {
-  cat_read_lock read_lock(this);
   auto tableDescIt = tableDescriptorMapById_.find(tableId);
   if (tableDescIt == tableDescriptorMapById_.end()) {  // check to make sure table exists
     return nullptr;
@@ -1441,14 +1444,21 @@ const TableDescriptor* Catalog::getMetadataForTableImpl(
   return td;  // returns pointer to table descriptor
 }
 
-const TableDescriptor* Catalog::getMetadataForTable(int tableId) const {
-  return getMetadataForTableImpl(tableId, true);
+const TableDescriptor* Catalog::getMetadataForTable(int tableId,
+                                                    bool populateFragmenter) const {
+  cat_read_lock read_lock(this);
+  return getMetadataForTableImpl(tableId, populateFragmenter);
 }
 
-const DictDescriptor* Catalog::getMetadataForDict(const int dictId,
-                                                  const bool loadDict) const {
-  const DictRef dictRef(currentDB_.dbId, dictId);
+const DictDescriptor* Catalog::getMetadataForDict(const int dict_id,
+                                                  const bool load_dict) const {
   cat_read_lock read_lock(this);
+  return getMetadataForDictUnlocked(dict_id, load_dict);
+}
+
+const DictDescriptor* Catalog::getMetadataForDictUnlocked(const int dictId,
+                                                          const bool loadDict) const {
+  const DictRef dictRef(currentDB_.dbId, dictId);
   auto dictDescIt = dictDescriptorMapByRef_.find(dictRef);
   if (dictDescIt ==
       dictDescriptorMapByRef_.end()) {  // check to make sure dictionary exists
@@ -1498,9 +1508,13 @@ const ColumnDescriptor* Catalog::getMetadataForColumn(int tableId,
   return colDescIt->second;
 }
 
-const ColumnDescriptor* Catalog::getMetadataForColumn(int tableId, int columnId) const {
+const ColumnDescriptor* Catalog::getMetadataForColumn(int table_id, int column_id) const {
   cat_read_lock read_lock(this);
+  return getMetadataForColumnUnlocked(table_id, column_id);
+}
 
+const ColumnDescriptor* Catalog::getMetadataForColumnUnlocked(int tableId,
+                                                              int columnId) const {
   ColumnIdKey columnIdKey(tableId, columnId);
   auto colDescIt = columnDescriptorMapById_.find(columnIdKey);
   if (colDescIt == columnDescriptorMapById_
@@ -1542,31 +1556,71 @@ const ColumnDescriptor* Catalog::getMetadataForColumnBySpi(const int tableId,
   return columnDescriptorMapById_.end() == colDescIt ? nullptr : colDescIt->second;
 }
 
-void Catalog::deleteMetadataForDashboard(const std::string& userId,
-                                         const std::string& dashName) {
-  cat_write_lock write_lock(this);
+void Catalog::deleteMetadataForDashboards(const std::vector<int32_t> dashboard_ids,
+                                          const UserMetadata& user) {
+  std::stringstream invalid_ids, restricted_ids;
 
-  auto viewDescIt = dashboardDescriptorMap_.find(userId + ":" + dashName);
-  if (viewDescIt == dashboardDescriptorMap_.end()) {  // check to make sure view exists
-    LOG(ERROR) << "No metadata for dashboard for user " << userId << " dashboard "
-               << dashName << " does not exist in map";
-    throw runtime_error("No metadata for dashboard for user " + userId + " dashboard " +
-                        dashName + " does not exist in map");
+  for (int32_t dashboard_id : dashboard_ids) {
+    if (!getMetadataForDashboard(dashboard_id)) {
+      invalid_ids << (!invalid_ids.str().empty() ? ", " : "") << dashboard_id;
+      continue;
+    }
+    DBObject object(dashboard_id, DashboardDBObjectType);
+    object.loadKey(*this);
+    object.setPrivileges(AccessPrivileges::DELETE_DASHBOARD);
+    std::vector<DBObject> privs = {object};
+    if (!SysCatalog::instance().checkPrivileges(user, privs))
+      restricted_ids << (!restricted_ids.str().empty() ? ", " : "") << dashboard_id;
   }
-  // found view in Map now remove it
-  dashboardDescriptorMap_.erase(viewDescIt);
-  // remove from DB
-  cat_sqlite_lock sqlite_lock(this);
-  sqliteConnector_.query("BEGIN TRANSACTION");
-  try {
-    sqliteConnector_.query_with_text_params(
-        "DELETE FROM mapd_dashboards WHERE name = ? and userid = ?",
-        std::vector<std::string>{dashName, userId});
-  } catch (std::exception& e) {
-    sqliteConnector_.query("ROLLBACK TRANSACTION");
-    throw;
+
+  if (invalid_ids.str().size() > 0 || restricted_ids.str().size() > 0) {
+    std::stringstream error_message;
+    error_message << "Delete dashboard(s) failed with error(s):";
+    if (invalid_ids.str().size() > 0)
+      error_message << "\nDashboard id: " << invalid_ids.str()
+                    << " - Dashboard id does not exist";
+    if (restricted_ids.str().size() > 0)
+      error_message
+          << "\nDashboard id: " << restricted_ids.str()
+          << " - User should be either owner of dashboard or super user to delete it";
+    throw std::runtime_error(error_message.str());
   }
-  sqliteConnector_.query("END TRANSACTION");
+  std::vector<DBObject> dash_objs;
+
+  for (int32_t dashboard_id : dashboard_ids) {
+    dash_objs.push_back(DBObject(dashboard_id, DashboardDBObjectType));
+  }
+  // BE-5245: Transactionally unsafe (like other combined Catalog/Syscatalog operations)
+  SysCatalog::instance().revokeDBObjectPrivilegesFromAllBatch(dash_objs, this);
+  {
+    cat_write_lock write_lock(this);
+    cat_sqlite_lock sqlite_lock(this);
+
+    sqliteConnector_.query("BEGIN TRANSACTION");
+    try {
+      for (int32_t dashboard_id : dashboard_ids) {
+        auto dash = getMetadataForDashboard(dashboard_id);
+        // Dash should still exist if revokeDBObjectPrivileges passed but throw and
+        // rollback if already deleted
+        if (!dash) {
+          throw std::runtime_error(
+              std::string("Delete dashboard(s) failed with error(s):\nDashboard id: ") +
+              std::to_string(dashboard_id) + " - Dashboard id does not exist ");
+        }
+        std::string user_id = std::to_string(dash->userId);
+        std::string dash_name = dash->dashboardName;
+        auto viewDescIt = dashboardDescriptorMap_.find(user_id + ":" + dash_name);
+        dashboardDescriptorMap_.erase(viewDescIt);
+        sqliteConnector_.query_with_text_params(
+            "DELETE FROM mapd_dashboards WHERE name = ? and userid = ?",
+            std::vector<std::string>{dash_name, user_id});
+      }
+    } catch (std::exception& e) {
+      sqliteConnector_.query("ROLLBACK TRANSACTION");
+      throw;
+    }
+    sqliteConnector_.query("END TRANSACTION");
+  }
 }
 
 const DashboardDescriptor* Catalog::getMetadataForDashboard(
@@ -1603,30 +1657,6 @@ const DashboardDescriptor* Catalog::getMetadataForDashboard(const int32_t id) co
   return nullptr;
 }
 
-void Catalog::deleteMetadataForDashboard(const int32_t id) {
-  std::string userId;
-  std::string name;
-  bool found{false};
-  {
-    cat_read_lock read_lock(this);
-    for (auto descp : dashboardDescriptorMap_) {
-      auto dash = descp.second.get();
-      if (dash->dashboardId == id) {
-        userId = std::to_string(dash->userId);
-        name = dash->dashboardName;
-        found = true;
-        break;
-      }
-    }
-  }
-  if (found) {
-    // TODO: transactionally unsafe
-    SysCatalog::instance().revokeDBObjectPrivilegesFromAll(
-        DBObject(id, DashboardDBObjectType), this);
-    deleteMetadataForDashboard(userId, name);
-  }
-}
-
 const LinkDescriptor* Catalog::getMetadataForLink(const string& link) const {
   cat_read_lock read_lock(this);
   auto linkDescIt = linkDescriptorMap_.find(link);
@@ -1645,13 +1675,21 @@ const LinkDescriptor* Catalog::getMetadataForLink(int linkId) const {
   return linkDescIt->second;
 }
 
-void Catalog::getAllColumnMetadataForTable(
+const foreign_storage::ForeignTable* Catalog::getForeignTableUnlocked(
+    int table_id) const {
+  auto table = getMetadataForTableImpl(table_id, false);
+  CHECK(table);
+  auto foreign_table = dynamic_cast<const foreign_storage::ForeignTable*>(table);
+  CHECK(foreign_table);
+  return foreign_table;
+}
+
+void Catalog::getAllColumnMetadataForTableImpl(
     const TableDescriptor* td,
     list<const ColumnDescriptor*>& columnDescriptors,
     const bool fetchSystemColumns,
     const bool fetchVirtualColumns,
     const bool fetchPhysicalColumns) const {
-  cat_read_lock read_lock(this);
   int32_t skip_physical_cols = 0;
   for (const auto& columnDescriptor : columnDescriptorMapById_) {
     if (!fetchPhysicalColumns && skip_physical_cols > 0) {
@@ -1676,20 +1714,29 @@ void Catalog::getAllColumnMetadataForTable(
   }
 }
 
-list<const ColumnDescriptor*> Catalog::getAllColumnMetadataForTable(
+std::list<const ColumnDescriptor*> Catalog::getAllColumnMetadataForTable(
     const int tableId,
     const bool fetchSystemColumns,
     const bool fetchVirtualColumns,
     const bool fetchPhysicalColumns) const {
   cat_read_lock read_lock(this);
-  list<const ColumnDescriptor*> columnDescriptors;
+  return getAllColumnMetadataForTableUnlocked(
+      tableId, fetchSystemColumns, fetchVirtualColumns, fetchPhysicalColumns);
+}
+
+std::list<const ColumnDescriptor*> Catalog::getAllColumnMetadataForTableUnlocked(
+    const int tableId,
+    const bool fetchSystemColumns,
+    const bool fetchVirtualColumns,
+    const bool fetchPhysicalColumns) const {
+  std::list<const ColumnDescriptor*> columnDescriptors;
   const TableDescriptor* td =
       getMetadataForTableImpl(tableId, false);  // dont instantiate fragmenter
-  getAllColumnMetadataForTable(td,
-                               columnDescriptors,
-                               fetchSystemColumns,
-                               fetchVirtualColumns,
-                               fetchPhysicalColumns);
+  getAllColumnMetadataForTableImpl(td,
+                                   columnDescriptors,
+                                   fetchSystemColumns,
+                                   fetchVirtualColumns,
+                                   fetchPhysicalColumns);
   return columnDescriptors;
 }
 
@@ -2081,6 +2128,19 @@ void Catalog::expandGeoColumn(const ColumnDescriptor& cd,
   }
 }
 
+namespace {
+int64_t get_next_refresh_time(const foreign_storage::ForeignTable& foreign_table) {
+  auto timing_type_entry =
+      foreign_table.options.find(foreign_storage::ForeignTable::REFRESH_TIMING_TYPE_KEY);
+  CHECK(timing_type_entry != foreign_table.options.end());
+  if (timing_type_entry->second ==
+      foreign_storage::ForeignTable::SCHEDULE_REFRESH_TIMING_TYPE) {
+    return foreign_storage::get_next_refresh_time(foreign_table.options);
+  }
+  return foreign_storage::ForeignTable::NULL_REFRESH_TIME;
+}
+}  // namespace
+
 void Catalog::createTable(
     TableDescriptor& td,
     const list<ColumnDescriptor>& cols,
@@ -2221,13 +2281,16 @@ void Catalog::createTable(
             std::vector<std::string>{std::to_string(td.tableId), td.viewSQL});
       }
       if (td.storageType == StorageType::FOREIGN_TABLE) {
-        auto& foreignTable = dynamic_cast<foreign_storage::ForeignTable&>(td);
+        auto& foreign_table = dynamic_cast<foreign_storage::ForeignTable&>(td);
+        foreign_table.next_refresh_time = get_next_refresh_time(foreign_table);
         sqliteConnector_.query_with_text_params(
-            "INSERT INTO omnisci_foreign_tables (table_id, server_id, options) VALUES "
-            "(?, ?, ?)",
-            std::vector<std::string>{std::to_string(foreignTable.tableId),
-                                     std::to_string(foreignTable.foreign_server->id),
-                                     foreignTable.getOptionsAsJsonString()});
+            "INSERT INTO omnisci_foreign_tables (table_id, server_id, options, "
+            "last_refresh_time, next_refresh_time) VALUES (?, ?, ?, ?, ?)",
+            std::vector<std::string>{std::to_string(foreign_table.tableId),
+                                     std::to_string(foreign_table.foreign_server->id),
+                                     foreign_table.getOptionsAsJsonString(),
+                                     std::to_string(foreign_table.last_refresh_time),
+                                     std::to_string(foreign_table.next_refresh_time)});
       }
     } catch (std::exception& e) {
       sqliteConnector_.query("ROLLBACK TRANSACTION");
@@ -2419,7 +2482,7 @@ void Catalog::createForeignServerNoLocks(
         "SELECT id from omnisci_foreign_servers where name = ?",
         std::vector<std::string>{foreign_server->name});
     CHECK_EQ(sqliteConnector_.getNumRows(), size_t(1));
-    foreign_server->id = sqliteConnector_.getData<int>(0, 0);
+    foreign_server->id = sqliteConnector_.getData<int32_t>(0, 0);
   } else if (!if_not_exists) {
     throw std::runtime_error{"A foreign server with name \"" + foreign_server->name +
                              "\" already exists."};
@@ -2441,26 +2504,22 @@ const foreign_storage::ForeignServer* Catalog::getForeignServer(
   return foreign_server;
 }
 
-const foreign_storage::ForeignServer* Catalog::getForeignServerSkipCache(
-    const std::string& server_name) {
-  foreign_storage::ForeignServer* foreign_server = nullptr;
-  cat_write_lock write_lock(this);
+const std::unique_ptr<const foreign_storage::ForeignServer>
+Catalog::getForeignServerFromStorage(const std::string& server_name) {
+  std::unique_ptr<foreign_storage::ForeignServer> foreign_server = nullptr;
   cat_sqlite_lock sqlite_lock(this);
   sqliteConnector_.query_with_text_params(
       "SELECT id, name, data_wrapper_type, options, owner_user_id, creation_time "
       "FROM omnisci_foreign_servers WHERE name = ?",
       std::vector<std::string>{server_name});
   if (sqliteConnector_.getNumRows() > 0) {
-    auto server = std::make_shared<foreign_storage::ForeignServer>(
+    foreign_server = std::make_unique<foreign_storage::ForeignServer>(
         sqliteConnector_.getData<int>(0, 0),
         sqliteConnector_.getData<std::string>(0, 1),
         sqliteConnector_.getData<std::string>(0, 2),
         sqliteConnector_.getData<std::string>(0, 3),
         sqliteConnector_.getData<std::int32_t>(0, 4),
         sqliteConnector_.getData<std::int32_t>(0, 5));
-    foreign_server = server.get();
-    foreignServerMap_[server->name] = server;
-    foreignServerMapById_[server->id] = server;
   }
   return foreign_server;
 }
@@ -2539,7 +2598,7 @@ void Catalog::dropForeignServer(const std::string& server_name) {
   auto num_rows = sqliteConnector_.getNumRows();
   if (num_rows > 0) {
     CHECK_EQ(size_t(1), num_rows);
-    auto server_id = sqliteConnector_.getData<int>(0, 0);
+    auto server_id = sqliteConnector_.getData<int32_t>(0, 0);
     sqliteConnector_.query_with_text_param(
         "SELECT table_id from omnisci_foreign_tables where server_id = ?",
         std::to_string(server_id));
@@ -2548,9 +2607,16 @@ void Catalog::dropForeignServer(const std::string& server_name) {
                                "\" is referenced "
                                "by existing foreign tables and cannot be dropped."};
     }
-    sqliteConnector_.query_with_text_params(
-        "DELETE FROM omnisci_foreign_servers WHERE name = ?",
-        std::vector<std::string>{server_name});
+    sqliteConnector_.query("BEGIN TRANSACTION");
+    try {
+      sqliteConnector_.query_with_text_params(
+          "DELETE FROM omnisci_foreign_servers WHERE name = ?",
+          std::vector<std::string>{server_name});
+    } catch (const std::exception& e) {
+      sqliteConnector_.query("ROLLBACK TRANSACTION");
+      throw;
+    }
+    sqliteConnector_.query("END TRANSACTION");
     foreignServerMap_.erase(server_name);
     foreignServerMapById_.erase(server_id);
   }
@@ -2609,7 +2675,7 @@ void Catalog::getForeignServersForUser(
 
       if (timestamp_column && equals_operator) {
         arguments.push_back(std::to_string(
-            DateTimeStringValidate<kTIMESTAMP>()(filter_def["value"].GetString(), 0)));
+            dateTimeParse<kTIMESTAMP>(filter_def["value"].GetString(), 0)));
       } else {
         arguments.push_back(filter_def["value"].GetString());
       }
@@ -2655,26 +2721,40 @@ int32_t Catalog::getTableEpoch(const int32_t db_id, const int32_t table_id) cons
     // check all shards have same checkpoint
     const auto physicalTables = physicalTableIt->second;
     CHECK(!physicalTables.empty());
-    size_t curr_epoch = 0;
+    size_t curr_epoch{0}, first_epoch{0};
+    int32_t first_table_id{0};
+    bool are_epochs_inconsistent{false};
     for (size_t i = 0; i < physicalTables.size(); i++) {
       int32_t physical_tb_id = physicalTables[i];
       const TableDescriptor* phys_td = getMetadataForTable(physical_tb_id);
       CHECK(phys_td);
+
+      curr_epoch = dataMgr_->getTableEpoch(db_id, physical_tb_id);
+      LOG(INFO) << "Got sharded table epoch for db id: " << db_id
+                << ", table id: " << physical_tb_id << ", epoch: " << curr_epoch;
       if (i == 0) {
-        curr_epoch = dataMgr_->getTableEpoch(db_id, physical_tb_id);
-      } else {
-        if (curr_epoch != dataMgr_->getTableEpoch(db_id, physical_tb_id)) {
-          // oh dear the leaves do not agree on the epoch for this table
-          LOG(ERROR) << "Epochs on shards do not all agree on table id " << table_id
-                     << " db id  " << db_id << " epoch " << curr_epoch << " leaf_epoch "
-                     << dataMgr_->getTableEpoch(db_id, physical_tb_id);
-          return -1;
-        }
+        first_epoch = curr_epoch;
+        first_table_id = physical_tb_id;
+      } else if (first_epoch != curr_epoch) {
+        are_epochs_inconsistent = true;
+        LOG(ERROR) << "Epochs on shards do not all agree on table id: " << table_id
+                   << ", db id: " << db_id
+                   << ". First table (table id: " << first_table_id
+                   << ") has epoch: " << first_epoch << ". Table id: " << physical_tb_id
+                   << ", has inconsistent epoch: " << curr_epoch
+                   << ". See previous INFO logs for all epochs and their table ids.";
       }
+    }
+    if (are_epochs_inconsistent) {
+      // oh dear the shards do not agree on the epoch for this table
+      return -1;
     }
     return curr_epoch;
   } else {
-    return dataMgr_->getTableEpoch(db_id, table_id);
+    auto epoch = dataMgr_->getTableEpoch(db_id, table_id);
+    LOG(INFO) << "Got table epoch for db id: " << db_id << ", table id: " << table_id
+              << ", epoch: " << epoch;
+    return epoch;
   }
 }
 
@@ -2699,6 +2779,47 @@ void Catalog::setTableEpoch(const int db_id, const int table_id, int new_epoch) 
       removeChunks(physical_tb_id);
       dataMgr_->setTableEpoch(db_id, physical_tb_id, new_epoch);
     }
+  }
+}
+
+std::vector<TableEpochInfo> Catalog::getTableEpochs(const int32_t db_id,
+                                                    const int32_t table_id) const {
+  cat_read_lock read_lock(this);
+  std::vector<TableEpochInfo> table_epochs;
+  const auto physical_table_it = logicalToPhysicalTableMapById_.find(table_id);
+  if (physical_table_it != logicalToPhysicalTableMapById_.end()) {
+    const auto physical_tables = physical_table_it->second;
+    CHECK(!physical_tables.empty());
+
+    for (const auto physical_tb_id : physical_tables) {
+      const auto phys_td = getMetadataForTableImpl(physical_tb_id, false);
+      CHECK(phys_td);
+
+      auto table_id = phys_td->tableId;
+      auto epoch = dataMgr_->getTableEpoch(db_id, phys_td->tableId);
+      table_epochs.emplace_back(table_id, epoch);
+      LOG(INFO) << "Got sharded table epoch for db id: " << db_id
+                << ", table id:  " << table_id << ", epoch: " << epoch;
+    }
+  } else {
+    auto epoch = dataMgr_->getTableEpoch(db_id, table_id);
+    LOG(INFO) << "Got table epoch for db id: " << db_id << ", table id:  " << table_id
+              << ", epoch: " << epoch;
+    table_epochs.emplace_back(table_id, epoch);
+  }
+  return table_epochs;
+}
+
+void Catalog::setTableEpochs(const int32_t db_id,
+                             const std::vector<TableEpochInfo>& table_epochs) {
+  cat_read_lock read_lock(this);
+  for (const auto& table_epoch_info : table_epochs) {
+    removeChunks(table_epoch_info.table_id);
+    dataMgr_->setTableEpoch(
+        db_id, table_epoch_info.table_id, table_epoch_info.table_epoch);
+    LOG(INFO) << "Set table epoch for db id: " << db_id
+              << ", table id: " << table_epoch_info.table_id
+              << ", back to epoch: " << table_epoch_info.table_epoch;
   }
 }
 
@@ -3050,6 +3171,17 @@ void Catalog::doTruncateTable(const TableDescriptor* td) {
   }
 }
 
+void Catalog::removeFragmenterForTable(const int table_id) {
+  cat_write_lock write_lock(this);
+  auto td = getMetadataForTable(table_id, false);
+  if (td->fragmenter != nullptr) {
+    auto tableDescIt = tableDescriptorMapById_.find(table_id);
+    CHECK(tableDescIt != tableDescriptorMapById_.end());
+    tableDescIt->second->fragmenter = nullptr;
+    CHECK(td->fragmenter == nullptr);
+  }
+}
+
 // used by rollback_table_epoch to clean up in memory artifacts after a rollback
 void Catalog::removeChunks(const int table_id) {
   auto td = getMetadataForTable(table_id);
@@ -3252,61 +3384,61 @@ void Catalog::renameColumn(const TableDescriptor* td,
 }
 
 int32_t Catalog::createDashboard(DashboardDescriptor& vd) {
-  {
-    cat_write_lock write_lock(this);
-    cat_sqlite_lock sqlite_lock(this);
-    sqliteConnector_.query("BEGIN TRANSACTION");
-    try {
-      // TODO(andrew): this should be an upsert
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+  sqliteConnector_.query("BEGIN TRANSACTION");
+  try {
+    // TODO(andrew): this should be an upsert
+    sqliteConnector_.query_with_text_params(
+        "SELECT id FROM mapd_dashboards WHERE name = ? and userid = ?",
+        std::vector<std::string>{vd.dashboardName, std::to_string(vd.userId)});
+    if (sqliteConnector_.getNumRows() > 0) {
       sqliteConnector_.query_with_text_params(
-          "SELECT id FROM mapd_dashboards WHERE name = ? and userid = ?",
-          std::vector<std::string>{vd.dashboardName, std::to_string(vd.userId)});
-      if (sqliteConnector_.getNumRows() > 0) {
-        sqliteConnector_.query_with_text_params(
-            "UPDATE mapd_dashboards SET state = ?, image_hash = ?, metadata = ?, "
-            "update_time = "
-            "datetime('now') where name = ? "
-            "and userid = ?",
-            std::vector<std::string>{vd.dashboardState,
-                                     vd.imageHash,
-                                     vd.dashboardMetadata,
-                                     vd.dashboardName,
-                                     std::to_string(vd.userId)});
-      } else {
-        sqliteConnector_.query_with_text_params(
-            "INSERT INTO mapd_dashboards (name, state, image_hash, metadata, "
-            "update_time, "
-            "userid) "
-            "VALUES "
-            "(?,?,?,?, "
-            "datetime('now'), ?)",
-            std::vector<std::string>{vd.dashboardName,
-                                     vd.dashboardState,
-                                     vd.imageHash,
-                                     vd.dashboardMetadata,
-                                     std::to_string(vd.userId)});
-      }
-    } catch (std::exception& e) {
-      sqliteConnector_.query("ROLLBACK TRANSACTION");
-      throw;
-    }
-    sqliteConnector_.query("END TRANSACTION");
-
-    // now get the auto generated dashboardId
-    try {
+          "UPDATE mapd_dashboards SET state = ?, image_hash = ?, metadata = ?, "
+          "update_time = "
+          "datetime('now') where name = ? "
+          "and userid = ?",
+          std::vector<std::string>{vd.dashboardState,
+                                   vd.imageHash,
+                                   vd.dashboardMetadata,
+                                   vd.dashboardName,
+                                   std::to_string(vd.userId)});
+    } else {
       sqliteConnector_.query_with_text_params(
-          "SELECT id, strftime('%Y-%m-%dT%H:%M:%SZ', update_time) FROM mapd_dashboards "
-          "WHERE name = ? and userid = ?",
-          std::vector<std::string>{vd.dashboardName, std::to_string(vd.userId)});
-      vd.dashboardId = sqliteConnector_.getData<int>(0, 0);
-      vd.updateTime = sqliteConnector_.getData<std::string>(0, 1);
-    } catch (std::exception& e) {
-      throw;
+          "INSERT INTO mapd_dashboards (name, state, image_hash, metadata, "
+          "update_time, "
+          "userid) "
+          "VALUES "
+          "(?,?,?,?, "
+          "datetime('now'), ?)",
+          std::vector<std::string>{vd.dashboardName,
+                                   vd.dashboardState,
+                                   vd.imageHash,
+                                   vd.dashboardMetadata,
+                                   std::to_string(vd.userId)});
     }
-    vd.dashboardSystemRoleName = generate_dashboard_system_rolename(
-        std::to_string(currentDB_.dbId), std::to_string(vd.dashboardId));
-    addFrontendViewToMap(vd);
+  } catch (std::exception& e) {
+    sqliteConnector_.query("ROLLBACK TRANSACTION");
+    throw;
   }
+  sqliteConnector_.query("END TRANSACTION");
+
+  // now get the auto generated dashboardId
+  try {
+    sqliteConnector_.query_with_text_params(
+        "SELECT id, strftime('%Y-%m-%dT%H:%M:%SZ', update_time) FROM mapd_dashboards "
+        "WHERE name = ? and userid = ?",
+        std::vector<std::string>{vd.dashboardName, std::to_string(vd.userId)});
+    vd.dashboardId = sqliteConnector_.getData<int>(0, 0);
+    vd.updateTime = sqliteConnector_.getData<std::string>(0, 1);
+  } catch (std::exception& e) {
+    throw;
+  }
+  vd.dashboardSystemRoleName = generate_dashboard_system_rolename(
+      std::to_string(currentDB_.dbId), std::to_string(vd.dashboardId));
+  addFrontendViewToMap(vd);
+  sqlite_lock.unlock();
+  write_lock.unlock();
   // NOTE(wamsi): Transactionally unsafe
   createOrUpdateDashboardSystemRole(
       vd.dashboardMetadata, vd.userId, vd.dashboardSystemRoleName);
@@ -3325,12 +3457,12 @@ void Catalog::replaceDashboard(DashboardDescriptor& vd) {
     if (sqliteConnector_.getNumRows() > 0) {
       sqliteConnector_.query_with_text_params(
           "UPDATE mapd_dashboards SET name = ?, state = ?, image_hash = ?, metadata = ?, "
-          "update_time = "
-          "datetime('now') where id = ? ",
+          "userid = ?, update_time = datetime('now') where id = ? ",
           std::vector<std::string>{vd.dashboardName,
                                    vd.dashboardState,
                                    vd.imageHash,
                                    vd.dashboardMetadata,
+                                   std::to_string(vd.userId),
                                    std::to_string(vd.dashboardId)});
     } else {
       LOG(ERROR) << "Error replacing dashboard id " << vd.dashboardId
@@ -3380,6 +3512,8 @@ void Catalog::replaceDashboard(DashboardDescriptor& vd) {
   vd.dashboardSystemRoleName = generate_dashboard_system_rolename(
       std::to_string(currentDB_.dbId), std::to_string(vd.dashboardId));
   addFrontendViewToMapNoLock(vd);
+  sqlite_lock.unlock();
+  write_lock.unlock();
   // NOTE(wamsi): Transactionally unsafe
   createOrUpdateDashboardSystemRole(
       vd.dashboardMetadata, vd.userId, vd.dashboardSystemRoleName);
@@ -3438,6 +3572,8 @@ std::string Catalog::createLink(LinkDescriptor& ld, size_t min_length) {
 
 const ColumnDescriptor* Catalog::getShardColumnMetadataForTable(
     const TableDescriptor* td) const {
+  cat_read_lock read_lock(this);
+
   const auto column_descriptors =
       getAllColumnMetadataForTable(td->tableId, false, true, true);
 
@@ -3469,6 +3605,37 @@ std::vector<const TableDescriptor*> Catalog::getPhysicalTablesDescriptors(
   }
 
   return physicalTables;
+}
+
+const std::map<int, const ColumnDescriptor*> Catalog::getDictionaryToColumnMapping() {
+  cat_read_lock read_lock(this);
+
+  std::map<int, const ColumnDescriptor*> mapping;
+
+  const auto tables = getAllTableMetadata();
+  for (const auto td : tables) {
+    if (td->shard >= 0) {
+      // skip shards, they're not standalone tables
+      continue;
+    }
+
+    for (auto& cd : getAllColumnMetadataForTable(td->tableId, false, false, true)) {
+      const auto& ti = cd->columnType;
+      if (ti.is_string()) {
+        if (ti.get_compression() == kENCODING_DICT) {
+          // if foreign reference, get referenced tab.col
+          const auto dict_id = ti.get_comp_param();
+
+          // ignore temp (negative) dictionaries
+          if (dict_id > 0 && mapping.end() == mapping.find(dict_id)) {
+            mapping[dict_id] = cd;
+          }
+        }
+      }
+    }
+  }
+
+  return mapping;
 }
 
 std::vector<std::string> Catalog::getTableNamesForUser(
@@ -3546,7 +3713,6 @@ void Catalog::eraseDBData() {
 }
 
 void Catalog::eraseTablePhysicalData(const TableDescriptor* td) {
-  cat_write_lock write_lock(this);
   const int tableId = td->tableId;
   // must destroy fragmenter before deleteChunks is called.
   if (td->fragmenter != nullptr) {
@@ -3601,6 +3767,12 @@ std::shared_ptr<Catalog> Catalog::get(const int32_t db_id) {
     }
   }
   return nullptr;
+}
+
+std::shared_ptr<Catalog> Catalog::checkedGet(const int32_t db_id) {
+  auto catalog = get(db_id);
+  CHECK(catalog);
+  return catalog;
 }
 
 std::shared_ptr<Catalog> Catalog::get(const string& basePath,
@@ -3695,12 +3867,15 @@ void Catalog::buildForeignServerMap() {
 
 void Catalog::addForeignTableDetails() {
   sqliteConnector_.query(
-      "SELECT table_id, server_id, options from omnisci_foreign_tables");
+      "SELECT table_id, server_id, options, last_refresh_time, next_refresh_time from "
+      "omnisci_foreign_tables");
   auto num_rows = sqliteConnector_.getNumRows();
   for (size_t r = 0; r < num_rows; r++) {
-    const auto table_id = sqliteConnector_.getData<int>(r, 0);
-    const auto server_id = sqliteConnector_.getData<int>(r, 1);
+    const auto table_id = sqliteConnector_.getData<int32_t>(r, 0);
+    const auto server_id = sqliteConnector_.getData<int32_t>(r, 1);
     const auto& options = sqliteConnector_.getData<std::string>(r, 2);
+    const auto last_refresh_time = sqliteConnector_.getData<int>(r, 3);
+    const auto next_refresh_time = sqliteConnector_.getData<int>(r, 4);
 
     CHECK(tableDescriptorMapById_.find(table_id) != tableDescriptorMapById_.end());
     auto foreign_table =
@@ -3709,6 +3884,8 @@ void Catalog::addForeignTableDetails() {
     foreign_table->foreign_server = foreignServerMapById_[server_id].get();
     CHECK(foreign_table->foreign_server);
     foreign_table->populateOptionsMap(options);
+    foreign_table->last_refresh_time = last_refresh_time;
+    foreign_table->next_refresh_time = next_refresh_time;
   }
 }
 
@@ -3722,7 +3899,7 @@ void Catalog::setForeignServerProperty(const std::string& server_name,
   auto num_rows = sqliteConnector_.getNumRows();
   if (num_rows > 0) {
     CHECK_EQ(size_t(1), num_rows);
-    auto server_id = sqliteConnector_.getData<int>(0, 0);
+    auto server_id = sqliteConnector_.getData<int32_t>(0, 0);
     sqliteConnector_.query_with_text_params(
         "UPDATE omnisci_foreign_servers SET " + property + " = ? WHERE id = ?",
         std::vector<std::string>{value, std::to_string(server_id)});
@@ -3840,7 +4017,8 @@ std::string Catalog::dumpSchema(const TableDescriptor* td) const {
         os << " " << ti.get_type_name();
       }
       os << (ti.get_notnull() ? " NOT NULL" : "");
-      if (ti.is_string()) {
+      if (ti.is_string() || (ti.is_array() && ti.get_subtype() == kTEXT)) {
+        auto size = ti.is_array() ? ti.get_logical_size() : ti.get_size();
         if (ti.get_compression() == kENCODING_DICT) {
           // if foreign reference, get referenced tab.col
           const auto dict_id = ti.get_comp_param();
@@ -3852,8 +4030,7 @@ std::string Catalog::dumpSchema(const TableDescriptor* td) const {
           // and the first cd of a dict will become root of the dict
           if (dict_root_cds.end() == dict_root_cds.find(dict_name)) {
             dict_root_cds[dict_name] = cd;
-            os << " ENCODING " << ti.get_compression_name() << "(" << (ti.get_size() * 8)
-               << ")";
+            os << " ENCODING " << ti.get_compression_name() << "(" << (size * 8) << ")";
           } else {
             const auto dict_root_cd = dict_root_cds[dict_name];
             shared_dicts.push_back("SHARED DICTIONARY (" + cd->columnName +
@@ -3863,9 +4040,17 @@ std::string Catalog::dumpSchema(const TableDescriptor* td) const {
         } else {
           os << " ENCODING NONE";
         }
-      } else if (ti.get_size() > 0 && ti.get_size() != ti.get_logical_size()) {
+      } else if (ti.is_date_in_days() ||
+                 (ti.get_size() > 0 && ti.get_size() != ti.get_logical_size())) {
         const auto comp_param = ti.get_comp_param() ? ti.get_comp_param() : 32;
         os << " ENCODING " << ti.get_compression_name() << "(" << comp_param << ")";
+      } else if (ti.is_geometry()) {
+        if (ti.get_compression() == kENCODING_GEOINT) {
+          os << " ENCODING " << ti.get_compression_name() << "(" << ti.get_comp_param()
+             << ")";
+        } else {
+          os << " ENCODING NONE";
+        }
       }
       comma = ", ";
     }
@@ -3889,7 +4074,9 @@ std::string Catalog::dumpSchema(const TableDescriptor* td) const {
     const auto shard_cd = getMetadataForColumn(td->tableId, td->shardedColumnId);
     CHECK(shard_cd);
     os << ", SHARD KEY(" << shard_cd->columnName << ")";
-    with_options.push_back("SHARD_COUNT=" + std::to_string(td->nShards));
+    with_options.push_back(
+        "SHARD_COUNT=" +
+        std::to_string(td->nShards * std::max(g_leaf_count, static_cast<size_t>(1))));
   }
   if (td->sortedColumnId > 0) {
     const auto sort_cd = getMetadataForColumn(td->tableId, td->sortedColumnId);
@@ -3930,15 +4117,39 @@ void unserialize_key_metainfo(std::vector<std::string>& shared_dicts,
 
 }  // namespace
 
-// returns a "CREATE TABLE" statement in a string
+#include "Parser/ReservedKeywords.h"
+
+//! returns true if the string contains one or more spaces
+inline bool contains_spaces(std::string_view str) {
+  return std::find_if(str.begin(), str.end(), [](const unsigned char& ch) {
+           return std::isspace(ch);
+         }) != str.end();
+}
+
+//! returns true if the string contains one or more OmniSci SQL reserved characters
+inline bool contains_sql_reserved_chars(
+    std::string_view str,
+    std::string_view chars = "`~!@#$%^&*()-=+[{]}\\|;:'\",<.>/?") {
+  return str.find_first_of(chars) != std::string_view::npos;
+}
+
+//! returns true if the string equals an OmniSci SQL reserved keyword
+inline bool is_reserved_sql_keyword(std::string_view str) {
+  return reserved_keywords.find(to_upper(std::string(str))) != reserved_keywords.end();
+}
+
+// returns a "CREATE TABLE" statement in a string for "SHOW CREATE TABLE"
 std::string Catalog::dumpCreateTable(const TableDescriptor* td,
                                      bool multiline_formatting,
                                      bool dump_defaults) const {
   cat_read_lock read_lock(this);
 
+  auto foreign_table = dynamic_cast<const foreign_storage::ForeignTable*>(td);
   std::ostringstream os;
 
-  if (!td->isView) {
+  if (foreign_table) {
+    os << "CREATE FOREIGN TABLE " << td->tableName << " (";
+  } else if (!td->isView) {
     os << "CREATE ";
     if (td->persistenceLevel == Data_Namespace::MemoryLevel::CPU_LEVEL) {
       os << "TEMPORARY ";
@@ -3970,7 +4181,15 @@ std::string Catalog::dumpCreateTable(const TableDescriptor* td,
       if (multiline_formatting) {
         os << "\n  ";
       }
-      os << cd->columnName;
+      // column name
+      bool column_name_needs_quotes = is_reserved_sql_keyword(cd->columnName) ||
+                                      contains_spaces(cd->columnName) ||
+                                      contains_sql_reserved_chars(cd->columnName);
+      if (!column_name_needs_quotes) {
+        os << cd->columnName;
+      } else {
+        os << "\"" << cd->columnName << "\"";
+      }
       // CHAR is perculiar... better dump it as TEXT(32) like \d does
       if (ti.get_type() == SQLTypes::kCHAR) {
         os << " "
@@ -3986,16 +4205,24 @@ std::string Catalog::dumpCreateTable(const TableDescriptor* td,
           shared_dict_column_names.end()) {
         // avoids "Exception: Column ... shouldn't specify an encoding, it borrows it from
         // the referenced column"
-        if (ti.is_string()) {
+        if (ti.is_string() || (ti.is_array() && ti.get_subtype() == kTEXT)) {
+          auto size = ti.is_array() ? ti.get_logical_size() : ti.get_size();
           if (ti.get_compression() == kENCODING_DICT) {
-            os << " ENCODING " << ti.get_compression_name() << "(" << (ti.get_size() * 8)
+            os << " ENCODING " << ti.get_compression_name() << "(" << (size * 8) << ")";
+          } else {
+            os << " ENCODING NONE";
+          }
+        } else if (ti.is_date_in_days() ||
+                   (ti.get_size() > 0 && ti.get_size() != ti.get_logical_size())) {
+          const auto comp_param = ti.get_comp_param() ? ti.get_comp_param() : 32;
+          os << " ENCODING " << ti.get_compression_name() << "(" << comp_param << ")";
+        } else if (ti.is_geometry()) {
+          if (ti.get_compression() == kENCODING_GEOINT) {
+            os << " ENCODING " << ti.get_compression_name() << "(" << ti.get_comp_param()
                << ")";
           } else {
             os << " ENCODING NONE";
           }
-        } else if (ti.get_size() > 0 && ti.get_size() != ti.get_logical_size()) {
-          const auto comp_param = ti.get_comp_param() ? ti.get_comp_param() : 32;
-          os << " ENCODING " << ti.get_compression_name() << "(" << comp_param << ")";
         }
       }
     }
@@ -4011,37 +4238,54 @@ std::string Catalog::dumpCreateTable(const TableDescriptor* td,
     os << comma;
     os << boost::algorithm::join(shared_dicts, comma);
   }
-  // gather WITH options ...
+  os << ")";
+
   std::vector<std::string> with_options;
+  if (foreign_table) {
+    if (multiline_formatting) {
+      os << "\n";
+    } else {
+      os << " ";
+    }
+    os << "SERVER " << foreign_table->foreign_server->name;
+
+    // gather WITH options ...
+    for (const auto& [option, value] : foreign_table->options) {
+      with_options.emplace_back(option + "='" + value + "'");
+    }
+  }
+
   if (dump_defaults || td->maxFragRows != DEFAULT_FRAGMENT_ROWS) {
     with_options.push_back("FRAGMENT_SIZE=" + std::to_string(td->maxFragRows));
   }
-  if (dump_defaults || td->maxChunkSize != DEFAULT_MAX_CHUNK_SIZE) {
+  if (!foreign_table && (dump_defaults || td->maxChunkSize != DEFAULT_MAX_CHUNK_SIZE)) {
     with_options.push_back("MAX_CHUNK_SIZE=" + std::to_string(td->maxChunkSize));
   }
-  if (dump_defaults || td->fragPageSize != DEFAULT_PAGE_SIZE) {
+  if (!foreign_table && (dump_defaults || td->fragPageSize != DEFAULT_PAGE_SIZE)) {
     with_options.push_back("PAGE_SIZE=" + std::to_string(td->fragPageSize));
   }
-  if (dump_defaults || td->maxRows != DEFAULT_MAX_ROWS) {
+  if (!foreign_table && (dump_defaults || td->maxRows != DEFAULT_MAX_ROWS)) {
     with_options.push_back("MAX_ROWS=" + std::to_string(td->maxRows));
   }
-  if (dump_defaults || !td->hasDeletedCol) {
+  if (!foreign_table && (dump_defaults || !td->hasDeletedCol)) {
     with_options.push_back(td->hasDeletedCol ? "VACUUM='DELAYED'" : "VACUUM='IMMEDIATE'");
   }
-  if (!td->partitions.empty()) {
+  if (!foreign_table && !td->partitions.empty()) {
     with_options.push_back("PARTITIONS='" + td->partitions + "'");
   }
-  if (td->nShards > 0) {
+  if (!foreign_table && td->nShards > 0) {
     const auto shard_cd = getMetadataForColumn(td->tableId, td->shardedColumnId);
     CHECK(shard_cd);
-    with_options.push_back("SHARD_COUNT=" + std::to_string(td->nShards));
+    with_options.push_back(
+        "SHARD_COUNT=" +
+        std::to_string(td->nShards * std::max(g_leaf_count, static_cast<size_t>(1))));
   }
-  if (td->sortedColumnId > 0) {
+  if (!foreign_table && td->sortedColumnId > 0) {
     const auto sort_cd = getMetadataForColumn(td->tableId, td->sortedColumnId);
     CHECK(sort_cd);
     with_options.push_back("SORT_COLUMN='" + sort_cd->columnName + "'");
   }
-  os << ")";
+
   if (!with_options.empty()) {
     if (!multiline_formatting) {
       os << " ";
@@ -4054,4 +4298,61 @@ std::string Catalog::dumpCreateTable(const TableDescriptor* td,
   return os.str();
 }
 
+bool Catalog::validateNonExistentTableOrView(const std::string& name,
+                                             const bool if_not_exists) {
+  if (getMetadataForTable(name, false)) {
+    if (if_not_exists) {
+      return false;
+    }
+    throw std::runtime_error("Table or View with name \"" + name + "\" already exists.");
+  }
+  return true;
+}
+
+std::vector<const TableDescriptor*> Catalog::getAllForeignTablesForRefresh() const {
+  cat_read_lock read_lock(this);
+  std::vector<const TableDescriptor*> tables;
+  for (auto entry : tableDescriptorMapById_) {
+    auto table_descriptor = entry.second;
+    if (table_descriptor->storageType == StorageType::FOREIGN_TABLE) {
+      auto foreign_table = dynamic_cast<foreign_storage::ForeignTable*>(table_descriptor);
+      CHECK(foreign_table);
+      auto timing_type_entry = foreign_table->options.find(
+          foreign_storage::ForeignTable::REFRESH_TIMING_TYPE_KEY);
+      CHECK(timing_type_entry != foreign_table->options.end());
+      int64_t current_time = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+      if (timing_type_entry->second ==
+              foreign_storage::ForeignTable::SCHEDULE_REFRESH_TIMING_TYPE &&
+          foreign_table->next_refresh_time <= current_time) {
+        tables.emplace_back(foreign_table);
+      }
+    }
+  }
+  return tables;
+}
+
+void Catalog::updateForeignTableRefreshTimes(const int32_t table_id) {
+  cat_write_lock write_lock(this);
+  cat_sqlite_lock sqlite_lock(this);
+  CHECK(tableDescriptorMapById_.find(table_id) != tableDescriptorMapById_.end());
+  auto table_descriptor = tableDescriptorMapById_.find(table_id)->second;
+  CHECK(table_descriptor);
+  auto foreign_table = dynamic_cast<foreign_storage::ForeignTable*>(table_descriptor);
+  CHECK(foreign_table);
+  int64_t current_time = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+  auto last_refresh_time = current_time;
+  auto next_refresh_time = get_next_refresh_time(*foreign_table);
+  sqliteConnector_.query_with_text_params(
+      "UPDATE omnisci_foreign_tables SET last_refresh_time = ?, next_refresh_time = ? "
+      "WHERE table_id = ?",
+      std::vector<std::string>{std::to_string(last_refresh_time),
+                               std::to_string(next_refresh_time),
+                               std::to_string(foreign_table->tableId)});
+  foreign_table->last_refresh_time = last_refresh_time;
+  foreign_table->next_refresh_time = next_refresh_time;
+}
 }  // namespace Catalog_Namespace

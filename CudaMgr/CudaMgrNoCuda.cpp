@@ -15,7 +15,7 @@
  */
 
 #include "CudaMgr.h"
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 namespace CudaMgr_Namespace {
 
@@ -79,7 +79,7 @@ bool CudaMgr::isArchMaxwellOrLaterForAll() const {
   CHECK(false);
   return false;
 }
-bool CudaMgr::isArchVoltaForAll() const {
+bool CudaMgr::isArchVoltaOrGreaterForAll() const {
   CHECK(false);
   return false;
 }

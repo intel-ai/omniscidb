@@ -14,19 +14,9 @@
  * limitations under the License.
  */
 
-#include "StringDictionary.h"
-#include "../Shared/sqltypes.h"
-#include "../Utils/Regexp.h"
-#include "../Utils/StringLike.h"
-#include "LeafHostInfo.h"
-#include "Shared/Logger.h"
-#include "Shared/thread_count.h"
-#include "StringDictionaryClient.h"
+#include "StringDictionary/StringDictionary.h"
 
-#include <sys/fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-
+#include <tbb/parallel_for.h>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/sort/spreadsort/string_sort.hpp>
@@ -38,18 +28,31 @@
 #include <string_view>
 #include <thread>
 
-namespace {
-const int SYSTEM_PAGE_SIZE = getpagesize();
+// TODO(adb): fixup
+#ifdef _MSC_VER
+#include <fcntl.h>
+#else
+#include <sys/fcntl.h>
+#endif
 
-size_t file_size(const int fd) {
-  struct stat buf;
-  int err = fstat(fd, &buf);
-  CHECK_EQ(0, err);
-  return buf.st_size;
-}
+#include "Logger/Logger.h"
+#include "OSDependent/omnisci_fs.h"
+#include "Shared/sqltypes.h"
+#include "Shared/thread_count.h"
+#include "StringDictionaryClient.h"
+#include "Utils/Regexp.h"
+#include "Utils/StringLike.h"
+
+#include "LeafHostInfo.h"
+
+bool g_cache_string_hash{true};
+
+namespace {
+
+const int SYSTEM_PAGE_SIZE = omnisci::get_page_size();
 
 int checked_open(const char* path, const bool recover) {
-  auto fd = open(path, O_RDWR | O_CREAT | (recover ? O_APPEND : O_TRUNC), 0644);
+  auto fd = omnisci::open(path, O_RDWR | O_CREAT | (recover ? O_APPEND : O_TRUNC), 0644);
   if (fd > 0) {
     return fd;
   }
@@ -57,22 +60,6 @@ int checked_open(const char* path, const bool recover) {
              std::string(" does not exist.");
   LOG(ERROR) << err;
   throw DictPayloadUnavailable(err);
-}
-
-void* checked_mmap(const int fd, const size_t sz) {
-  auto ptr = mmap(nullptr, sz, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-  CHECK(ptr != reinterpret_cast<void*>(-1));
-#ifdef __linux__
-#ifdef MADV_HUGEPAGE
-  madvise(ptr, sz, MADV_RANDOM | MADV_WILLNEED | MADV_HUGEPAGE);
-#else
-  madvise(ptr, sz, MADV_RANDOM | MADV_WILLNEED);
-#endif
-#endif
-  return ptr;
-}
-void checked_munmap(void* addr, size_t length) {
-  CHECK_EQ(0, munmap(addr, length));
 }
 
 const uint64_t round_up_p2(const uint64_t num) {
@@ -139,35 +126,47 @@ StringDictionary::StringDictionary(const std::string& folder,
         (storage_path / boost::filesystem::path("DictPayload")).string();
     payload_fd_ = checked_open(payload_path.c_str(), recover);
     offset_fd_ = checked_open(offsets_path_.c_str(), recover);
-    payload_file_size_ = file_size(payload_fd_);
-    offset_file_size_ = file_size(offset_fd_);
+    payload_file_size_ = omnisci::file_size(payload_fd_);
+    offset_file_size_ = omnisci::file_size(offset_fd_);
   }
-
+  bool storage_is_empty = false;
   if (payload_file_size_ == 0) {
+    storage_is_empty = true;
     addPayloadCapacity();
   }
   if (offset_file_size_ == 0) {
     addOffsetCapacity();
   }
   if (!isTemp_) {  // we never mmap or recover temp dictionaries
-    payload_map_ = reinterpret_cast<char*>(checked_mmap(payload_fd_, payload_file_size_));
-    offset_map_ =
-        reinterpret_cast<StringIdxEntry*>(checked_mmap(offset_fd_, offset_file_size_));
+    payload_map_ =
+        reinterpret_cast<char*>(omnisci::checked_mmap(payload_fd_, payload_file_size_));
+    offset_map_ = reinterpret_cast<StringIdxEntry*>(
+        omnisci::checked_mmap(offset_fd_, offset_file_size_));
     if (recover) {
-      const size_t bytes = file_size(offset_fd_);
+      const size_t bytes = omnisci::file_size(offset_fd_);
       if (bytes % sizeof(StringIdxEntry) != 0) {
         LOG(WARNING) << "Offsets " << offsets_path_ << " file is truncated";
       }
-      const uint64_t str_count = bytes / sizeof(StringIdxEntry);
+      const uint64_t str_count =
+          storage_is_empty ? 0 : getNumStringsFromStorage(bytes / sizeof(StringIdxEntry));
+      collisions_ = 0;
       // at this point we know the size of the StringDict we need to load
       // so lets reallocate the vector to the correct size
-      const uint64_t max_entries = round_up_p2(str_count * 2 + 1);
+      const uint64_t max_entries =
+          std::max(round_up_p2(str_count * 2 + 1),
+                   round_up_p2(std::max(initial_capacity, static_cast<size_t>(1))));
       std::vector<int32_t> new_str_ids(max_entries, INVALID_STR_ID);
       string_id_hash_table_.swap(new_str_ids);
       if (materialize_hashes_) {
         std::vector<uint32_t> new_rk_hashes(max_entries / 2);
         rk_hashes_.swap(new_rk_hashes);
       }
+      // Bail early if we know we don't have strings to add (i.e. a new or empty
+      // dictionary)
+      if (str_count == 0) {
+        return;
+      }
+
       unsigned string_id = 0;
       mapd_lock_guard<mapd_shared_mutex> write_lock(rw_mutex_);
 
@@ -204,6 +203,10 @@ StringDictionary::StringDictionary(const std::string& folder,
       if (dictionary_futures.size() != 0) {
         processDictionaryFutures(dictionary_futures);
       }
+      VLOG(1) << "Opened string dictionary " << folder << " # Strings: " << str_count_
+              << " Hash table size: " << string_id_hash_table_.size() << " Fill rate: "
+              << static_cast<double>(str_count_) * 100.0 / string_id_hash_table_.size()
+              << "% Collisions: " << collisions_;
     }
   }
 }
@@ -227,6 +230,36 @@ void StringDictionary::processDictionaryFutures(
   dictionary_futures.clear();
 }
 
+/**
+ * Method to retrieve number of strings in storage via a binary search for the first
+ * canary
+ * @param storage_slots number of storage entries we should search to find the minimum
+ * canary
+ * @return number of strings in storage
+ */
+size_t StringDictionary::getNumStringsFromStorage(const size_t storage_slots) const
+    noexcept {
+  if (storage_slots == 0) {
+    return 0;
+  }
+  // Must use signed integers since final binary search step can wrap to max size_t value
+  // if dictionary is empty
+  int64_t min_bound = 0;
+  int64_t max_bound = storage_slots - 1;
+  int64_t guess{0};
+  while (min_bound <= max_bound) {
+    guess = (max_bound + min_bound) / 2;
+    CHECK_GE(guess, 0);
+    if (getStringFromStorage(guess).canary) {
+      max_bound = guess - 1;
+    } else {
+      min_bound = guess + 1;
+    }
+  }
+  CHECK_GE(guess + (min_bound > guess ? 1 : 0), 0);
+  return guess + (min_bound > guess ? 1 : 0);
+}
+
 StringDictionary::StringDictionary(const LeafHostInfo& host, const DictRef dict_ref)
     : strings_cache_(nullptr)
     , client_(new StringDictionaryClient(host, dict_ref, true))
@@ -240,12 +273,12 @@ StringDictionary::~StringDictionary() noexcept {
   if (payload_map_) {
     if (!isTemp_) {
       CHECK(offset_map_);
-      checked_munmap(payload_map_, payload_file_size_);
-      checked_munmap(offset_map_, offset_file_size_);
+      omnisci::checked_munmap(payload_map_, payload_file_size_);
+      omnisci::checked_munmap(offset_map_, offset_file_size_);
       CHECK_GE(payload_fd_, 0);
-      close(payload_fd_);
+      omnisci::close(payload_fd_);
       CHECK_GE(offset_fd_, 0);
-      close(offset_fd_);
+      omnisci::close(offset_fd_);
     } else {
       CHECK(offset_map_);
       free(payload_map_);
@@ -745,7 +778,7 @@ std::vector<int32_t> StringDictionary::getCompare(const std::string& pattern,
 
   // since we have a cache in form of vector of ints which is sorted according to
   // corresponding strings in the dictionary all we need is the index of the element
-  // which equal to the pattern that we are trying to match or the index of “biggest”
+  // which equal to the pattern that we are trying to match or the index of  biggest
   // element smaller than the pattern, to perform all the comparison operators over
   // string. The search function guarantees we have such index so now it is just the
   // matter to include all the elements in the result vector.
@@ -802,7 +835,7 @@ std::vector<int32_t> StringDictionary::getCompare(const std::string& pattern,
     // For >= operator when the indexed element that we have points to element which is
     // equal to the pattern we are searching for we want to include that in the result
     // vector. If the index that we have does not point to the string which is equal to
-    // the pattern we are searching we don’t want to include that id into the result
+    // the pattern we are searching we don t want to include that id into the result
     // vector except when the index is 0.
 
   } else if (comp_operator == ">=") {
@@ -1150,13 +1183,14 @@ uint32_t StringDictionary::computeBucketFromStorageAndMemory(
 
 uint32_t StringDictionary::computeUniqueBucketWithHash(
     const uint32_t hash,
-    const std::vector<int32_t>& data) const noexcept {
+    const std::vector<int32_t>& data) noexcept {
   auto bucket = hash & (data.size() - 1);
   while (true) {
     if (data[bucket] ==
         INVALID_STR_ID) {  // In this case it means the slot is available for use
       break;
     }
+    collisions_++;
     // wrap around
     if (++bucket == data.size()) {
       bucket = 0;
@@ -1172,11 +1206,11 @@ void StringDictionary::checkAndConditionallyIncreasePayloadCapacity(
         write_length - (payload_file_size_ - payload_file_off_);
     if (!isTemp_) {
       CHECK_GE(payload_fd_, 0);
-      checked_munmap(payload_map_, payload_file_size_);
+      omnisci::checked_munmap(payload_map_, payload_file_size_);
       addPayloadCapacity(min_capacity_needed);
       CHECK(payload_file_off_ + write_length <= payload_file_size_);
       payload_map_ =
-          reinterpret_cast<char*>(checked_mmap(payload_fd_, payload_file_size_));
+          reinterpret_cast<char*>(omnisci::checked_mmap(payload_fd_, payload_file_size_));
     } else {
       addPayloadCapacity(min_capacity_needed);
       CHECK(payload_file_off_ + write_length <= payload_file_size_);
@@ -1192,11 +1226,11 @@ void StringDictionary::checkAndConditionallyIncreaseOffsetCapacity(
         write_length - (offset_file_size_ - offset_file_off);
     if (!isTemp_) {
       CHECK_GE(offset_fd_, 0);
-      checked_munmap(offset_map_, offset_file_size_);
+      omnisci::checked_munmap(offset_map_, offset_file_size_);
       addOffsetCapacity(min_capacity_needed);
       CHECK(offset_file_off + write_length <= offset_file_size_);
-      offset_map_ =
-          reinterpret_cast<StringIdxEntry*>(checked_mmap(offset_fd_, offset_file_size_));
+      offset_map_ = reinterpret_cast<StringIdxEntry*>(
+          omnisci::checked_mmap(offset_fd_, offset_file_size_));
     } else {
       addOffsetCapacity(min_capacity_needed);
       CHECK(offset_file_off + write_length <= offset_file_size_);
@@ -1293,7 +1327,7 @@ size_t StringDictionary::addStorageCapacity(
   memset(CANARY_BUFFER, 0xff, canary_buff_size_to_add);
 
   CHECK_NE(lseek(fd, 0, SEEK_END), -1);
-  ssize_t write_return = write(fd, CANARY_BUFFER, canary_buff_size_to_add);
+  const auto write_return = write(fd, CANARY_BUFFER, canary_buff_size_to_add);
   CHECK(write_return > 0 &&
         (static_cast<size_t>(write_return) == canary_buff_size_to_add));
   return canary_buff_size_to_add;
@@ -1343,10 +1377,12 @@ bool StringDictionary::checkpoint() noexcept {
   }
   CHECK(!isTemp_);
   bool ret = true;
-  ret = ret && (msync((void*)offset_map_, offset_file_size_, MS_SYNC) == 0);
-  ret = ret && (msync((void*)payload_map_, payload_file_size_, MS_SYNC) == 0);
-  ret = ret && (fsync(offset_fd_) == 0);
-  ret = ret && (fsync(payload_fd_) == 0);
+  ret = ret &&
+        (omnisci::msync((void*)offset_map_, offset_file_size_, /*async=*/false) == 0);
+  ret = ret &&
+        (omnisci::msync((void*)payload_map_, payload_file_size_, /*async=*/false) == 0);
+  ret = ret && (omnisci::fsync(offset_fd_) == 0);
+  ret = ret && (omnisci::fsync(payload_fd_) == 0);
   return ret;
 }
 

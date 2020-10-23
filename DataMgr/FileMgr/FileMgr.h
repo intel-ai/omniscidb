@@ -44,14 +44,14 @@ using namespace Data_Namespace;
 namespace File_Namespace {
 
 class GlobalFileMgr;  // forward declaration
-                      /**
-                       * @type PageSizeFileMMap
-                       * @brief Maps logical page sizes to files.
-                       *
-                       * The file manager uses this type in order to quickly find files of a certain page size.
-                       * A multimap is used to associate the key (page size) with values (file identifiers of
-                       * files                       having the matching page size).
-                       */
+/**
+ * @type PageSizeFileMMap
+ * @brief Maps logical page sizes to files.
+ *
+ * The file manager uses this type in order to quickly find files of a certain page size.
+ * A multimap is used to associate the key (page size) with values (file identifiers of
+ * files having the matching page size).
+ */
 using PageSizeFileMMap = std::multimap<size_t, int>;
 
 /**
@@ -106,9 +106,9 @@ class FileMgr : public AbstractBufferMgr {  // implements
   ~FileMgr() override;
 
   /// Creates a chunk with the specified key and page size.
-  AbstractBuffer* createBuffer(const ChunkKey& key,
-                               size_t pageSize = 0,
-                               const size_t numBytes = 0) override;
+  FileBuffer* createBuffer(const ChunkKey& key,
+                           size_t pageSize = 0,
+                           const size_t numBytes = 0) override;
 
   bool isBufferOnDevice(const ChunkKey& key) override;
   /// Deletes the chunk with the specified key
@@ -121,7 +121,7 @@ class FileMgr : public AbstractBufferMgr {  // implements
                                const bool purge = true) override;
 
   /// Returns the a pointer to the chunk with the specified key.
-  AbstractBuffer* getBuffer(const ChunkKey& key, const size_t numBytes = 0) override;
+  FileBuffer* getBuffer(const ChunkKey& key, const size_t numBytes = 0) override;
 
   void fetchBuffer(const ChunkKey& key,
                    AbstractBuffer* destBuffer,
@@ -133,9 +133,9 @@ class FileMgr : public AbstractBufferMgr {  // implements
    * @param d - An object representing the source data for the Chunk.
    * @return AbstractBuffer*
    */
-  AbstractBuffer* putBuffer(const ChunkKey& key,
-                            AbstractBuffer* d,
-                            const size_t numBytes = 0) override;
+  FileBuffer* putBuffer(const ChunkKey& key,
+                        AbstractBuffer* d,
+                        const size_t numBytes = 0) override;
 
   // Buffer API
   AbstractBuffer* alloc(const size_t numBytes) override;
@@ -182,7 +182,6 @@ class FileMgr : public AbstractBufferMgr {  // implements
                         std::vector<Page>& pages,
                         const bool isMetadata);
 
-  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadataVec) override;
   void getChunkMetadataVecForKeyPrefix(ChunkMetadataVector& chunkMetadataVec,
                                        const ChunkKey& keyPrefix) override;
 
@@ -244,10 +243,10 @@ class FileMgr : public AbstractBufferMgr {  // implements
   size_t defaultPageSize_;
   unsigned nextFileId_;  /// the index of the next file id
   int epoch_;            /// the current epoch (time of last checkpoint)
-  FILE* epochFile_;
-  int db_version_;    /// DB version from dbmeta file, should be compatible with
-                      /// GlobalFileMgr::mapd_db_version_
-  FILE* DBMetaFile_;  /// pointer to DB level metadata
+  FILE* epochFile_ = nullptr;
+  int db_version_;              /// DB version from dbmeta file, should be compatible with
+                                /// GlobalFileMgr::mapd_db_version_
+  FILE* DBMetaFile_ = nullptr;  /// pointer to DB level metadata
   // bool isDirty_;      /// true if metadata changed since last writeState()
   std::mutex getPageMutex_;
   mutable mapd_shared_mutex chunkIndexMutex_;
@@ -287,6 +286,9 @@ class FileMgr : public AbstractBufferMgr {  // implements
   void setEpoch(int epoch);  // resets current value of epoch at startup
   void processFileFutures(std::vector<std::future<std::vector<HeaderInfo>>>& file_futures,
                           std::vector<HeaderInfo>& headerVec);
+  FileBuffer* createBufferUnlocked(const ChunkKey& key,
+                                   size_t pageSize = 0,
+                                   const size_t numBytes = 0);
 };
 
 }  // namespace File_Namespace

@@ -16,7 +16,7 @@
 
 #include "TestHelpers.h"
 
-#include "../Import/Importer.h"
+#include "../ImportExport/Importer.h"
 #include "../Parser/parser.h"
 #include "../QueryEngine/ArrowResultSet.h"
 #include "../QueryEngine/Descriptors/RelAlgExecutionDescriptor.h"
@@ -24,7 +24,6 @@
 #include "../QueryEngine/FromTableReordering.h"
 #include "../QueryRunner/QueryRunner.h"
 #include "../Shared/Compressor.h"
-#include "../Shared/TimeGM.h"
 #include "../Shared/scope.h"
 #include "../SqliteConnector/SqliteConnector.h"
 #include "DistributedLoader.h"

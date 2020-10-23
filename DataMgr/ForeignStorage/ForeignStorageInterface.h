@@ -70,8 +70,6 @@ class ForeignStorageBuffer : public Data_Namespace::AbstractBuffer {
     return Data_Namespace::MemoryLevel::DISK_LEVEL;
   };
 
-  size_t size() const override { return size_; }
-
   std::vector<int8_t> moveBuffer() { return std::move(buff_); }
 
   void write(int8_t* src,
@@ -153,8 +151,6 @@ class ForeignStorageBufferMgr : public Data_Namespace::AbstractBufferMgr {
     CHECK(false);
     return nullptr;
   }
-
-  void getChunkMetadataVec(ChunkMetadataVector& chunkMetadata) override { CHECK(false); }
 
   bool isBufferOnDevice(const ChunkKey& key) override {
     CHECK(false);

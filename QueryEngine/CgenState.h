@@ -22,6 +22,7 @@
 #include "LLVMGlobalContext.h"
 
 #include "../Analyzer/Analyzer.h"
+#include "../Shared/InsertionOrderedMap.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
@@ -29,16 +30,32 @@
 
 struct CgenState {
  public:
-  CgenState(const std::vector<InputTableInfo>& query_infos,
-            const bool contains_left_deep_outer_join)
+  CgenState(const size_t num_query_infos, const bool contains_left_deep_outer_join)
       : module_(nullptr)
       , row_func_(nullptr)
+      , filter_func_(nullptr)
+      , current_func_(nullptr)
+      , row_func_bb_(nullptr)
+      , filter_func_bb_(nullptr)
+      , row_func_call_(nullptr)
+      , filter_func_call_(nullptr)
       , context_(getGlobalLLVMContext())
       , ir_builder_(context_)
       , contains_left_deep_outer_join_(contains_left_deep_outer_join)
-      , outer_join_match_found_per_level_(std::max(query_infos.size(), size_t(1)) - 1)
-      , query_infos_(query_infos)
+      , outer_join_match_found_per_level_(std::max(num_query_infos, size_t(1)) - 1)
       , needs_error_check_(false)
+      , needs_geos_(false)
+      , query_func_(nullptr)
+      , query_func_entry_ir_builder_(context_){};
+
+  CgenState(llvm::LLVMContext& context)
+      : module_(nullptr)
+      , row_func_(nullptr)
+      , context_(context)
+      , ir_builder_(context_)
+      , contains_left_deep_outer_join_(false)
+      , needs_error_check_(false)
+      , needs_geos_(false)
       , query_func_(nullptr)
       , query_func_entry_ir_builder_(context_){};
 
@@ -312,6 +329,12 @@ struct CgenState {
 
   llvm::Module* module_;
   llvm::Function* row_func_;
+  llvm::Function* filter_func_;
+  llvm::Function* current_func_;
+  llvm::BasicBlock* row_func_bb_;
+  llvm::BasicBlock* filter_func_bb_;
+  llvm::CallInst* row_func_call_;
+  llvm::CallInst* filter_func_call_;
   std::vector<llvm::Function*> helper_functions_;
   llvm::LLVMContext& context_;
   llvm::ValueToValueMapTy vmap_;  // used for cloning the runtime module
@@ -328,9 +351,10 @@ struct CgenState {
   const bool contains_left_deep_outer_join_;
   std::vector<llvm::Value*> outer_join_match_found_per_level_;
   std::unordered_map<int, llvm::Value*> scan_idx_to_hash_pos_;
+  InsertionOrderedMap filter_func_args_;
   std::vector<std::unique_ptr<const InValuesBitmap>> in_values_bitmaps_;
-  const std::vector<InputTableInfo>& query_infos_;
   bool needs_error_check_;
+  bool needs_geos_;
 
   llvm::Function* query_func_;
   llvm::IRBuilder<> query_func_entry_ir_builder_;
@@ -403,3 +427,5 @@ struct CgenState {
   std::unordered_map<int, LiteralValues> literals_;
   std::unordered_map<int, size_t> literal_bytes_;
 };
+
+#include "AutomaticIRMetadataGuard.h"

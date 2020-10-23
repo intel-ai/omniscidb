@@ -34,8 +34,8 @@ source $SCRIPTS_DIR/common-functions.sh
 source /etc/os-release
 if [ "$ID" == "ubuntu" ] ; then
   PACKAGER="apt -y"
-  if [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ] && [ "$VERSION_ID" != "16.04" ]; then
-    echo "Ubuntu 19.10, 19.04, 18.04, and 16.04 are the only debian-based releases supported by this script"
+  if [ "$VERSION_ID" != "20.04" ] && [ "$VERSION_ID" != "19.10" ] && [ "$VERSION_ID" != "19.04" ] && [ "$VERSION_ID" != "18.04" ]; then
+    echo "Ubuntu 20.04, 19.10, 19.04, and 18.04 are the only debian-based releases supported by this script"
     exit 1
   fi
 else
@@ -46,16 +46,16 @@ fi
 sudo mkdir -p $PREFIX
 sudo chown -R $(id -u) $PREFIX
 
-sudo apt update
-sudo apt install -y \
+DEBIAN_FRONTEND=noninteractive sudo apt update
+DEBIAN_FRONTEND=noninteractive sudo apt install -y \
     software-properties-common \
     build-essential \
     ccache \
     git \
     wget \
     curl \
-    gcc \
-    g++ \
+    gcc-8 \
+    g++-8 \
     libboost-all-dev \
     libgoogle-glog-dev \
     libssl-dev \
@@ -101,6 +101,11 @@ sudo apt install -y \
     libxerces-c-dev \
     libxmlsec1-dev
 
+# Set up gcc-8 as default gcc
+sudo update-alternatives \
+  --install /usr/bin/gcc gcc /usr/bin/gcc-8 800 \
+  --slave /usr/bin/g++ g++ /usr/bin/g++-8
+
 # Needed to find sqlite3, xmltooling, and xml_security_c
 export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PKG_CONFIG_PATH
 export PATH=$PREFIX/bin:$PATH
@@ -111,6 +116,7 @@ install_cmake
 
 # llvm
 # (see common-functions.sh)
+LLVM_BUILD_DYLIB=true
 install_llvm
 
 # Geo Support
@@ -202,7 +208,7 @@ popd
 install_rdkafka
 
 # glslang (with spirv-tools)
-VERS=7.12.3352 # 8/20/19
+VERS=8.13.3743 # stable 4/27/20
 rm -rf glslang
 mkdir -p glslang
 pushd glslang
@@ -223,7 +229,7 @@ popd # glslang-$VERS
 popd # glslang
 
 # spirv-cross
-VERS=2019-09-04
+VERS=2020-06-29 # latest from 6/29/20
 rm -rf spirv-cross
 mkdir -p spirv-cross
 pushd spirv-cross
@@ -246,7 +252,7 @@ popd # spirv-cross
 
 # Vulkan
 # Custom tarball which excludes the spir-v toolchain
-VERS=1.1.126.0 # 11/1/19
+VERS=1.2.148.1 # stable 8/9/20
 rm -rf vulkan
 mkdir -p vulkan
 pushd vulkan

@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "ExternalExecutor.h"
-#include "OutputBufferInitialization.h"
+#include "QueryEngine/ExternalExecutor.h"
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
+#include "QueryEngine/Execute.h"
+#include "QueryEngine/OutputBufferInitialization.h"
 #include "SqliteConnector/SqliteConnector.h"
 
 namespace {

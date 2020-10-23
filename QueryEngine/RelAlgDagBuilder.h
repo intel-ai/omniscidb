@@ -14,8 +14,14 @@
  * limitations under the License.
  */
 
+/** Notes:
+ *  * All copy constuctors of child classes of RelAlgNode are deep copies,
+ *    and are invoked by the the RelAlgNode::deepCopy() overloads.
+ */
+
 #pragma once
 
+#include <atomic>
 #include <iterator>
 #include <memory>
 #include <unordered_map>
@@ -24,9 +30,11 @@
 #include <boost/core/noncopyable.hpp>
 
 #include "Catalog/Catalog.h"
+#include "QueryEngine/QueryHint.h"
 #include "QueryEngine/Rendering/RenderInfo.h"
 #include "QueryEngine/TargetMetaInfo.h"
 #include "QueryEngine/TypePunning.h"
+#include "Shared/sql_type_to_string.h"
 #include "Shared/sql_window_function_to_string.h"
 #include "Utils/FsiUtils.h"
 
@@ -40,7 +48,6 @@ class Rex {
 };
 
 class RexScalar : public Rex {};
-
 // For internal use of the abstract interpreter only. The result after abstract
 // interpretation will not have any references to 'RexAbstractInput' objects.
 class RexAbstractInput : public RexScalar {
@@ -52,7 +59,7 @@ class RexAbstractInput : public RexScalar {
   void setIndex(const unsigned in_index) const { in_index_ = in_index; }
 
   std::string toString() const override {
-    return "(RexAbstractInput " + std::to_string(in_index_) + ")";
+    return cat(::typeName(this), "(", std::to_string(in_index_), ")");
   }
 
  private:
@@ -159,7 +166,14 @@ class RexLiteral : public RexScalar {
   unsigned getTypePrecision() const { return type_precision_; }
 
   std::string toString() const override {
-    return "(RexLiteral " + boost::lexical_cast<std::string>(literal_) + ")";
+    return cat(::typeName(this),
+               "(",
+               boost::lexical_cast<std::string>(literal_),
+               ", type=",
+               (type_ == kNULLT ? "null" : sql_type_to_str(type_)),
+               ", target_type=",
+               (target_type_ == kNULLT ? "null" : sql_type_to_str(target_type_)),
+               ")");
   }
 
   std::unique_ptr<RexLiteral> deepCopy() const {
@@ -235,11 +249,14 @@ class RexOperator : public RexScalar {
   const SQLTypeInfo& getType() const { return type_; }
 
   std::string toString() const override {
-    std::string result = "(RexOperator " + std::to_string(op_);
-    for (const auto& operand : operands_) {
-      result += " " + operand->toString();
-    }
-    return result + ")";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(op_),
+               ", operands=",
+               ::toString(operands_),
+               ", type=",
+               type_.to_string(),
+               ")");
   };
 
  protected:
@@ -285,11 +302,11 @@ class RexSubQuery : public RexScalar {
     return *(result_.get());
   }
 
+  unsigned getId() const;
+
   const RelAlgNode* getRelAlg() const { return ra_.get(); }
 
-  std::string toString() const override {
-    return "(RexSubQuery " + std::to_string(reinterpret_cast<const uint64_t>(this)) + ")";
-  }
+  std::string toString() const override;
 
   std::unique_ptr<RexSubQuery> deepCopy() const;
 
@@ -319,10 +336,7 @@ class RexInput : public RexAbstractInput {
     return getSourceNode() == that.getSourceNode() && getIndex() == that.getIndex();
   }
 
-  std::string toString() const override {
-    return "(RexInput " + std::to_string(getIndex()) + " " +
-           std::to_string(reinterpret_cast<const uint64_t>(node_)) + ")";
-  }
+  std::string toString() const override;
 
   std::unique_ptr<RexInput> deepCopy() const {
     return std::make_unique<RexInput>(node_, getIndex());
@@ -368,15 +382,12 @@ class RexCase : public RexScalar {
   const RexScalar* getElse() const { return else_expr_.get(); }
 
   std::string toString() const override {
-    std::string ret = "(RexCase";
-    for (const auto& expr_pair : expr_pair_list_) {
-      ret += " " + expr_pair.first->toString() + " -> " + expr_pair.second->toString();
-    }
-    if (else_expr_) {
-      ret += " else " + else_expr_->toString();
-    }
-    ret += ")";
-    return ret;
+    return cat(::typeName(this),
+               "(expr_pair_list=",
+               ::toString(expr_pair_list_),
+               ", else_expr=",
+               (else_expr_ ? else_expr_->toString() : "null"),
+               ")");
   }
 
  private:
@@ -405,11 +416,7 @@ class RexFunctionOperator : public RexOperator {
   const std::string& getName() const { return name_; }
 
   std::string toString() const override {
-    auto result = "(RexFunctionOperator " + name_;
-    for (const auto& operand : operands_) {
-      result += (" " + operand->toString());
-    }
-    return result + ")";
+    return cat(::typeName(this), "(", name_, ", operands=", ::toString(operands_), ")");
   }
 
  private:
@@ -439,9 +446,14 @@ class SortField {
   NullSortedPosition getNullsPosition() const { return nulls_pos_; }
 
   std::string toString() const {
-    return "(" + std::to_string(field_) + " " +
-           (sort_dir_ == SortDirection::Ascending ? "asc" : "desc") + " " +
-           (nulls_pos_ == NullSortedPosition::First ? "nulls_first" : "nulls_last") + ")";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(field_),
+               ", sort_dir=",
+               (sort_dir_ == SortDirection::Ascending ? "asc" : "desc"),
+               ", null_pos=",
+               (nulls_pos_ == NullSortedPosition::First ? "nulls_first" : "nulls_last"),
+               ")");
   }
 
  private:
@@ -519,21 +531,16 @@ class RexWindowFunctionOperator : public RexFunctionOperator {
   }
 
   std::string toString() const override {
-    auto result = "(RexWindowFunctionOperator " + getName();
-    for (const auto& operand : operands_) {
-      result += (" " + operand->toString());
-    }
-    result += " partition[";
-    for (const auto& partition_key : partition_keys_) {
-      result += (" " + partition_key->toString());
-    }
-    result += "]";
-    result += " order[";
-    for (const auto& order_key : order_keys_) {
-      result += (" " + order_key->toString());
-    }
-    result += "]";
-    return result + ")";
+    return cat(::typeName(this),
+               "(",
+               getName(),
+               ", operands=",
+               ::toString(operands_),
+               ", partition_keys=",
+               ::toString(partition_keys_),
+               ", order_keys=",
+               ::toString(order_keys_),
+               ")");
   }
 
  private:
@@ -555,7 +562,7 @@ class RexRef : public RexScalar {
   size_t getIndex() const { return index_; }
 
   std::string toString() const override {
-    return "(RexRef " + std::to_string(index_) + ")";
+    return cat(::typeName(this), "(", std::to_string(index_), ")");
   }
 
   std::unique_ptr<RexRef> deepCopy() const { return std::make_unique<RexRef>(index_); }
@@ -573,12 +580,16 @@ class RexAgg : public Rex {
       : agg_(agg), distinct_(distinct), type_(type), operands_(operands) {}
 
   std::string toString() const override {
-    auto result = "(RexAgg " + std::to_string(agg_) + " " + std::to_string(distinct_) +
-                  " " + type_.get_type_name() + " " + type_.get_compression_name();
-    for (auto operand : operands_) {
-      result += " " + std::to_string(operand);
-    }
-    return result + ")";
+    return cat(::typeName(this),
+               "(agg=",
+               std::to_string(agg_),
+               ", distinct=",
+               std::to_string(distinct_),
+               ", type=",
+               type_.get_type_name(),
+               ", operands=",
+               ::toString(operands_),
+               ")");
   }
 
   SQLAgg getKind() const { return agg_; }
@@ -601,6 +612,85 @@ class RexAgg : public Rex {
   const SQLTypeInfo type_;
   const std::vector<size_t> operands_;
 };
+
+class HintExplained {
+ public:
+  HintExplained(std::string hint_name,
+                bool query_hint,
+                bool is_marker,
+                bool has_kv_type_options)
+      : hint_name_(hint_name)
+      , query_hint_(query_hint)
+      , is_marker_(is_marker)
+      , has_kv_type_options_(has_kv_type_options) {}
+
+  HintExplained(std::string hint_name,
+                bool query_hint,
+                bool is_marker,
+                bool has_kv_type_options,
+                std::vector<std::string>& list_options)
+      : hint_name_(hint_name)
+      , query_hint_(query_hint)
+      , is_marker_(is_marker)
+      , has_kv_type_options_(has_kv_type_options)
+      , list_options_(std::move(list_options)) {}
+
+  HintExplained(std::string hint_name,
+                bool query_hint,
+                bool is_marker,
+                bool has_kv_type_options,
+                std::unordered_map<std::string, std::string>& kv_options)
+      : hint_name_(hint_name)
+      , query_hint_(query_hint)
+      , is_marker_(is_marker)
+      , has_kv_type_options_(has_kv_type_options)
+      , kv_options_(std::move(kv_options)) {}
+
+  void setListOptions(std::vector<std::string>& list_options) {
+    list_options_ = list_options;
+  }
+
+  void setKVOptions(std::unordered_map<std::string, std::string>& kv_options) {
+    kv_options_ = kv_options;
+  }
+
+  void setInheritPaths(std::vector<int>& interit_paths) {
+    inherit_paths_ = interit_paths;
+  }
+
+  const std::vector<std::string>& getListOptions() { return list_options_; }
+
+  const std::vector<int>& getInteritPath() { return inherit_paths_; }
+
+  const std::unordered_map<std::string, std::string>& getKVOptions() {
+    return kv_options_;
+  }
+
+  const std::string& getHintName() const { return hint_name_; }
+
+  bool isQueryHint() const { return query_hint_; }
+
+  bool hasOptions() const { return is_marker_; }
+
+  bool hasKvOptions() const { return has_kv_type_options_; }
+
+ private:
+  std::string hint_name_;
+  // Set true if this hint affects globally
+  // Otherwise it just affects the node which this hint is included (aka table hint)
+  bool query_hint_;
+  // set true if this has no extra options (neither list_options nor kv_options)
+  bool is_marker_;
+  // Set true if it is not a marker and has key-value type options
+  // Otherwise (it is not a marker but has list type options), we set this be false
+  bool has_kv_type_options_;
+  std::vector<int> inherit_paths_;  // currently not used
+  std::vector<std::string> list_options_;
+  std::unordered_map<std::string, std::string> kv_options_;
+};
+
+// a map from hint_name to its detailed info
+using Hints = std::unordered_map<std::string, HintExplained>;
 
 class RelAlgNode {
  public:
@@ -700,7 +790,10 @@ class RelAlgNode {
 class RelScan : public RelAlgNode {
  public:
   RelScan(const TableDescriptor* td, const std::vector<std::string>& field_names)
-      : td_(td), field_names_(field_names) {}
+      : td_(td)
+      , field_names_(field_names)
+      , hint_applied_(false)
+      , hints_(std::make_unique<Hints>()) {}
 
   size_t size() const override { return field_names_.size(); }
 
@@ -711,8 +804,8 @@ class RelScan : public RelAlgNode {
   const std::string getFieldName(const size_t i) const { return field_names_[i]; }
 
   std::string toString() const override {
-    return "(RelScan<" + std::to_string(reinterpret_cast<uint64_t>(this)) + "> " +
-           td_->tableName + ")";
+    return cat(
+        ::typeName(this), "(", td_->tableName, ", ", ::toString(field_names_), ")");
   }
 
   std::shared_ptr<RelAlgNode> deepCopy() const override {
@@ -720,9 +813,32 @@ class RelScan : public RelAlgNode {
     return nullptr;
   };
 
+  void addHint(const HintExplained& hint_explained) {
+    if (!hint_applied_) {
+      hint_applied_ = true;
+    }
+    hints_->emplace(hint_explained.getHintName(), hint_explained);
+  }
+
+  const bool hasHintEnabled(const std::string& candidate_hint_name) const {
+    if (hint_applied_ && !hints_->empty()) {
+      return hints_->find(candidate_hint_name) != hints_->end();
+    }
+    return false;
+  }
+
+  const HintExplained& getHintInfo(const std::string& hint_name) const {
+    CHECK(hint_applied_);
+    CHECK(!hints_->empty());
+    CHECK(hasHintEnabled(hint_name));
+    return hints_->at(hint_name);
+  }
+
  private:
   const TableDescriptor* td_;
   const std::vector<std::string> field_names_;
+  bool hint_applied_;
+  std::unique_ptr<Hints> hints_;
 };
 
 class ModifyManipulationTarget {
@@ -788,9 +904,13 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
              std::shared_ptr<const RelAlgNode> input)
       : ModifyManipulationTarget(false, false, false, nullptr)
       , scalar_exprs_(std::move(scalar_exprs))
-      , fields_(fields) {
+      , fields_(fields)
+      , hint_applied_(false)
+      , hints_(std::make_unique<Hints>()) {
     inputs_.push_back(input);
   }
+
+  RelProject(RelProject const&);
 
   void setExpressions(std::vector<std::unique_ptr<const RexScalar>>& exprs) const {
     scalar_exprs_ = std::move(exprs);
@@ -847,17 +967,36 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
                    std::unique_ptr<const RexScalar> new_input);
 
   std::string toString() const override {
-    std::string result =
-        "(RelProject<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">";
-    for (const auto& scalar_expr : scalar_exprs_) {
-      result += " " + scalar_expr->toString();
-    }
-    return result + ")";
+    return cat(
+        ::typeName(this), "(", ::toString(scalar_exprs_), ", ", ::toString(fields_), ")");
   }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelProject>(*this);
+  }
 
   bool hasWindowFunctionExpr() const;
+
+  void addHint(const HintExplained& hint_explained) {
+    if (!hint_applied_) {
+      hint_applied_ = true;
+    }
+    hints_->emplace(hint_explained.getHintName(), hint_explained);
+  }
+
+  const bool hasHintEnabled(const std::string& candidate_hint_name) const {
+    if (hint_applied_ && !hints_->empty()) {
+      return hints_->find(candidate_hint_name) != hints_->end();
+    }
+    return false;
+  }
+
+  const HintExplained& getHintInfo(const std::string& hint_name) const {
+    CHECK(hint_applied_);
+    CHECK(!hints_->empty());
+    CHECK(hasHintEnabled(hint_name));
+    return hints_->at(hint_name);
+  }
 
  private:
   template <typename EXPR_VISITOR_FUNCTOR>
@@ -876,6 +1015,8 @@ class RelProject : public RelAlgNode, public ModifyManipulationTarget {
 
   mutable std::vector<std::unique_ptr<const RexScalar>> scalar_exprs_;
   mutable std::vector<std::string> fields_;
+  bool hint_applied_;
+  std::unique_ptr<Hints> hints_;
 };
 
 class RelAggregate : public RelAlgNode {
@@ -885,9 +1026,15 @@ class RelAggregate : public RelAlgNode {
                std::vector<std::unique_ptr<const RexAgg>>& agg_exprs,
                const std::vector<std::string>& fields,
                std::shared_ptr<const RelAlgNode> input)
-      : groupby_count_(groupby_count), agg_exprs_(std::move(agg_exprs)), fields_(fields) {
+      : groupby_count_(groupby_count)
+      , agg_exprs_(std::move(agg_exprs))
+      , fields_(fields)
+      , hint_applied_(false)
+      , hints_(std::make_unique<Hints>()) {
     inputs_.push_back(input);
   }
+
+  RelAggregate(RelAggregate const&);
 
   size_t size() const override { return groupby_count_ + agg_exprs_.size(); }
 
@@ -923,24 +1070,49 @@ class RelAggregate : public RelAlgNode {
   }
 
   std::string toString() const override {
-    std::string result = "(RelAggregate<" +
-                         std::to_string(reinterpret_cast<uint64_t>(this)) + ">(groups: [";
-    for (size_t group_index = 0; group_index < groupby_count_; ++group_index) {
-      result += " " + std::to_string(group_index);
-    }
-    result += " ] aggs: [";
-    for (const auto& agg_expr : agg_exprs_) {
-      result += " " + agg_expr->toString();
-    }
-    return result + " ]))";
+    return cat(::typeName(this),
+               "(",
+               std::to_string(groupby_count_),
+               ", agg_exprs=",
+               ::toString(agg_exprs_),
+               ", fields=",
+               ::toString(fields_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelAggregate>(*this);
+  }
+
+  void addHint(const HintExplained& hint_explained) {
+    if (!hint_applied_) {
+      hint_applied_ = true;
+    }
+    hints_->emplace(hint_explained.getHintName(), hint_explained);
+  }
+
+  const bool hasHintEnabled(const std::string& candidate_hint_name) const {
+    if (hint_applied_ && !hints_->empty()) {
+      return hints_->find(candidate_hint_name) != hints_->end();
+    }
+    return false;
+  }
+
+  const HintExplained& getHintInfo(const std::string& hint_name) const {
+    CHECK(hint_applied_);
+    CHECK(!hints_->empty());
+    CHECK(hasHintEnabled(hint_name));
+    return hints_->at(hint_name);
+  }
 
  private:
   const size_t groupby_count_;
   std::vector<std::unique_ptr<const RexAgg>> agg_exprs_;
   std::vector<std::string> fields_;
+  bool hint_applied_;
+  std::unique_ptr<Hints> hints_;
 };
 
 class RelJoin : public RelAlgNode {
@@ -949,10 +1121,15 @@ class RelJoin : public RelAlgNode {
           std::shared_ptr<const RelAlgNode> rhs,
           std::unique_ptr<const RexScalar>& condition,
           const JoinType join_type)
-      : condition_(std::move(condition)), join_type_(join_type) {
+      : condition_(std::move(condition))
+      , join_type_(join_type)
+      , hint_applied_(false)
+      , hints_(std::make_unique<Hints>()) {
     inputs_.push_back(lhs);
     inputs_.push_back(rhs);
   }
+
+  RelJoin(RelJoin const&);
 
   JoinType getJoinType() const { return join_type_; }
 
@@ -969,20 +1146,47 @@ class RelJoin : public RelAlgNode {
                     std::shared_ptr<const RelAlgNode> input) override;
 
   std::string toString() const override {
-    std::string result =
-        "(RelJoin<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += condition_ ? condition_->toString() : "null";
-    result += " " + std::to_string(static_cast<int>(join_type_));
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               ::toString(inputs_),
+               ", condition=",
+               (condition_ ? condition_->toString() : "null"),
+               ", join_type=",
+               std::to_string(static_cast<int>(join_type_)));
   }
 
   size_t size() const override { return inputs_[0]->size() + inputs_[1]->size(); }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelJoin>(*this);
+  }
+
+  void addHint(const HintExplained& hint_explained) {
+    if (!hint_applied_) {
+      hint_applied_ = true;
+    }
+    hints_->emplace(hint_explained.getHintName(), hint_explained);
+  }
+
+  const bool hasHintEnabled(const std::string& candidate_hint_name) const {
+    if (hint_applied_ && !hints_->empty()) {
+      return hints_->find(candidate_hint_name) != hints_->end();
+    }
+    return false;
+  }
+
+  const HintExplained& getHintInfo(const std::string& hint_name) const {
+    CHECK(hint_applied_);
+    CHECK(!hints_->empty());
+    CHECK(hasHintEnabled(hint_name));
+    return hints_->at(hint_name);
+  }
 
  private:
   mutable std::unique_ptr<const RexScalar> condition_;
   const JoinType join_type_;
+  bool hint_applied_;
+  std::unique_ptr<Hints> hints_;
 };
 
 class RelFilter : public RelAlgNode {
@@ -993,6 +1197,8 @@ class RelFilter : public RelAlgNode {
     CHECK(filter_);
     inputs_.push_back(input);
   }
+
+  RelFilter(RelFilter const&);
 
   const RexScalar* getCondition() const { return filter_.get(); }
 
@@ -1009,13 +1215,16 @@ class RelFilter : public RelAlgNode {
                     std::shared_ptr<const RelAlgNode> input) override;
 
   std::string toString() const override {
-    std::string result =
-        "(RelFilter<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += filter_ ? filter_->toString() : "null";
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               (filter_ ? filter_->toString() : "null"),
+               ", ",
+               ::toString(inputs_) + ")");
   }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelFilter>(*this);
+  }
 
  private:
   std::unique_ptr<const RexScalar> filter_;
@@ -1074,16 +1283,20 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
                                  manipulation_target_table,
                                  target_columns)
       , filter_expr_(std::move(filter_expr))
-      , target_exprs_(target_exprs)
       , groupby_count_(groupby_count)
       , fields_(fields)
       , is_agg_(is_agg)
-      , scalar_sources_(std::move(scalar_sources)) {
+      , scalar_sources_(std::move(scalar_sources))
+      , target_exprs_(target_exprs)
+      , hint_applied_(false)
+      , hints_(std::make_unique<Hints>()) {
     CHECK_EQ(fields.size(), target_exprs.size());
     for (auto agg_expr : agg_exprs) {
       agg_exprs_.emplace_back(agg_expr);
     }
   }
+
+  RelCompound(RelCompound const&);
 
   void replaceInput(std::shared_ptr<const RelAlgNode> old_input,
                     std::shared_ptr<const RelAlgNode> input) override;
@@ -1117,29 +1330,35 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
 
   bool isAggregate() const { return is_agg_; }
 
-  std::string toString() const override {
-    std::string result =
-        "(RelCompound<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += (filter_expr_ ? filter_expr_->toString() : "null") + " ";
-    for (const auto target_expr : target_exprs_) {
-      result += target_expr->toString() + " ";
-    }
-    result += "groups: [";
-    for (size_t group_index = 0; group_index < groupby_count_; ++group_index) {
-      result += " " + std::to_string(group_index);
-    }
-    result += " ] sources: [";
-    for (const auto& scalar_source : scalar_sources_) {
-      result += " " + scalar_source->toString();
-    }
-    return result + " ]))";
+  std::string toString() const override;
+
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelCompound>(*this);
   }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  void addHint(const HintExplained& hint_explained) {
+    if (!hint_applied_) {
+      hint_applied_ = true;
+    }
+    hints_->emplace(hint_explained.getHintName(), hint_explained);
+  }
+
+  const bool hasHintEnabled(const std::string& candidate_hint_name) const {
+    if (hint_applied_ && !hints_->empty()) {
+      return hints_->find(candidate_hint_name) != hints_->end();
+    }
+    return false;
+  }
+
+  const HintExplained& getHintInfo(const std::string& hint_name) const {
+    CHECK(hint_applied_);
+    CHECK(!hints_->empty());
+    CHECK(hasHintEnabled(hint_name));
+    return hints_->at(hint_name);
+  }
 
  private:
   std::unique_ptr<const RexScalar> filter_expr_;
-  const std::vector<const Rex*> target_exprs_;
   const size_t groupby_count_;
   std::vector<std::unique_ptr<const RexAgg>> agg_exprs_;
   const std::vector<std::string> fields_;
@@ -1147,6 +1366,9 @@ class RelCompound : public RelAlgNode, public ModifyManipulationTarget {
   std::vector<std::unique_ptr<const RexScalar>>
       scalar_sources_;  // building blocks for group_indices_ and agg_exprs_; not actually
                         // projected, just owned
+  const std::vector<const Rex*> target_exprs_;
+  bool hint_applied_;
+  std::unique_ptr<Hints> hints_;
 };
 
 class RelSort : public RelAlgNode {
@@ -1184,22 +1406,24 @@ class RelSort : public RelAlgNode {
   size_t getOffset() const { return offset_; }
 
   std::string toString() const override {
-    std::string result =
-        "(RelSort<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">(";
-    result += "limit: " + std::to_string(limit_) + " ";
-    result += "offset: " + std::to_string(offset_) + " ";
-    result += "empty_result: " + std::to_string(empty_result_) + " ";
-    result += "collation: [ ";
-    for (const auto& sort_field : collation_) {
-      result += sort_field.toString() + " ";
-    }
-    result += "]";
-    return result + "))";
+    return cat(::typeName(this),
+               "(",
+               "collation=",
+               ::toString(collation_),
+               ", limit=",
+               std::to_string(limit_),
+               ", offset",
+               std::to_string(offset_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
   size_t size() const override { return inputs_[0]->size(); }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelSort>(*this);
+  }
 
  private:
   std::vector<SortField> collation_;
@@ -1281,23 +1505,22 @@ class RelModify : public RelAlgNode {
 
   size_t size() const override { return 0; }
   std::shared_ptr<RelAlgNode> deepCopy() const override {
-    return std::make_shared<RelModify>(catalog_,
-                                       table_descriptor_,
-                                       flattened_,
-                                       operation_,
-                                       target_column_list_,
-                                       inputs_[0]);
+    return std::make_shared<RelModify>(*this);
   }
 
   std::string toString() const override {
-    std::ostringstream result_stream;
-    result_stream << std::boolalpha
-                  << "(RelModify<" + std::to_string(reinterpret_cast<uint64_t>(this)) +
-                         "> "
-                  << table_descriptor_->tableName << " flattened= " << flattened_
-                  << " operation= " << yieldModifyOperationString(operation_) << ")";
-
-    return result_stream.str();
+    return cat(::typeName(this),
+               "(",
+               table_descriptor_->tableName,
+               ", flattened=",
+               std::to_string(flattened_),
+               ", op=",
+               yieldModifyOperationString(operation_),
+               ", target_column_list=",
+               ::toString(target_column_list_),
+               ", inputs=",
+               ::toString(inputs_),
+               ")");
   }
 
   void applyUpdateModificationsToInputNode() {
@@ -1373,7 +1596,7 @@ class RelModify : public RelAlgNode {
 class RelTableFunction : public RelAlgNode {
  public:
   RelTableFunction(const std::string& function_name,
-                   std::shared_ptr<const RelAlgNode> input,
+                   RelAlgInputs inputs,
                    std::vector<std::string>& fields,
                    std::vector<const Rex*> col_inputs,
                    std::vector<std::unique_ptr<const RexScalar>>& table_func_inputs,
@@ -1383,8 +1606,12 @@ class RelTableFunction : public RelAlgNode {
       , col_inputs_(col_inputs)
       , table_func_inputs_(std::move(table_func_inputs))
       , target_exprs_(std::move(target_exprs)) {
-    inputs_.emplace_back(input);
+    for (const auto& input : inputs) {
+      inputs_.emplace_back(input);
+    }
   }
+
+  RelTableFunction(RelTableFunction const&);
 
   void replaceInput(std::shared_ptr<const RelAlgNode> old_input,
                     std::shared_ptr<const RelAlgNode> input) override;
@@ -1416,24 +1643,24 @@ class RelTableFunction : public RelAlgNode {
     return fields_[idx];
   }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelTableFunction>(*this);
+  }
 
   std::string toString() const override {
-    std::string result = "RelTableFunction<" +
-                         std::to_string(reinterpret_cast<uint64_t>(this)) + ">(" +
-                         function_name_ + " ";
-
-    result += "targets: " + std::to_string(target_exprs_.size());
-    result += "inputs: [";
-    for (size_t i = 0; i < target_exprs_.size(); ++i) {
-      result += target_exprs_[i]->toString();
-      if (i < target_exprs_.size() - 1) {
-        result += ", ";
-      }
-    }
-    result += "])";
-
-    return result;
+    return cat(::typeName(this),
+               "(",
+               function_name_,
+               ", inputs=",
+               ::toString(inputs_),
+               ", fields=",
+               ::toString(fields_),
+               ", col_inputs=...",
+               ", table_func_inputs=",
+               ::toString(table_func_inputs_),
+               ", target_exprs=",
+               ::toString(target_exprs_),
+               ")");
   }
 
  private:
@@ -1458,16 +1685,17 @@ class RelLogicalValues : public RelAlgNode {
                    std::vector<RowValues>& values)
       : tuple_type_(tuple_type), values_(std::move(values)) {}
 
+  RelLogicalValues(RelLogicalValues const&);
+
   const std::vector<TargetMetaInfo> getTupleType() const { return tuple_type_; }
 
   std::string toString() const override {
-    std::string ret =
-        "(RelLogicalValues<" + std::to_string(reinterpret_cast<uint64_t>(this)) + ">";
+    std::string ret = ::typeName(this) + "(";
     for (const auto& target_meta_info : tuple_type_) {
       ret += " (" + target_meta_info.get_resname() + " " +
              target_meta_info.get_type_info().get_type_name() + ")";
     }
-    ret += " )";
+    ret += ")";
     return ret;
   }
 
@@ -1492,7 +1720,9 @@ class RelLogicalValues : public RelAlgNode {
 
   bool hasRows() const { return !values_.empty(); }
 
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelLogicalValues>(*this);
+  }
 
  private:
   const std::vector<TargetMetaInfo> tuple_type_;
@@ -1502,14 +1732,17 @@ class RelLogicalValues : public RelAlgNode {
 class RelLogicalUnion : public RelAlgNode {
  public:
   RelLogicalUnion(RelAlgInputs, bool is_all);
-  std::shared_ptr<RelAlgNode> deepCopy() const override;
+  std::shared_ptr<RelAlgNode> deepCopy() const override {
+    return std::make_shared<RelLogicalUnion>(*this);
+  }
   size_t size() const override;
   std::string toString() const override;
 
   std::string getFieldName(const size_t i) const;
 
   inline bool isAll() const { return is_all_; }
-  bool inputMetainfoTypesMatch() const;
+  // Will throw a std::runtime_error if MetaInfo types don't match.
+  void checkForMatchingMetaInfoTypes() const;
   RexScalar const* copyAndRedirectSource(RexScalar const*, size_t input_idx) const;
 
   // Not unique_ptr to allow for an easy deepCopy() implementation.
@@ -1593,6 +1826,10 @@ class RelAlgDagBuilder : public boost::noncopyable {
     return subqueries_;
   }
 
+  void registerQueryHints(QueryHint& query_hint) { query_hint_ = query_hint; }
+
+  const QueryHint getQueryHints() const { return query_hint_; }
+
   /**
    * Gets all registered subqueries. Only the root DAG can contain subqueries.
    */
@@ -1605,6 +1842,7 @@ class RelAlgDagBuilder : public boost::noncopyable {
   std::vector<std::shared_ptr<RelAlgNode>> nodes_;
   std::vector<std::shared_ptr<RexSubQuery>> subqueries_;
   const RenderInfo* render_info_;
+  QueryHint query_hint_;
 };
 
 using RANodeOutput = std::vector<RexInput>;

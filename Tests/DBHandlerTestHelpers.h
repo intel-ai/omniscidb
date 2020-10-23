@@ -21,12 +21,15 @@
 #include <boost/optional.hpp>
 
 #include "Catalog/Catalog.h"
+#include "QueryRunner/TestProcessSignalHandler.h"
 #include "ThriftHandler/DBHandler.h"
 
 constexpr int64_t True = 1;
 constexpr int64_t False = 0;
 constexpr void* Null = nullptr;
 constexpr int64_t Null_i = NULL_INT;
+
+extern size_t g_leaf_count;
 
 /**
  * Helper class for asserting equality between a result set represented as a boost variant
@@ -170,8 +173,14 @@ class DBHandlerTestFixture : public testing::Test {
     switchToAdmin();
   }
 
-  static void createDBHandler() {
+  static void SetUpTestSuite() { createDBHandler(); }
+
+  static void TearDownTestSuite() {}
+
+  static void createDBHandler(DiskCacheLevel cache_level = DiskCacheLevel::fsi) {
     if (!db_handler_) {
+      setupSignalHandler();
+
       // Based on default values observed from starting up an OmniSci DB server.
       const bool cpu_only{false};
       const bool allow_multifrag{true};
@@ -180,10 +189,12 @@ class DBHandlerTestFixture : public testing::Test {
       const bool read_only{false};
       const bool allow_loop_joins{false};
       const bool enable_rendering{false};
+      const bool renderer_use_vulkan_driver{false};
       const bool enable_auto_clear_render_mem{false};
       const int render_oom_retry_threshold{0};
       const size_t render_mem_bytes{500000000};
       const size_t max_concurrent_render_sessions{500};
+      const bool render_compositor_use_last_gpu{false};
       const int num_gpus{-1};
       const int start_gpu{0};
       const size_t reserved_gpu_mem{134217728};
@@ -195,6 +206,8 @@ class DBHandlerTestFixture : public testing::Test {
       system_parameters_.omnisci_server_port = -1;
       system_parameters_.calcite_port = 3280;
 
+      DiskCacheConfig disk_cache_config{std::string(BASE_PATH) + "/omnisci_disk_cache",
+                                        cache_level};
       db_handler_ = std::make_unique<DBHandler>(db_leaves_,
                                                 string_leaves_,
                                                 BASE_PATH,
@@ -205,6 +218,7 @@ class DBHandlerTestFixture : public testing::Test {
                                                 read_only,
                                                 allow_loop_joins,
                                                 enable_rendering,
+                                                renderer_use_vulkan_driver,
                                                 enable_auto_clear_render_mem,
                                                 render_oom_retry_threshold,
                                                 render_mem_bytes,
@@ -212,6 +226,7 @@ class DBHandlerTestFixture : public testing::Test {
                                                 num_gpus,
                                                 start_gpu,
                                                 reserved_gpu_mem,
+                                                render_compositor_use_last_gpu,
                                                 num_reader_threads,
                                                 auth_metadata_,
                                                 system_parameters_,
@@ -222,8 +237,11 @@ class DBHandlerTestFixture : public testing::Test {
                                                 udf_filename_,
                                                 udf_compiler_path_,
                                                 udf_compiler_options_,
+#ifdef ENABLE_GEOS
+                                                libgeos_so_filename_,
+#endif
+                                                disk_cache_config,
                                                 fsi_);
-
       loginAdmin();
     }
   }
@@ -247,15 +265,15 @@ class DBHandlerTestFixture : public testing::Test {
     return db_handler_->get_session_copy_ptr(session_id_)->get_currentUser();
   }
 
-  Catalog_Namespace::Catalog& getCatalog() {
+  static Catalog_Namespace::Catalog& getCatalog() {
     return db_handler_->get_session_copy_ptr(session_id_)->getCatalog();
   }
 
   std::pair<DBHandler*, TSessionId&> getDbHandlerAndSessionId() {
-    return {db_handler_.get(), admin_session_id_};
+    return {db_handler_.get(), session_id_};
   }
 
-  void resetCatalog() {
+  static void resetCatalog() {
     auto& catalog = getCatalog();
     catalog.remove(catalog.getCurrentDB().dbName);
   }
@@ -266,6 +284,7 @@ class DBHandlerTestFixture : public testing::Test {
     admin_session_id_ = session_id_;
   }
   static bool isDistributedMode() { return system_parameters_.aggregator; }
+  static SystemParameters getSystemParameters() { return system_parameters_; }
   static void switchToAdmin() { session_id_ = admin_session_id_; }
 
   static void logout(const TSessionId& id) { db_handler_->disconnect(id); }
@@ -291,14 +310,37 @@ class DBHandlerTestFixture : public testing::Test {
     }
   }
 
-  void queryAndAssertException(const std::string& sql_statement,
-                               const std::string& error_message) {
+  template <typename Lambda>
+  void executeLambdaAndAssertException(Lambda lambda, const std::string& error_message) {
     try {
-      sql(sql_statement);
+      lambda();
       FAIL() << "An exception should have been thrown for this test case.";
     } catch (const TOmniSciException& e) {
+      assertExceptionMessage(e, error_message);
+    } catch (const std::runtime_error& e) {
+      assertExceptionMessage(e, error_message);
+    }
+  }
+
+  void assertExceptionMessage(const TOmniSciException& e,
+                              const std::string& error_message) {
+    if (isDistributedMode()) {
+      // In distributed mode, exception messages may be wrapped within
+      // another thrift exception. In this case, do a substring check.
+      ASSERT_TRUE(e.error_msg.find(error_message) != std::string::npos);
+    } else {
       ASSERT_EQ(error_message, e.error_msg);
     }
+  }
+
+  void assertExceptionMessage(const std::runtime_error& e,
+                              const std::string& error_message) {
+    ASSERT_EQ(error_message, e.what());
+  }
+
+  void queryAndAssertException(const std::string& sql_statement,
+                               const std::string& error_message) {
+    executeLambdaAndAssertException([&] { sql(sql_statement); }, error_message);
   }
 
   void assertResultSetEqual(
@@ -330,6 +372,14 @@ class DBHandlerTestFixture : public testing::Test {
     }
   }
 
+  void sqlAndCompareResult(
+      const std::string& sql_statement,
+      const std::vector<std::vector<TargetValue>>& expected_result_set) {
+    TQueryResult result_set;
+    sql(result_set, sql_statement);
+    assertResultSetEqual(expected_result_set, result_set);
+  }
+
   /**
    * Helper method used to cast a vector of scalars to an optional of the same object.
    */
@@ -343,6 +393,14 @@ class DBHandlerTestFixture : public testing::Test {
    * avoid compiler ambiguity).
    */
   constexpr int64_t i(int64_t i) { return i; }
+
+  bool setExecuteMode(const TExecuteMode::type mode) {
+    if (db_handler_->cpu_mode_only_ && TExecuteMode::GPU) {
+      return false;
+    }
+    db_handler_->set_execution_mode(session_id_, mode);
+    return true;
+  }
 
  private:
   size_t getRowCount(const TRowSet& row_set) {
@@ -389,7 +447,10 @@ class DBHandlerTestFixture : public testing::Test {
     }
   }
 
-  void setDatum(TDatum& datum, const TColumnData& column_data, const size_t index) {
+  void setDatum(TDatum& datum,
+                const TColumnData& column_data,
+                const size_t index,
+                const bool is_null) {
     if (!column_data.int_col.empty()) {
       datum.val.int_val = column_data.int_col[index];
     } else if (!column_data.real_col.empty()) {
@@ -398,7 +459,9 @@ class DBHandlerTestFixture : public testing::Test {
       datum.val.str_val = column_data.str_col[index];
     } else if (!column_data.arr_col.empty()) {
       std::vector<TDatum> datum_array{};
-      setDatumArray(datum_array, column_data.arr_col[index].data);
+      if (!is_null) {
+        setDatumArray(datum_array, column_data.arr_col[index].data);
+      }
       datum.val.arr_val = datum_array;
     } else {
       throw std::runtime_error{"Unexpected column data"};
@@ -410,10 +473,10 @@ class DBHandlerTestFixture : public testing::Test {
       std::vector<TDatum> row{};
       for (auto& column : row_set.columns) {
         TDatum datum{};
-        if (column.nulls[index]) {
+        auto is_null = column.nulls[index];
+        setDatum(datum, column.data, index, is_null);
+        if (is_null) {
           datum.is_null = true;
-        } else {
-          setDatum(datum, column.data, index);
         }
         row.emplace_back(datum);
       }
@@ -421,6 +484,15 @@ class DBHandlerTestFixture : public testing::Test {
     } else {
       return row_set.rows[index].cols;
     }
+  }
+
+  static void setupSignalHandler() {
+    TestProcessSignalHandler::registerSignalHandler();
+    TestProcessSignalHandler::addShutdownCallback([]() {
+      if (db_handler_) {
+        db_handler_->shutdown();
+      }
+    });
   }
 
   static std::unique_ptr<DBHandler> db_handler_;
@@ -438,6 +510,9 @@ class DBHandlerTestFixture : public testing::Test {
   static std::string default_db_name_;
   static std::vector<std::string> udf_compiler_options_;
   static std::string cluster_config_file_path_;
+#ifdef ENABLE_GEOS
+  static std::string libgeos_so_filename_;
+#endif
 };
 
 TSessionId DBHandlerTestFixture::session_id_{};
@@ -455,3 +530,6 @@ std::string DBHandlerTestFixture::default_db_name_{};
 SystemParameters DBHandlerTestFixture::system_parameters_{};
 std::vector<std::string> DBHandlerTestFixture::udf_compiler_options_{};
 std::string DBHandlerTestFixture::cluster_config_file_path_{};
+#ifdef ENABLE_GEOS
+std::string DBHandlerTestFixture::libgeos_so_filename_{};
+#endif

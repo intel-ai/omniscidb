@@ -53,16 +53,9 @@ class NoneEncoder : public Encoder {
     }
     for (size_t i = 0; i < num_elems_to_append; ++i) {
       size_t ri = replicating ? 0 : i;
-      T data = unencodedData[ri];
+      T data = validateDataAndUpdateStats(unencodedData[ri]);
       if (replicating) {
         encoded_data[i] = data;
-      }
-      if (data == none_encoded_null_value<T>()) {
-        has_nulls = true;
-      } else {
-        decimal_overflow_validator_.validate(data);
-        dataMin = std::min(dataMin, data);
-        dataMax = std::max(dataMax, data);
       }
     }
     if (offset == -1) {
@@ -119,32 +112,23 @@ class NoneEncoder : public Encoder {
     }
   }
 
-  void updateStats(const int8_t* const dst, const size_t numElements) override {
-    const T* data = reinterpret_cast<const T*>(dst);
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    const T* unencoded_data = reinterpret_cast<const T*>(src_data);
+    for (size_t i = 0; i < num_elements; ++i) {
+      validateDataAndUpdateStats(unencoded_data[i]);
+    }
+  }
 
-    std::tie(dataMin, dataMax, has_nulls) = tbb::parallel_reduce(
-        tbb::blocked_range(0UL, numElements),
-        std::tuple(dataMin, dataMax, has_nulls),
-        [&](const auto& range, auto init) {
-          auto [min, max, nulls] = init;
-          for (size_t i = range.begin(); i < range.end(); i++) {
-            if (data[i] != none_encoded_null_value<T>()) {
-              decimal_overflow_validator_.validate(data[i]);
-              min = std::min(min, data[i]);
-              max = std::max(max, data[i]);
-            } else {
-              nulls = true;
-            }
-          }
-          return std::tuple(min, max, nulls);
-        },
-        [&](auto lhs, auto rhs) {
-          const auto [lhs_min, lhs_max, lhs_nulls] = lhs;
-          const auto [rhs_min, rhs_max, rhs_nulls] = rhs;
-          return std::tuple(std::min(lhs_min, rhs_min),
-                            std::max(lhs_max, rhs_max),
-                            lhs_nulls || rhs_nulls);
-        });
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
   }
 
   // Only called from the executor for synthesized meta-information.
@@ -199,6 +183,17 @@ class NoneEncoder : public Encoder {
   T dataMax;
   bool has_nulls;
 
+ private:
+  T validateDataAndUpdateStats(const T& unencoded_data) {
+    if (unencoded_data == none_encoded_null_value<T>()) {
+      has_nulls = true;
+    } else {
+      decimal_overflow_validator_.validate(unencoded_data);
+      dataMin = std::min(dataMin, unencoded_data);
+      dataMax = std::max(dataMax, unencoded_data);
+    }
+    return unencoded_data;
+  }
 };  // class NoneEncoder
 
 #endif  // NONE_ENCODER_H

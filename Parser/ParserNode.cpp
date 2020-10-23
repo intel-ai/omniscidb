@@ -48,7 +48,9 @@
 #include "Fragmenter/InsertOrderFragmenter.h"
 #include "Fragmenter/SortedOrderFragmenter.h"
 #include "Fragmenter/TargetValueConvertersFactories.h"
-#include "Import/Importer.h"
+#include "Geospatial/Compression.h"
+#include "Geospatial/Types.h"
+#include "ImportExport/Importer.h"
 #include "LockMgr/LockMgr.h"
 #include "QueryEngine/CalciteAdapter.h"
 #include "QueryEngine/Execute.h"
@@ -56,10 +58,6 @@
 #include "QueryEngine/RelAlgExecutor.h"
 #include "ReservedKeywords.h"
 #include "Shared/StringTransform.h"
-#include "Shared/TimeGM.h"
-#include "Shared/geo_compression.h"
-#include "Shared/geo_types.h"
-#include "Shared/mapd_glob.h"
 #include "Shared/measure.h"
 #include "Shared/shard_key.h"
 #include "TableArchiver/TableArchiver.h"
@@ -185,8 +183,14 @@ std::shared_ptr<Analyzer::Expr> UserLiteral::analyze(
     const Catalog_Namespace::Catalog& catalog,
     Analyzer::Query& query,
     TlistRefType allow_tlist_ref) const {
-  throw std::runtime_error("USER literal not supported yet.");
-  return nullptr;
+  Datum d;
+  return makeExpr<Analyzer::Constant>(kTEXT, false, d);
+}
+
+std::shared_ptr<Analyzer::Expr> UserLiteral::get(const std::string& user) {
+  Datum d;
+  d.stringval = new std::string(user);
+  return makeExpr<Analyzer::Constant>(kTEXT, false, d);
 }
 
 std::shared_ptr<Analyzer::Expr> ArrayLiteral::analyze(
@@ -1672,15 +1676,16 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
         }
       }
       bool is_null = false;
-      std::string* wkt{nullptr};
+      std::string* geo_string{nullptr};
       if (c) {
         is_null = c->get_is_null();
         if (!is_null) {
-          wkt = c->get_constval().stringval;
+          geo_string = c->get_constval().stringval;
         }
       }
-      if (!is_null && !wkt) {
-        throw std::runtime_error("Expecting a WKT string for column " + cd->columnName);
+      if (!is_null && !geo_string) {
+        throw std::runtime_error("Expecting a WKT or WKB hex string for column " +
+                                 cd->columnName);
       }
       std::vector<double> coords;
       std::vector<double> bounds;
@@ -1690,8 +1695,8 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
           0;  // @TODO simon.eves where to get render_group from in this context?!
       SQLTypeInfo import_ti{cd->columnType};
       if (!is_null) {
-        if (!Geo_namespace::GeoTypesFactory::getGeoColumns(
-                *wkt, import_ti, coords, bounds, ring_sizes, poly_rings)) {
+        if (!Geospatial::GeoTypesFactory::getGeoColumns(
+                *geo_string, import_ti, coords, bounds, ring_sizes, poly_rings)) {
           throw std::runtime_error("Cannot read geometry to insert into column " +
                                    cd->columnName);
         }
@@ -1727,7 +1732,7 @@ void InsertValuesStmt::analyze(const Catalog_Namespace::Catalog& catalog,
       CHECK_EQ(cd_coords->columnType.get_subtype(), kTINYINT);
       std::list<std::shared_ptr<Analyzer::Expr>> value_exprs;
       if (!is_null || cd->columnType.get_type() == kPOINT) {
-        auto compressed_coords = geospatial::compress_coords(coords, col_ti);
+        auto compressed_coords = Geospatial::compress_coords(coords, col_ti);
         for (auto cc : compressed_coords) {
           Datum d;
           d.tinyintval = cc;
@@ -1866,7 +1871,7 @@ void InsertValuesStmt::execute(const Catalog_Namespace::SessionInfo& session) {
     throw std::runtime_error("Singleton inserts on views is not supported.");
   }
 
-  auto executor = Executor::getExecutor(catalog.getCurrentDB().dbId);
+  auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
   RelAlgExecutor ra_executor(executor.get(), catalog);
 
   ra_executor.executeSimpleInsert(query);
@@ -2141,6 +2146,20 @@ void get_table_definitions(TableDescriptor& td,
   return it->second(td, p.get(), columns);
 }
 
+void get_table_definitions_for_ctas(TableDescriptor& td,
+                                    const std::unique_ptr<NameValueAssign>& p,
+                                    const std::list<ColumnDescriptor>& columns) {
+  const auto it = tableDefFuncMap.find(boost::to_lower_copy<std::string>(*p->get_name()));
+  if (it == tableDefFuncMap.end()) {
+    throw std::runtime_error(
+        "Invalid CREATE TABLE AS option " + *p->get_name() +
+        ". Should be FRAGMENT_SIZE, MAX_CHUNK_SIZE, PAGE_SIZE, MAX_ROWS, "
+        "PARTITIONS, SHARD_COUNT, VACUUM, SORT_COLUMN, STORAGE_TYPE or "
+        "USE_SHARED_DICTIONARIES.");
+  }
+  return it->second(td, p.get(), columns);
+}
+
 static const std::map<const std::string, const DataframeDefFuncPtr> dataframeDefFuncMap =
     {{"fragment_size"s, get_frag_size_dataframe_def},
      {"max_chunk_size"s, get_max_chunk_size_dataframe_def},
@@ -2235,7 +2254,7 @@ void CreateTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
                              " will not be created. User has no create privileges.");
   }
 
-  if (!ddl_utils::validate_nonexistent_table(*table_, catalog, if_not_exists_)) {
+  if (!catalog.validateNonExistentTableOrView(*table_, if_not_exists_)) {
     return;
   }
 
@@ -2333,7 +2352,7 @@ std::shared_ptr<ResultSet> getResultSet(QueryStateProxy query_state_proxy,
   auto const session = query_state_proxy.getQueryState().getConstSessionInfo();
   auto& catalog = session->getCatalog();
 
-  auto executor = Executor::getExecutor(catalog.getCurrentDB().dbId);
+  auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
 #ifdef HAVE_CUDA
   const auto device_type = session->get_executor_device_type();
 #else
@@ -2347,7 +2366,12 @@ std::shared_ptr<ResultSet> getResultSet(QueryStateProxy query_state_proxy,
       calcite_mgr
           ->process(query_state_proxy, pg_shim(select_stmt), {}, true, false, false, true)
           .plan_result;
+  RelAlgExecutor ra_executor(executor.get(), catalog, query_ra);
   CompilationOptions co = CompilationOptions::defaults(device_type);
+  const auto& query_hints = ra_executor.getParsedQueryHints();
+  if (query_hints.cpu_mode) {
+    co.device_type = ExecutorDeviceType::CPU;
+  }
   co.opt_level = ExecutorOptLevel::LoopStrengthReduction;
   // TODO(adb): Need a better method of dropping constants into this ExecutionOptions
   // struct
@@ -2367,7 +2391,6 @@ std::shared_ptr<ResultSet> getResultSet(QueryStateProxy query_state_proxy,
                          1000,
                          ExecutorType::Native,
                          outer_fragment_indices};
-  RelAlgExecutor ra_executor(executor.get(), catalog, query_ra);
   ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
                                                      ExecutorDeviceType::CPU,
                                                      QueryMemoryDescriptor(),
@@ -2385,7 +2408,7 @@ size_t LocalConnector::getOuterFragmentCount(QueryStateProxy query_state_proxy,
   auto const session = query_state_proxy.getQueryState().getConstSessionInfo();
   auto& catalog = session->getCatalog();
 
-  auto executor = Executor::getExecutor(catalog.getCurrentDB().dbId);
+  auto executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
 #ifdef HAVE_CUDA
   const auto device_type = session->get_executor_device_type();
 #else
@@ -2400,13 +2423,16 @@ size_t LocalConnector::getOuterFragmentCount(QueryStateProxy query_state_proxy,
           ->process(
               query_state_proxy, pg_shim(sql_query_string), {}, true, false, false, true)
           .plan_result;
-  CompilationOptions co = {
-      device_type, true, ExecutorOptLevel::LoopStrengthReduction, false};
+  RelAlgExecutor ra_executor(executor.get(), catalog, query_ra);
+  const auto& query_hints = ra_executor.getParsedQueryHints();
+  CompilationOptions co = {query_hints.cpu_mode ? ExecutorDeviceType::CPU : device_type,
+                           true,
+                           ExecutorOptLevel::LoopStrengthReduction,
+                           false};
   // TODO(adb): Need a better method of dropping constants into this ExecutionOptions
   // struct
   ExecutionOptions eo = {
       false, true, false, true, false, false, false, false, 10000, false, false, 0.9};
-  RelAlgExecutor ra_executor(executor.get(), catalog, query_ra);
   return ra_executor.getOuterFragmentCount(co, eo);
 }
 
@@ -2486,6 +2512,12 @@ std::list<ColumnDescriptor> LocalConnector::getColumnDescriptors(AggregatedResul
       } else {
         cd_for_create.columnType.set_comp_param(cd.columnType.get_size() * 8);
       }
+    }
+
+    if (cd.columnType.is_date() && !cd.columnType.is_date_in_days()) {
+      // default to kENCODING_DATE_IN_DAYS encoding
+      cd_for_create.columnType.set_compression(kENCODING_DATE_IN_DAYS);
+      cd_for_create.columnType.set_comp_param(0);
     }
 
     column_descriptors_for_create.push_back(cd_for_create);
@@ -2582,13 +2614,20 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           &(*std::next(source_column_descriptors.begin(), i));
       const ColumnDescriptor* target_cd = target_column_descriptors.at(i);
 
-      if ((!source_cd->columnType.is_string() && !target_cd->columnType.is_string()) &&
-          (source_cd->columnType.get_type() != target_cd->columnType.get_type())) {
-        throw std::runtime_error("Source '" + source_cd->columnName + " " +
-                                 source_cd->columnType.get_type_name() +
-                                 "' and target '" + target_cd->columnName + " " +
-                                 target_cd->columnType.get_type_name() +
-                                 "' column types do not match.");
+      if (source_cd->columnType.get_type() != target_cd->columnType.get_type()) {
+        auto type_cannot_be_cast = [](const auto& col_type) {
+          return (col_type.is_time() || col_type.is_geometry() || col_type.is_array() ||
+                  col_type.is_boolean());
+        };
+
+        if (type_cannot_be_cast(source_cd->columnType) ||
+            type_cannot_be_cast(target_cd->columnType)) {
+          throw std::runtime_error("Source '" + source_cd->columnName + " " +
+                                   source_cd->columnType.get_type_name() +
+                                   "' and target '" + target_cd->columnName + " " +
+                                   target_cd->columnType.get_type_name() +
+                                   "' column types do not match.");
+        }
       }
       if (source_cd->columnType.is_array()) {
         if (source_cd->columnType.get_subtype() != target_cd->columnType.get_subtype()) {
@@ -2610,17 +2649,23 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           targetType = target_cd->columnType.get_elem_type();
         }
 
-        if ((sourceType.get_dimension() != targetType.get_dimension()) ||
-            (sourceType.get_scale() != targetType.get_scale())) {
-          throw std::runtime_error(
-              "Source '" + source_cd->columnName + " " +
-              source_cd->columnType.get_type_name() + "' and target '" +
-              target_cd->columnName + " " + target_cd->columnType.get_type_name() +
-              "' decimal columns dimension and or scale do not match.");
+        if (sourceType.get_scale() != targetType.get_scale()) {
+          throw std::runtime_error("Source '" + source_cd->columnName + " " +
+                                   source_cd->columnType.get_type_name() +
+                                   "' and target '" + target_cd->columnName + " " +
+                                   target_cd->columnType.get_type_name() +
+                                   "' decimal columns scales do not match.");
         }
       }
 
       if (source_cd->columnType.is_string()) {
+        if (!target_cd->columnType.is_string()) {
+          throw std::runtime_error("Source '" + source_cd->columnName + " " +
+                                   source_cd->columnType.get_type_name() +
+                                   "' and target '" + target_cd->columnName + " " +
+                                   target_cd->columnType.get_type_name() +
+                                   "' column types do not match.");
+        }
         if (source_cd->columnType.get_compression() !=
             target_cd->columnType.get_compression()) {
           throw std::runtime_error("Source '" + source_cd->columnName + " " +
@@ -2643,6 +2688,9 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       }
 
       if (!source_cd->columnType.is_string() && !source_cd->columnType.is_geometry() &&
+          !source_cd->columnType.is_integer() && !source_cd->columnType.is_decimal() &&
+          !source_cd->columnType.is_date() && !source_cd->columnType.is_time() &&
+          !source_cd->columnType.is_timestamp() &&
           source_cd->columnType.get_size() > target_cd->columnType.get_size()) {
         throw std::runtime_error("Source '" + source_cd->columnName + " " +
                                  source_cd->columnType.get_type_name() +
@@ -2656,6 +2704,11 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
   if (!populate_table) {
     return;
   }
+
+  int64_t total_row_count = 0;
+  int64_t total_source_query_time_ms = 0;
+  int64_t total_target_value_translate_time_ms = 0;
+  int64_t total_data_load_time_ms = 0;
 
   Fragmenter_Namespace::InsertDataLoader insertDataLoader(*leafs_connector_);
   auto target_column_descriptors = get_target_column_descriptors(td);
@@ -2672,8 +2725,10 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       allowed_outer_fragment_indices.push_back(outer_frag_idx);
     }
 
+    const auto query_clock_begin = timer_start();
     std::vector<AggregatedResult> query_results = leafs_connector_->query(
         query_state_proxy, select_query_, allowed_outer_fragment_indices);
+    total_source_query_time_ms += timer_stop(query_clock_begin);
 
     for (auto& res : query_results) {
       auto result_rows = res.rs;
@@ -2683,6 +2738,8 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       if (0 == num_rows) {
         continue;
       }
+
+      total_row_count += num_rows;
 
       size_t leaf_count = leafs_connector_->leafCount();
 
@@ -2783,7 +2840,7 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       std::shared_ptr<Executor> executor;
 
       if (g_enable_experimental_string_functions) {
-        executor = Executor::getExecutor(catalog.getCurrentDB().dbId);
+        executor = Executor::getExecutor(Executor::UNITARY_EXECUTOR_ID);
       }
 
       while (start_row < num_rows) {
@@ -2812,6 +2869,7 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
             value_converters.push_back(std::move(converter));
           }
 
+          const auto translate_clock_begin = timer_start();
           if (can_go_parallel) {
             std::vector<std::future<void>> worker_threads;
             for (int i = 0; i < num_worker_threads; ++i) {
@@ -2859,8 +2917,12 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
           for (int col_idx = 0; col_idx < target_column_descriptors.size(); col_idx++) {
             value_converters[col_idx]->addDataBlocksToInsertData(insert_data);
           }
+          total_target_value_translate_time_ms += timer_stop(translate_clock_begin);
 
+          const auto data_load_clock_begin = timer_start();
           insertDataLoader.insertData(*session, insert_data);
+          total_data_load_time_ms += timer_stop(data_load_clock_begin);
+
         } catch (...) {
           try {
             if (td->nShards) {
@@ -2881,6 +2943,16 @@ void InsertIntoTableAsSelectStmt::populateData(QueryStateProxy query_state_proxy
       }
     }
   }
+
+  int64_t total_time_ms = total_source_query_time_ms +
+                          total_target_value_translate_time_ms + total_data_load_time_ms;
+
+  VLOG(1) << "CTAS/ITAS " << total_row_count << " rows loaded in " << total_time_ms
+          << "ms (outer_frag_count=" << outer_frag_count
+          << ", query_time=" << total_source_query_time_ms
+          << "ms, translation_time=" << total_target_value_translate_time_ms
+          << "ms, data_load_time=" << total_data_load_time_ms
+          << "ms)\nquery: " << select_query_;
 
   if (!is_temporary) {
     if (td->nShards) {
@@ -2954,20 +3026,67 @@ void CreateTableAsSelectStmt::execute(const Catalog_Namespace::SessionInfo& sess
     td.maxChunkSize = DEFAULT_MAX_CHUNK_SIZE;
     td.fragPageSize = DEFAULT_PAGE_SIZE;
     td.maxRows = DEFAULT_MAX_ROWS;
-    td.keyMetainfo = "[]";
     if (is_temporary_) {
       td.persistenceLevel = Data_Namespace::MemoryLevel::CPU_LEVEL;
     } else {
       td.persistenceLevel = Data_Namespace::MemoryLevel::DISK_LEVEL;
     }
 
+    bool use_shared_dictionaries = true;
+
     if (!storage_options_.empty()) {
       for (auto& p : storage_options_) {
-        get_table_definitions(td, p, column_descriptors_for_create);
+        if (boost::to_lower_copy<std::string>(*p->get_name()) ==
+            "use_shared_dictionaries") {
+          const StringLiteral* literal =
+              dynamic_cast<const StringLiteral*>(p->get_value());
+          if (nullptr == literal) {
+            throw std::runtime_error(
+                "USE_SHARED_DICTIONARIES must be a string parameter");
+          }
+          std::string val = boost::to_lower_copy<std::string>(*literal->get_stringval());
+          use_shared_dictionaries = val == "true" || val == "1" || val == "t";
+        } else {
+          get_table_definitions_for_ctas(td, p, column_descriptors_for_create);
+        }
       }
     }
 
-    catalog.createTable(td, column_descriptors_for_create, {}, true);
+    std::vector<SharedDictionaryDef> sharedDictionaryRefs;
+
+    if (use_shared_dictionaries) {
+      const auto source_column_descriptors =
+          local_connector.getColumnDescriptors(result, false);
+      const auto mapping = catalog.getDictionaryToColumnMapping();
+
+      for (auto& source_cd : source_column_descriptors) {
+        const auto& ti = source_cd.columnType;
+        if (ti.is_string()) {
+          if (ti.get_compression() == kENCODING_DICT) {
+            int dict_id = ti.get_comp_param();
+            auto it = mapping.find(dict_id);
+            if (mapping.end() != it) {
+              const auto targetColumn = it->second;
+              auto targetTable =
+                  catalog.getMetadataForTable(targetColumn->tableId, false);
+              CHECK(targetTable);
+              LOG(INFO) << "CTAS: sharing text dictionary on column "
+                        << source_cd.columnName << " with " << targetTable->tableName
+                        << "." << targetColumn->columnName;
+              sharedDictionaryRefs.push_back(
+                  SharedDictionaryDef(source_cd.columnName,
+                                      targetTable->tableName,
+                                      targetColumn->columnName));
+            }
+          }
+        }
+      }
+    }
+
+    // currently no means of defining sharding in CTAS
+    td.keyMetainfo = serialize_key_metainfo(nullptr, sharedDictionaryRefs);
+
+    catalog.createTable(td, column_descriptors_for_create, sharedDictionaryRefs, true);
     // TODO (max): It's transactionally unsafe, should be fixed: we may create object
     // w/o privileges
     SysCatalog::instance().createDBObject(
@@ -3237,8 +3356,8 @@ void AddColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
       }
     }
 
-    std::unique_ptr<Importer_NS::Loader> loader(new Importer_NS::Loader(catalog, td));
-    auto import_buffers = Importer_NS::setup_column_loaders(td, loader.get());
+    std::unique_ptr<import_export::Loader> loader(new import_export::Loader(catalog, td));
+    auto import_buffers = import_export::setup_column_loaders(td, loader.get());
     loader->setReplicating(true);
 
     // set_geo_physical_import_buffer below needs a sorted import_buffers
@@ -3288,32 +3407,32 @@ void AddColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
             if (coldef != nullptr ||
                 skip_physical_cols-- <= 0) {  // skip non-null phy col
               import_buffer->add_value(
-                  cd, defaultval, isnull, Importer_NS::CopyParams(), nrows);
+                  cd, defaultval, isnull, import_export::CopyParams(), nrows);
               if (cd->columnType.is_geometry()) {
                 std::vector<double> coords, bounds;
                 std::vector<int> ring_sizes, poly_rings;
                 int render_group = 0;
                 SQLTypeInfo tinfo{cd->columnType};
-                if (!Geo_namespace::GeoTypesFactory::getGeoColumns(defaultval,
-                                                                   tinfo,
-                                                                   coords,
-                                                                   bounds,
-                                                                   ring_sizes,
-                                                                   poly_rings,
-                                                                   false)) {
+                if (!Geospatial::GeoTypesFactory::getGeoColumns(defaultval,
+                                                                tinfo,
+                                                                coords,
+                                                                bounds,
+                                                                ring_sizes,
+                                                                poly_rings,
+                                                                false)) {
                   throw std::runtime_error("Bad geometry data: '" + defaultval + "'");
                 }
                 size_t col_idx = 1 + std::distance(import_buffers.begin(), it);
-                Importer_NS::Importer::set_geo_physical_import_buffer(catalog,
-                                                                      cd,
-                                                                      import_buffers,
-                                                                      col_idx,
-                                                                      coords,
-                                                                      bounds,
-                                                                      ring_sizes,
-                                                                      poly_rings,
-                                                                      render_group,
-                                                                      nrows);
+                import_export::Importer::set_geo_physical_import_buffer(catalog,
+                                                                        cd,
+                                                                        import_buffers,
+                                                                        col_idx,
+                                                                        coords,
+                                                                        bounds,
+                                                                        ring_sizes,
+                                                                        poly_rings,
+                                                                        render_group,
+                                                                        nrows);
                 // skip following phy cols
                 skip_physical_cols = cd->columnType.get_physical_cols();
               }
@@ -3438,18 +3557,25 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto importer_factory = [](Catalog_Namespace::Catalog& catalog,
                              const TableDescriptor* td,
                              const std::string& file_path,
-                             const Importer_NS::CopyParams& copy_params) {
-    return std::make_unique<Importer_NS::Importer>(catalog, td, file_path, copy_params);
+                             const import_export::CopyParams& copy_params) {
+    return std::make_unique<import_export::Importer>(catalog, td, file_path, copy_params);
   };
   return execute(session, importer_factory);
 }
 
 void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
-                            const std::function<std::unique_ptr<Importer_NS::Importer>(
+                            const std::function<std::unique_ptr<import_export::Importer>(
                                 Catalog_Namespace::Catalog&,
                                 const TableDescriptor*,
                                 const std::string&,
-                                const Importer_NS::CopyParams&)>& importer_factory) {
+                                const import_export::CopyParams&)>& importer_factory) {
+  boost::regex non_local_file_regex{R"(^\s*(s3|http|https)://.+)",
+                                    boost::regex::extended | boost::regex::icase};
+  if (!boost::regex_match(*file_pattern, non_local_file_regex)) {
+    ddl_utils::validate_allowed_file_path(
+        *file_pattern, ddl_utils::DataTransferType::IMPORT, true);
+  }
+
   size_t rows_completed = 0;
   size_t rows_rejected = 0;
   size_t total_time = 0;
@@ -3498,7 +3624,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
   // from here on, file_path contains something which may be a url
   // or a wildcard of file names;
   std::string file_path = *file_pattern;
-  Importer_NS::CopyParams copy_params;
+  import_export::CopyParams copy_params;
   if (!options.empty()) {
     for (auto& p : options) {
       if (boost::iequals(*p->get_name(), "max_reject")) {
@@ -3512,7 +3638,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
         if (int_literal == nullptr) {
           throw std::runtime_error("buffer_size option must be an integer.");
         }
-        copy_params.buffer_size = std::max<size_t>(1 << 20, int_literal->get_intval());
+        copy_params.buffer_size = int_literal->get_intval();
       } else if (boost::iequals(*p->get_name(), "threads")) {
         const IntLiteral* int_literal = dynamic_cast<const IntLiteral*>(p->get_value());
         if (int_literal == nullptr) {
@@ -3542,8 +3668,8 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
           throw std::runtime_error("Header option must be a boolean.");
         }
         copy_params.has_header = bool_from_string_literal(str_literal)
-                                     ? Importer_NS::ImportHeaderRow::HAS_HEADER
-                                     : Importer_NS::ImportHeaderRow::NO_HEADER;
+                                     ? import_export::ImportHeaderRow::HAS_HEADER
+                                     : import_export::ImportHeaderRow::NO_HEADER;
 #ifdef ENABLE_IMPORT_PARQUET
       } else if (boost::iequals(*p->get_name(), "parquet")) {
         const StringLiteral* str_literal =
@@ -3554,7 +3680,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
         if (bool_from_string_literal(str_literal)) {
           // not sure a parquet "table" type is proper, but to make code
           // look consistent in some places, let's set "table" type too
-          copy_params.file_type = Importer_NS::FileType::PARQUET;
+          copy_params.file_type = import_export::FileType::PARQUET;
         }
 #endif  // ENABLE_IMPORT_PARQUET
       } else if (boost::iequals(*p->get_name(), "s3_access_key")) {
@@ -3660,8 +3786,8 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
           throw std::runtime_error("Geo option must be a boolean.");
         }
         copy_params.file_type = bool_from_string_literal(str_literal)
-                                    ? Importer_NS::FileType::POLYGON
-                                    : Importer_NS::FileType::DELIMITED;
+                                    ? import_export::FileType::POLYGON
+                                    : import_export::FileType::DELIMITED;
       } else if (boost::iequals(*p->get_name(), "geo_coords_type")) {
         const StringLiteral* str_literal =
             dynamic_cast<const StringLiteral*>(p->get_value());
@@ -3727,7 +3853,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
           throw std::runtime_error("Invalid value for 'geo_layer_name' option");
         }
       } else if (boost::iequals(*p->get_name(), "partitions")) {
-        if (copy_params.file_type == Importer_NS::FileType::POLYGON) {
+        if (copy_params.file_type == import_export::FileType::POLYGON) {
           const auto partitions =
               static_cast<const StringLiteral*>(p->get_value())->get_stringval();
           CHECK(partitions);
@@ -3761,7 +3887,7 @@ void CopyTableStmt::execute(const Catalog_Namespace::SessionInfo& session,
   }
 
   std::string tr;
-  if (copy_params.file_type == Importer_NS::FileType::POLYGON) {
+  if (copy_params.file_type == import_export::FileType::POLYGON) {
     // geo import
     // we do nothing here, except stash the parameters so we can
     // do the import when we unwind to the top of the handler
@@ -3966,6 +4092,10 @@ static std::pair<AccessPrivileges, DBObjectType> parseStringPrivs(
            {AccessPrivileges::DROP_SERVER, ServerDBObjectType}},
           {{"DROP"s, ServerDBObjectType},
            {AccessPrivileges::DROP_SERVER, ServerDBObjectType}},
+          {{"ALTER SERVER"s, DatabaseDBObjectType},
+           {AccessPrivileges::ALTER_SERVER, ServerDBObjectType}},
+          {{"ALTER"s, ServerDBObjectType},
+           {AccessPrivileges::ALTER_SERVER, ServerDBObjectType}},
 
           {{"VIEW SQL EDITOR"s, DatabaseDBObjectType},
            {AccessPrivileges::VIEW_SQL_EDITOR, DatabaseDBObjectType}},
@@ -4198,7 +4328,7 @@ void ShowCreateTableStmt::execute(const Catalog_Namespace::SessionInfo& session)
           legacylockmgr::ExecutorOuterLock, true));
 
   auto& catalog = session.getCatalog();
-  const TableDescriptor* td = catalog.getMetadataForTable(*table_);
+  const TableDescriptor* td = catalog.getMetadataForTable(*table_, false);
   if (!td) {
     throw std::runtime_error("Table/View " + *table_ + " does not exist.");
   }
@@ -4236,7 +4366,93 @@ void ExportQueryStmt::execute(const Catalog_Namespace::SessionInfo& session) {
     leafs_connector_ = &local_connector;
   }
 
-  Importer_NS::CopyParams copy_params;
+  import_export::CopyParams copy_params;
+  // @TODO(se) move rest to CopyParams when we have a Thrift endpoint
+  import_export::QueryExporter::FileType file_type =
+      import_export::QueryExporter::FileType::kCSV;
+  std::string layer_name;
+  import_export::QueryExporter::FileCompression file_compression =
+      import_export::QueryExporter::FileCompression::kNone;
+  import_export::QueryExporter::ArrayNullHandling array_null_handling =
+      import_export::QueryExporter::ArrayNullHandling::kAbortWithWarning;
+
+  parseOptions(copy_params, file_type, layer_name, file_compression, array_null_handling);
+
+  if (file_path->empty()) {
+    throw std::runtime_error("Invalid file path for COPY TO");
+  } else if (!boost::filesystem::path(*file_path).is_absolute()) {
+    std::string file_name = boost::filesystem::path(*file_path).filename().string();
+    std::string file_dir =
+        catalog.getBasePath() + "/mapd_export/" + session.get_session_id() + "/";
+    if (!boost::filesystem::exists(file_dir)) {
+      if (!boost::filesystem::create_directories(file_dir)) {
+        throw std::runtime_error("Directory " + file_dir + " cannot be created.");
+      }
+    }
+    *file_path = file_dir + file_name;
+  } else {
+    // Above branch will create a new file in the mapd_export directory. If that path is
+    // not exercised, go through applicable file path validations.
+    ddl_utils::validate_allowed_file_path(*file_path,
+                                          ddl_utils::DataTransferType::EXPORT);
+  }
+
+  // get column info
+  auto column_info_result =
+      local_connector.query(query_state_proxy, *select_stmt, {}, true);
+
+  // create exporter for requested file type
+  auto query_exporter = import_export::QueryExporter::create(file_type);
+
+  // default layer name to file path stem if it wasn't specified
+  if (layer_name.size() == 0) {
+    layer_name = boost::filesystem::path(*file_path).stem().string();
+  }
+
+  // begin export
+  query_exporter->beginExport(*file_path,
+                              layer_name,
+                              copy_params,
+                              column_info_result.targets_meta,
+                              file_compression,
+                              array_null_handling);
+
+  // how many fragments?
+  size_t outer_frag_count =
+      leafs_connector_->getOuterFragmentCount(query_state_proxy, *select_stmt);
+  size_t outer_frag_end = outer_frag_count == 0 ? 1 : outer_frag_count;
+
+  // loop fragments
+  for (size_t outer_frag_idx = 0; outer_frag_idx < outer_frag_end; outer_frag_idx++) {
+    // limit the query to just this fragment
+    std::vector<size_t> allowed_outer_fragment_indices;
+    if (outer_frag_count) {
+      allowed_outer_fragment_indices.push_back(outer_frag_idx);
+    }
+
+    // run the query
+    std::vector<AggregatedResult> query_results = leafs_connector_->query(
+        query_state_proxy, *select_stmt, allowed_outer_fragment_indices);
+
+    // export the results
+    query_exporter->exportResults(query_results);
+  }
+
+  // end export
+  query_exporter->endExport();
+}
+
+void ExportQueryStmt::parseOptions(
+    import_export::CopyParams& copy_params,
+    import_export::QueryExporter::FileType& file_type,
+    std::string& layer_name,
+    import_export::QueryExporter::FileCompression& file_compression,
+    import_export::QueryExporter::ArrayNullHandling& array_null_handling) {
+  // defaults for non-CopyParams values
+  file_type = import_export::QueryExporter::FileType::kCSV;
+  layer_name.clear();
+  file_compression = import_export::QueryExporter::FileCompression::kNone;
+
   if (!options.empty()) {
     for (auto& p : options) {
       if (boost::iequals(*p->get_name(), "delimiter")) {
@@ -4262,8 +4478,8 @@ void ExportQueryStmt::execute(const Catalog_Namespace::SessionInfo& session) {
           throw std::runtime_error("Header option must be a boolean.");
         }
         copy_params.has_header = bool_from_string_literal(str_literal)
-                                     ? Importer_NS::ImportHeaderRow::HAS_HEADER
-                                     : Importer_NS::ImportHeaderRow::NO_HEADER;
+                                     ? import_export::ImportHeaderRow::HAS_HEADER
+                                     : import_export::ImportHeaderRow::NO_HEADER;
       } else if (boost::iequals(*p->get_name(), "quote")) {
         const StringLiteral* str_literal =
             dynamic_cast<const StringLiteral*>(p->get_value());
@@ -4298,196 +4514,81 @@ void ExportQueryStmt::execute(const Catalog_Namespace::SessionInfo& session) {
           throw std::runtime_error("Quoted option must be a boolean.");
         }
         copy_params.quoted = bool_from_string_literal(str_literal);
+      } else if (boost::iequals(*p->get_name(), "file_type")) {
+        const StringLiteral* str_literal =
+            dynamic_cast<const StringLiteral*>(p->get_value());
+        if (str_literal == nullptr) {
+          throw std::runtime_error("File Type option must be a string.");
+        }
+        auto file_type_str =
+            boost::algorithm::to_lower_copy(*str_literal->get_stringval());
+        if (file_type_str == "csv") {
+          file_type = import_export::QueryExporter::FileType::kCSV;
+        } else if (file_type_str == "geojson") {
+          file_type = import_export::QueryExporter::FileType::kGeoJSON;
+        } else if (file_type_str == "geojsonl") {
+          file_type = import_export::QueryExporter::FileType::kGeoJSONL;
+        } else if (file_type_str == "shapefile") {
+          file_type = import_export::QueryExporter::FileType::kShapefile;
+        } else {
+          throw std::runtime_error(
+              "File Type option must be 'CSV', 'GeoJSON', 'GeoJSONL' or 'Shapefile'");
+        }
+      } else if (boost::iequals(*p->get_name(), "layer_name")) {
+        const StringLiteral* str_literal =
+            dynamic_cast<const StringLiteral*>(p->get_value());
+        if (str_literal == nullptr) {
+          throw std::runtime_error("Layer Name option must be a string.");
+        }
+        layer_name = *str_literal->get_stringval();
+      } else if (boost::iequals(*p->get_name(), "file_compression")) {
+        const StringLiteral* str_literal =
+            dynamic_cast<const StringLiteral*>(p->get_value());
+        if (str_literal == nullptr) {
+          throw std::runtime_error("File Compression option must be a string.");
+        }
+        auto file_compression_str =
+            boost::algorithm::to_lower_copy(*str_literal->get_stringval());
+        if (file_compression_str == "none") {
+          file_compression = import_export::QueryExporter::FileCompression::kNone;
+        } else if (file_compression_str == "gzip") {
+          file_compression = import_export::QueryExporter::FileCompression::kGZip;
+        } else if (file_compression_str == "zip") {
+          file_compression = import_export::QueryExporter::FileCompression::kZip;
+        } else {
+          throw std::runtime_error(
+              "File Compression option must be 'None', 'GZip', or 'Zip'");
+        }
+      } else if (boost::iequals(*p->get_name(), "array_null_handling")) {
+        const StringLiteral* str_literal =
+            dynamic_cast<const StringLiteral*>(p->get_value());
+        if (str_literal == nullptr) {
+          throw std::runtime_error("Array Null Handling option must be a string.");
+        }
+        auto array_null_handling_str =
+            boost::algorithm::to_lower_copy(*str_literal->get_stringval());
+        if (array_null_handling_str == "abort") {
+          array_null_handling =
+              import_export::QueryExporter::ArrayNullHandling::kAbortWithWarning;
+        } else if (array_null_handling_str == "raw") {
+          array_null_handling =
+              import_export::QueryExporter::ArrayNullHandling::kExportSentinels;
+        } else if (array_null_handling_str == "zero") {
+          array_null_handling =
+              import_export::QueryExporter::ArrayNullHandling::kExportZeros;
+        } else if (array_null_handling_str == "nullfield") {
+          array_null_handling =
+              import_export::QueryExporter::ArrayNullHandling::kNullEntireField;
+        } else {
+          throw std::runtime_error(
+              "Array Null Handling option must be 'Abort', 'Raw', 'Zero', or "
+              "'NullField'");
+        }
       } else {
         throw std::runtime_error("Invalid option for COPY: " + *p->get_name());
       }
     }
   }
-
-  std::ofstream outfile;
-  if (file_path->empty() || !boost::filesystem::path(*file_path).is_absolute()) {
-    std::string file_name;
-    if (file_path->empty()) {
-      file_name = session.get_session_id() + ".txt";
-    } else {
-      file_name = boost::filesystem::path(*file_path).filename().string();
-    }
-    *file_path = catalog.getBasePath() + "/mapd_export/" + session.get_session_id() + "/";
-    if (!boost::filesystem::exists(*file_path)) {
-      if (!boost::filesystem::create_directories(*file_path)) {
-        throw std::runtime_error("Directory " + *file_path + " cannot be created.");
-      }
-    }
-    *file_path += file_name;
-  }
-  outfile.open(*file_path);
-  if (!outfile) {
-    throw std::runtime_error("Cannot open file: " + *file_path);
-  }
-  if (copy_params.has_header == Importer_NS::ImportHeaderRow::HAS_HEADER) {
-    auto result = local_connector.query(query_state_proxy, *select_stmt, {}, true);
-
-    bool not_first = false;
-    size_t i = 0;
-    for (const auto& target : result.targets_meta) {
-      std::string col_name = target.get_resname();
-      if (col_name.empty()) {
-        col_name = "result_" + std::to_string(i + 1);
-      }
-      if (not_first) {
-        outfile << copy_params.delimiter;
-      } else {
-        not_first = true;
-      }
-      outfile << col_name;
-      ++i;
-    }
-    outfile << copy_params.line_delim;
-  }
-
-  auto outer_frag_count =
-      leafs_connector_->getOuterFragmentCount(query_state_proxy, *select_stmt);
-
-  size_t outer_frag_end = outer_frag_count == 0 ? 1 : outer_frag_count;
-
-  for (size_t outer_frag_idx = 0; outer_frag_idx < outer_frag_end; outer_frag_idx++) {
-    std::vector<size_t> allowed_outer_fragment_indices;
-
-    if (outer_frag_count) {
-      allowed_outer_fragment_indices.push_back(outer_frag_idx);
-    }
-
-    std::vector<AggregatedResult> query_results = leafs_connector_->query(
-        query_state_proxy, *select_stmt, allowed_outer_fragment_indices);
-
-    for (auto& res : query_results) {
-      auto results = res.rs;
-
-      const std::vector<TargetMetaInfo>& targets = res.targets_meta;
-      const TargetMetaInfo* td = targets.data();
-
-      while (true) {
-        const auto crt_row = results->getNextRow(true, true);
-        if (crt_row.empty()) {
-          break;
-        }
-        bool not_first = false;
-        for (size_t i = 0; i < results->colCount(); ++i) {
-          bool is_null;
-          const auto tv = crt_row[i];
-          const auto scalar_tv = boost::get<ScalarTargetValue>(&tv);
-          if (not_first) {
-            outfile << copy_params.delimiter;
-          } else {
-            not_first = true;
-          }
-          if (copy_params.quoted) {
-            outfile << copy_params.quote;
-          }
-          const auto& ti = td[i].get_type_info();
-          if (!scalar_tv) {
-            outfile << datum_to_string(crt_row[i], ti, " | ");
-            if (copy_params.quoted) {
-              outfile << copy_params.quote;
-            }
-            continue;
-          }
-          if (boost::get<int64_t>(scalar_tv)) {
-            auto int_val = *(boost::get<int64_t>(scalar_tv));
-            switch (ti.get_type()) {
-              case kBOOLEAN:
-                is_null = (int_val == NULL_BOOLEAN);
-                break;
-              case kTINYINT:
-                is_null = (int_val == NULL_TINYINT);
-                break;
-              case kSMALLINT:
-                is_null = (int_val == NULL_SMALLINT);
-                break;
-              case kINT:
-                is_null = (int_val == NULL_INT);
-                break;
-              case kBIGINT:
-                is_null = (int_val == NULL_BIGINT);
-                break;
-              case kTIME:
-              case kTIMESTAMP:
-              case kDATE:
-                is_null = (int_val == NULL_BIGINT);
-                break;
-              default:
-                is_null = false;
-            }
-            if (is_null) {
-              outfile << copy_params.null_str;
-            } else if (ti.get_type() == kTIME) {
-              const auto t = static_cast<time_t>(int_val);
-              std::tm tm_struct;
-              gmtime_r(&t, &tm_struct);
-              char buf[9];
-              strftime(buf, 9, "%T", &tm_struct);
-              outfile << buf;
-            } else {
-              outfile << int_val;
-            }
-          } else if (boost::get<double>(scalar_tv)) {
-            auto real_val = *(boost::get<double>(scalar_tv));
-            if (ti.get_type() == kFLOAT) {
-              is_null = (real_val == NULL_FLOAT);
-            } else {
-              is_null = (real_val == NULL_DOUBLE);
-            }
-            if (is_null) {
-              outfile << copy_params.null_str;
-            } else if (ti.get_type() == kNUMERIC) {
-              outfile << std::setprecision(ti.get_precision()) << real_val;
-            } else {
-              outfile << std::setprecision(std::numeric_limits<double>::digits10 + 1)
-                      << real_val;
-            }
-          } else if (boost::get<float>(scalar_tv)) {
-            CHECK_EQ(kFLOAT, ti.get_type());
-            auto real_val = *(boost::get<float>(scalar_tv));
-            if (real_val == NULL_FLOAT) {
-              outfile << copy_params.null_str;
-            } else {
-              outfile << std::setprecision(std::numeric_limits<float>::digits10 + 1)
-                      << real_val;
-            }
-          } else {
-            auto s = boost::get<NullableString>(scalar_tv);
-            is_null = !s || boost::get<void*>(s);
-            if (is_null) {
-              outfile << copy_params.null_str;
-            } else {
-              auto s_notnull = boost::get<std::string>(s);
-              CHECK(s_notnull);
-              if (!copy_params.quoted) {
-                outfile << *s_notnull;
-              } else {
-                size_t q = s_notnull->find(copy_params.quote);
-                if (q == std::string::npos) {
-                  outfile << *s_notnull;
-                } else {
-                  std::string str(*s_notnull);
-                  while (q != std::string::npos) {
-                    str.insert(q, 1, copy_params.escape);
-                    q = str.find(copy_params.quote, q + 2);
-                  }
-                  outfile << str;
-                }
-              }
-            }
-          }
-          if (copy_params.quoted) {
-            outfile << copy_params.quote;
-          }
-        }
-        outfile << copy_params.line_delim;
-      }
-    }
-  }
-  outfile.close();
 }
 
 void CreateViewStmt::execute(const Catalog_Namespace::SessionInfo& session) {
@@ -4498,7 +4599,7 @@ void CreateViewStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto stdlog = STDLOG(query_state);
   auto& catalog = session.getCatalog();
 
-  if (!ddl_utils::validate_nonexistent_table(view_name_, catalog, if_not_exists_)) {
+  if (!catalog.validateNonExistentTableOrView(view_name_, if_not_exists_)) {
     return;
   }
   if (!session.checkDBAccessPrivileges(DBObjectType::ViewDBObjectType,

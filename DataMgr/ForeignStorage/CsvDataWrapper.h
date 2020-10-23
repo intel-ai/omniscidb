@@ -17,36 +17,77 @@
 #pragma once
 
 #include <map>
-#include <unordered_set>
 #include <vector>
 
 #include "Catalog/Catalog.h"
 #include "Catalog/ForeignTable.h"
 #include "DataMgr/Chunk/Chunk.h"
+#include "DataMgr/ForeignStorage/CsvReader.h"
 #include "ForeignDataWrapper.h"
-#include "Import/Importer.h"
+#include "ImportExport/Importer.h"
 
 namespace foreign_storage {
+
+/**
+ * Data structure containing details about a CSV file region (subset of rows within a CSV
+ * file).
+ */
+struct FileRegion {
+  // Name of file containing region
+  std::string filename;
+  // Byte offset (within file) for the beginning of file region
+  size_t first_row_file_offset;
+  // Index of first row in file region relative to the first row/non-header line in the
+  // file
+  size_t first_row_index;
+  // Number of rows in file region
+  size_t row_count;
+  // Size of file region in bytes
+  size_t region_size;
+
+  bool operator<(const FileRegion& other) const {
+    return first_row_file_offset < other.first_row_file_offset;
+  }
+};
+
+using FileRegions = std::vector<FileRegion>;
+
 class CsvDataWrapper : public ForeignDataWrapper {
  public:
   CsvDataWrapper(const int db_id, const ForeignTable* foreign_table);
 
-  ForeignStorageBuffer* getChunkBuffer(const ChunkKey& chunk_key) override;
-  void populateMetadataForChunkKeyPrefix(
-      const ChunkKey& chunk_key_prefix,
-      ChunkMetadataVector& chunk_metadata_vector) override;
+  void populateChunkMetadata(ChunkMetadataVector& chunk_metadata_vector) override;
+
+  void populateChunkBuffers(
+      std::map<ChunkKey, AbstractBuffer*>& required_buffers,
+      std::map<ChunkKey, AbstractBuffer*>& optional_buffers) override;
 
   static void validateOptions(const ForeignTable* foreign_table);
+
+  static std::vector<std::string_view> getSupportedOptions();
+
+  void serializeDataWrapperInternals(const std::string& file_path) const override;
+
+  void restoreDataWrapperInternals(const std::string& file_path,
+                                   const ChunkMetadataVector& chunk_metadata) override;
+  bool isRestored() const override;
 
  private:
   CsvDataWrapper(const ForeignTable* foreign_table);
 
-  void initializeChunkBuffers(const int fragment_index);
-  void fetchChunkBuffers();
-  ForeignStorageBuffer* getBufferFromMap(const ChunkKey& chunk_key);
-  bool prefixMatch(const ChunkKey& prefix, const ChunkKey& checked);
+  /**
+   * Populates provided chunks with appropriate data by parsing all file regions
+   * containing chunk data.
+   *
+   * @param column_id_to_chunk_map - map of column id to chunks to be populated
+   * @param fragment_id - fragment id of given chunks
+   */
+  void populateChunks(std::map<int, Chunk_NS::Chunk>& column_id_to_chunk_map,
+                      int fragment_id);
+
   std::string getFilePath();
-  Importer_NS::CopyParams validateAndGetCopyParams();
+  import_export::CopyParams validateAndGetCopyParams();
+  void validateFilePath();
 
   /**
    * Validates that the value of given table option has the expected number of characters.
@@ -71,15 +112,30 @@ class CsvDataWrapper : public ForeignDataWrapper {
    */
   std::optional<bool> validateAndGetBoolValue(const std::string& option_name);
 
-  bool fragmentIsFull();
-  Importer_NS::Loader* getLoader(Catalog_Namespace::Catalog& catalog);
+  void populateChunkMapForColumns(const std::set<const ColumnDescriptor*>& columns,
+                                  const int fragment_id,
+                                  const std::map<ChunkKey, AbstractBuffer*>& buffers,
+                                  std::map<int, Chunk_NS::Chunk>& column_id_to_chunk_map);
 
-  std::mutex loader_mutex_;
-  std::map<ChunkKey, std::unique_ptr<ForeignStorageBuffer>> chunk_buffer_map_;
+  std::map<ChunkKey, std::shared_ptr<ChunkMetadata>> chunk_metadata_map_;
+  std::map<int, FileRegions> fragment_id_to_file_regions_map_;
+
+  std::unique_ptr<CsvReader> csv_reader_;
+
   const int db_id_;
   const ForeignTable* foreign_table_;
-  size_t row_count_;
+  std::mutex file_access_mutex_;
+  std::mutex file_regions_mutex_;
 
+  // Data needed for append workflow
+  std::map<ChunkKey, std::unique_ptr<ForeignStorageBuffer>> chunk_encoder_buffers_;
+  std::map<ChunkKey, size_t> chunk_byte_count_;
+  // How many rows have been read
+  size_t num_rows_;
+  // What byte offset we left off at in the csv_reader
+  size_t append_start_offset_;
+  // Is this datawrapper restored from disk
+  bool is_restored_;
   static constexpr std::array<char const*, 13> supported_options_{"BASE_PATH",
                                                                   "FILE_PATH",
                                                                   "ARRAY_DELIMITER",

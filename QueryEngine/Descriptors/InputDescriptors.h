@@ -17,8 +17,8 @@
 #ifndef QUERYENGINE_INPUTDESCRIPTORS_H
 #define QUERYENGINE_INPUTDESCRIPTORS_H
 
-#include "Catalog/TableDescriptor.h"
-#include "Shared/Logger.h"
+#include "../Catalog/TableDescriptor.h"
+#include "Logger/Logger.h"
 
 #include <memory>
 

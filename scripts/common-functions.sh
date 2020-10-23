@@ -4,9 +4,9 @@ HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 if [ "$TSAN" = "true" ]; then
-  ARROW_TSAN="-DARROW_USE_TSAN=ON"
+  ARROW_TSAN="-DARROW_JEMALLOC=OFF -DARROW_USE_TSAN=ON"
 elif [ "$TSAN" = "false" ]; then
-  ARROW_TSAN=""
+  ARROW_TSAN="-DARROW_JEMALLOC=BUNDLED"
 fi
 
 function download() {
@@ -63,15 +63,11 @@ function install_cmake() {
   CXXFLAGS="-pthread" CFLAGS="-pthread" download_make_install ${HTTP_DEPS}/cmake-${CMAKE_VERSION}.tar.gz
 }
 
-ARROW_VERSION=apache-arrow-0.16.0
+ARROW_VERSION=apache-arrow-1.0.0
 
 function install_arrow() {
   download https://github.com/apache/arrow/archive/$ARROW_VERSION.tar.gz
   extract $ARROW_VERSION.tar.gz
-
-  pushd arrow-$ARROW_VERSION
-  patch -p1 < ${SCRIPTS_DIR}/0001-PARQUET-1823-C-Invalid-RowGroup-returned-by-parquet-.patch
-  popd
 
   mkdir -p arrow-$ARROW_VERSION/cpp/build
   pushd arrow-$ARROW_VERSION/cpp/build
@@ -82,17 +78,18 @@ function install_arrow() {
     -DARROW_BUILD_STATIC=ON \
     -DARROW_BUILD_TESTS=OFF \
     -DARROW_BUILD_BENCHMARKS=OFF \
-    -DARROW_WITH_BROTLI=OFF \
     -DARROW_CSV=ON \
     -DARROW_JSON=ON \
-    -DARROW_WITH_ZLIB=ON \
-    -DARROW_WITH_LZ4=OFF \
-    -DARROW_WITH_SNAPPY=ON \
-    -DARROW_WITH_ZSTD=ON \
+    -DARROW_WITH_BROTLI=BUNDLED \
+    -DARROW_WITH_ZLIB=BUNDLED \
+    -DARROW_WITH_LZ4=BUNDLED \
+    -DARROW_WITH_SNAPPY=BUNDLED \
+    -DARROW_WITH_ZSTD=BUNDLED \
     -DARROW_USE_GLOG=OFF \
-    -DARROW_JEMALLOC=OFF \
     -DARROW_BOOST_USE_SHARED=${ARROW_BOOST_USE_SHARED:="OFF"} \
     -DARROW_PARQUET=ON \
+    -DARROW_FILESYSTEM=ON \
+    -DARROW_S3=ON \
     -DARROW_CUDA=ON \
     -DTHRIFT_HOME=${THRIFT_HOME:-$PREFIX} \
     ${ARROW_TSAN} \
@@ -138,7 +135,7 @@ function install_awscpp() {
     cmake \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=$PREFIX \
-        -DBUILD_ONLY="s3" \
+        -DBUILD_ONLY="s3;transfer;config" \
         -DBUILD_SHARED_LIBS=0 \
         -DCUSTOM_MEMORY_MANAGEMENT=0 \
         -DCPP_STANDARD=$CPP_STANDARD \
@@ -178,10 +175,23 @@ function install_llvm() {
     mv libcxxabi-$VERS.src llvm-$VERS.src/projects/libcxxabi
     mkdir -p llvm-$VERS.src/tools/clang/tools
     mv clang-tools-extra-$VERS.src llvm-$VERS.src/tools/clang/tools/extra
+
+    # Patch llvm 9 for glibc 2.31+ support
+    # from: https://bugs.gentoo.org/708430
+    pushd llvm-$VERS.src/projects/
+    patch -p0 < $SCRIPTS_DIR/llvm-9-glibc-2.31-708430.patch
+    popd
+
     rm -rf build.llvm-$VERS
     mkdir build.llvm-$VERS
     pushd build.llvm-$VERS
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PREFIX -DLLVM_ENABLE_RTTI=on -DLLVM_USE_INTEL_JITEVENTS=on ../llvm-$VERS.src
+
+    LLVM_SHARED=""
+    if [ "$LLVM_BUILD_DYLIB" = "true" ]; then
+      LLVM_SHARED="-DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON"
+    fi
+
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PREFIX -DLLVM_ENABLE_RTTI=on -DLLVM_USE_INTEL_JITEVENTS=on $LLVM_SHARED ../llvm-$VERS.src
     makej
     make install
     popd

@@ -20,9 +20,11 @@
 
 llvm::Value* Executor::codegenWindowFunction(const size_t target_index,
                                              const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   CodeGenerator code_generator(this);
   const auto window_func_context =
-      WindowProjectNodeContext::get()->activateWindowFunctionContext(target_index);
+      WindowProjectNodeContext::get(this)->activateWindowFunctionContext(this,
+                                                                         target_index);
   const auto window_func = window_func_context->getWindowFunction();
   switch (window_func->getKind()) {
     case SqlWindowFunctionKind::ROW_NUMBER:
@@ -45,7 +47,7 @@ llvm::Value* Executor::codegenWindowFunction(const size_t target_index,
     case SqlWindowFunctionKind::LEAD:
     case SqlWindowFunctionKind::FIRST_VALUE:
     case SqlWindowFunctionKind::LAST_VALUE: {
-      CHECK(WindowProjectNodeContext::get());
+      CHECK(WindowProjectNodeContext::get(this));
       const auto& args = window_func->getArgs();
       CHECK(!args.empty());
       const auto arg_lvs = code_generator.codegen(args.front().get(), true, co);
@@ -120,8 +122,9 @@ SQLTypeInfo get_adjusted_window_type_info(const Analyzer::WindowFunction* window
 }  // namespace
 
 llvm::Value* Executor::aggregateWindowStatePtr() {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto window_func = window_func_context->getWindowFunction();
   const auto arg_ti = get_adjusted_window_type_info(window_func);
   llvm::Type* aggregate_state_type =
@@ -135,11 +138,12 @@ llvm::Value* Executor::aggregateWindowStatePtr() {
 }
 
 llvm::Value* Executor::codegenWindowFunctionAggregate(const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto reset_state_false_bb = codegenWindowResetStateControlFlow();
   auto aggregate_state = aggregateWindowStatePtr();
   llvm::Value* aggregate_state_count = nullptr;
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto window_func = window_func_context->getWindowFunction();
   if (window_func->getKind() == SqlWindowFunctionKind::AVG) {
     const auto aggregate_state_count_i64 = cgen_state_->llInt(
@@ -156,13 +160,14 @@ llvm::Value* Executor::codegenWindowFunctionAggregate(const CompilationOptions& 
   }
   cgen_state_->ir_builder_.CreateBr(reset_state_false_bb);
   cgen_state_->ir_builder_.SetInsertPoint(reset_state_false_bb);
-  CHECK(WindowProjectNodeContext::get());
+  CHECK(WindowProjectNodeContext::get(this));
   return codegenWindowFunctionAggregateCalls(aggregate_state, co);
 }
 
 llvm::BasicBlock* Executor::codegenWindowResetStateControlFlow() {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto bitset = cgen_state_->llInt(
       reinterpret_cast<const int64_t>(window_func_context->partitionStart()));
   const auto min_val = cgen_state_->llInt(int64_t(0));
@@ -179,9 +184,9 @@ llvm::BasicBlock* Executor::codegenWindowResetStateControlFlow() {
                                                    null_val,
                                                    null_bool_val}));
   const auto reset_state_true_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "reset_state.true", cgen_state_->row_func_);
+      cgen_state_->context_, "reset_state.true", cgen_state_->current_func_);
   const auto reset_state_false_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "reset_state.false", cgen_state_->row_func_);
+      cgen_state_->context_, "reset_state.false", cgen_state_->current_func_);
   cgen_state_->ir_builder_.CreateCondBr(
       reset_state, reset_state_true_bb, reset_state_false_bb);
   cgen_state_->ir_builder_.SetInsertPoint(reset_state_true_bb);
@@ -189,8 +194,9 @@ llvm::BasicBlock* Executor::codegenWindowResetStateControlFlow() {
 }
 
 void Executor::codegenWindowFunctionStateInit(llvm::Value* aggregate_state) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto window_func = window_func_context->getWindowFunction();
   const auto window_func_ti = get_adjusted_window_type_info(window_func);
   const auto window_func_null_val =
@@ -239,8 +245,9 @@ void Executor::codegenWindowFunctionStateInit(llvm::Value* aggregate_state) {
 
 llvm::Value* Executor::codegenWindowFunctionAggregateCalls(llvm::Value* aggregate_state,
                                                            const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto window_func = window_func_context->getWindowFunction();
   const auto window_func_ti = get_adjusted_window_type_info(window_func);
   const auto window_func_null_val =
@@ -282,8 +289,9 @@ llvm::Value* Executor::codegenWindowFunctionAggregateCalls(llvm::Value* aggregat
 void Executor::codegenWindowAvgEpilogue(llvm::Value* crt_val,
                                         llvm::Value* window_func_null_val,
                                         llvm::Value* multiplicity_lv) {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const auto window_func = window_func_context->getWindowFunction();
   const auto window_func_ti = get_adjusted_window_type_info(window_func);
   const auto pi32_type =
@@ -316,12 +324,13 @@ void Executor::codegenWindowAvgEpilogue(llvm::Value* crt_val,
 }
 
 llvm::Value* Executor::codegenAggregateWindowState() {
+  AUTOMATIC_IR_METADATA(cgen_state_.get());
   const auto pi32_type =
       llvm::PointerType::get(get_int_type(32, cgen_state_->context_), 0);
   const auto pi64_type =
       llvm::PointerType::get(get_int_type(64, cgen_state_->context_), 0);
   const auto window_func_context =
-      WindowProjectNodeContext::getActiveWindowFunctionContext();
+      WindowProjectNodeContext::getActiveWindowFunctionContext(this);
   const Analyzer::WindowFunction* window_func = window_func_context->getWindowFunction();
   const auto window_func_ti = get_adjusted_window_type_info(window_func);
   const auto aggregate_state_type =

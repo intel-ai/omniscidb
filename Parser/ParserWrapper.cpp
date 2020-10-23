@@ -36,10 +36,12 @@ const std::vector<std::string> ParserWrapper::ddl_cmd = {"ARCHIVE",
                                                          "DROP",
                                                          "DUMP",
                                                          "OPTIMIZE",
+                                                         "REFRESH",
                                                          "RESTORE",
                                                          "REVOKE",
                                                          "SHOW",
-                                                         "TRUNCATE"};
+                                                         "TRUNCATE",
+                                                         "KILL"};
 
 const std::vector<std::string> ParserWrapper::update_dml_cmd = {
     "INSERT",
@@ -129,9 +131,16 @@ ParserWrapper::ParserWrapper(std::string query_string) {
     if (is_ddl) {
       query_type_ = QueryType::SchemaWrite;
       if (g_enable_fsi) {
-        boost::regex fsi_regex{R"((CREATE|DROP|ALTER)\s+(SERVER|FOREIGN\s+TABLE).*)",
+        std::string fsi_regex_pattern{
+            R"((CREATE|DROP|ALTER)\s+(SERVER|FOREIGN\s+TABLE).*)"};
+
+        boost::regex fsi_regex{fsi_regex_pattern,
                                boost::regex::extended | boost::regex::icase};
-        if (boost::regex_match(query_string, fsi_regex)) {
+        boost::regex refresh_regex{R"(REFRESH\s+FOREIGN\s+TABLES.*)",
+                                   boost::regex::extended | boost::regex::icase};
+
+        if (boost::regex_match(query_string, fsi_regex) ||
+            boost::regex_match(query_string, refresh_regex)) {
           is_calcite_ddl_ = true;
           is_legacy_ddl_ = false;
           return;
@@ -164,8 +173,12 @@ ParserWrapper::ParserWrapper(std::string query_string) {
           is_legacy_ddl_ = false;
           return;
         }
+      } else if (ddl == "KILL") {
+        query_type_ = QueryType::Unknown;
+        is_calcite_ddl_ = true;
+        is_legacy_ddl_ = false;
+        return;
       }
-
       is_legacy_ddl_ = !is_calcite_ddl_;
       return;
     }

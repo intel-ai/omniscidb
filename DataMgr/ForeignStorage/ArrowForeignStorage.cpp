@@ -29,9 +29,9 @@
 #include "Catalog/DataframeTableDescriptor.h"
 #include "DataMgr/ForeignStorage/ForeignStorageInterface.h"
 #include "DataMgr/StringNoneEncoder.h"
+#include "Logger/Logger.h"
 #include "QueryEngine/ArrowResultSet.h"
 #include "Shared/ArrowUtil.h"
-#include "Shared/Logger.h"
 #include "Shared/measure.h"
 
 struct Frag {
@@ -416,22 +416,18 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
               {
                 auto b = mgr->createBuffer(k);
                 b->setSize(varlen);
-                b->encoder.reset(Encoder::Create(b, c.columnType));
-                b->has_encoder = true;
-                b->sql_type = c.columnType;
+                b->initEncoder(c.columnType);
               }
               k[4] = 2;
               {
                 auto b = mgr->createBuffer(k);
-                b->sql_type = SQLTypeInfo(kINT, false);
-                b->setSize(frag.sz * b->sql_type.get_size());
+                b->setSqlType(SQLTypeInfo(kINT, false));
+                b->setSize(frag.sz * b->getSqlType().get_size());
               }
             } else {
               auto b = mgr->createBuffer(key);
-              b->sql_type = c.columnType;
-              b->setSize(frag.sz * b->sql_type.get_size());
-              b->encoder.reset(Encoder::Create(b, c.columnType));
-              b->has_encoder = true;
+              b->setSize(frag.sz * b->getSqlType().get_size());
+              b->initEncoder(c.columnType);
               if (!empty) {
                 size_t type_size = c.columnType.get_size();
                 tg.run([b, fr = &frag, type_size]() {
@@ -443,12 +439,12 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
                                                                : (chunk->length - offset);
                     sz += size;
                     auto data = chunk->buffers[1]->data();
-                    b->encoder->updateStats((const int8_t*)data + offset * type_size,
-                                            size);
+                    b->getEncoder()->updateStats((const int8_t*)data + offset * type_size,
+                                                 size);
                   }
                 });
               }
-              b->encoder->setNumElems(frag.sz);
+              b->getEncoder()->setNumElems(frag.sz);
             }
           }
           if (column_type != kDECIMAL && column_type != kNUMERIC &&
@@ -589,7 +585,9 @@ ArrowForeignStorageBase::createDictionaryEncodedColumn(
                     });
 
   std::shared_ptr<arrow::Buffer> indices_buf;
-  ARROW_THROW_NOT_OK(arrow::AllocateBuffer(bulk_size * sizeof(int32_t), &indices_buf));
+  auto res = arrow::AllocateBuffer(bulk_size * sizeof(int32_t));
+  CHECK(res.ok());
+  indices_buf = std::move(res).ValueOrDie();
   auto raw_data = reinterpret_cast<int*>(indices_buf->mutable_data());
   dict->getOrAddBulk(bulk, raw_data);
   auto array = std::make_shared<arrow::Int32Array>(bulk_size, indices_buf);
@@ -618,8 +616,9 @@ std::shared_ptr<arrow::ChunkedArray> ArrowForeignStorageBase::convertArrowDictio
 
     // create new arrow chunk with remapped indices
     std::shared_ptr<arrow::Buffer> dict_indices_buf;
-    ARROW_THROW_NOT_OK(arrow::AllocateBuffer(arrow_indices->length() * sizeof(int32_t),
-                                             &dict_indices_buf));
+    auto res = arrow::AllocateBuffer(arrow_indices->length() * sizeof(int32_t));
+    CHECK(res.ok());
+    dict_indices_buf = std::move(res).ValueOrDie();
     auto raw_data = reinterpret_cast<int32_t*>(dict_indices_buf->mutable_data());
 
     for (int i = 0; i < arrow_indices->length(); i++) {
@@ -644,8 +643,9 @@ std::shared_ptr<arrow::ChunkedArray> ArrowForeignStorageBase::createDecimalColum
   }
 
   std::shared_ptr<arrow::Buffer> result_buffer;
-  ARROW_THROW_NOT_OK(
-      arrow::AllocateBuffer(column_size * c.columnType.get_size(), &result_buffer));
+  auto res = arrow::AllocateBuffer(column_size * c.columnType.get_size());
+  CHECK(res.ok());
+  result_buffer = std::move(res).ValueOrDie();
 
   T* buffer_data = reinterpret_cast<T*>(result_buffer->mutable_data());
   tbb::parallel_for(

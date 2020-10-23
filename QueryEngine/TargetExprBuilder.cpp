@@ -25,9 +25,9 @@
 #include "CodeGenerator.h"
 #include "Execute.h"
 #include "GroupByAndAggregate.h"
+#include "Logger/Logger.h"
 #include "MaxwellCodegenPatch.h"
 #include "OutputBufferInitialization.h"
-#include "Shared/Logger.h"
 
 #define LL_CONTEXT executor->cgen_state_->context_
 #define LL_BUILDER executor->cgen_state_->ir_builder_
@@ -103,13 +103,14 @@ void TargetExprCodegen::codegen(
     GroupByAndAggregate::DiamondCodegen* sample_cfg) const {
   CHECK(group_by_and_agg);
   CHECK(executor);
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
 
   auto agg_out_ptr_w_idx = agg_out_ptr_w_idx_in;
   const auto arg_expr = agg_arg(target_expr);
 
   const auto agg_fn_names = agg_fn_base_names(target_info);
   const auto window_func = dynamic_cast<const Analyzer::WindowFunction*>(target_expr);
-  WindowProjectNodeContext::resetWindowFunctionContext();
+  WindowProjectNodeContext::resetWindowFunctionContext(executor);
   auto target_lvs =
       window_func
           ? std::vector<llvm::Value*>{executor->codegenWindowFunction(target_idx, co)}
@@ -275,6 +276,7 @@ void TargetExprCodegen::codegenAggregate(
     llvm::Value* output_buffer_byte_stream,
     llvm::Value* out_row_idx,
     int32_t slot_index) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   size_t target_lv_idx = 0;
   const bool lazy_fetched{executor->plan_state_->isLazyFetchColumn(target_expr)};
 
@@ -447,7 +449,7 @@ void TargetExprCodegen::codegenAggregate(
     const auto window_func = dynamic_cast<const Analyzer::WindowFunction*>(target_expr);
     if (window_func && window_function_requires_peer_handling(window_func)) {
       const auto window_func_context =
-          WindowProjectNodeContext::getActiveWindowFunctionContext();
+          WindowProjectNodeContext::getActiveWindowFunctionContext(executor);
       const auto pending_outputs =
           LL_INT(window_func_context->aggregateStatePendingOutputs());
       executor->cgen_state_->emitExternalCall("add_window_pending_output",
@@ -496,6 +498,7 @@ void TargetExprCodegen::codegenAggregate(
 void TargetExprCodegenBuilder::operator()(const Analyzer::Expr* target_expr,
                                           const Executor* executor,
                                           const CompilationOptions& co) {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   if (query_mem_desc.getPaddedSlotWidthBytes(slot_index_counter) == 0) {
     CHECK(!dynamic_cast<const Analyzer::AggExpr*>(target_expr));
     ++slot_index_counter;
@@ -581,6 +584,7 @@ void TargetExprCodegenBuilder::codegen(
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
   CHECK(group_by_and_agg);
   CHECK(executor);
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
 
   for (const auto& target_expr_codegen : target_exprs_to_codegen) {
     target_expr_codegen.codegen(group_by_and_agg,
@@ -617,6 +621,7 @@ void TargetExprCodegenBuilder::codegenSampleExpressions(
     llvm::Value* output_buffer_byte_stream,
     llvm::Value* out_row_idx,
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   CHECK(!sample_exprs_to_codegen.empty());
   CHECK(co.device_type == ExecutorDeviceType::GPU);
   if (sample_exprs_to_codegen.size() == 1 &&
@@ -653,6 +658,7 @@ void TargetExprCodegenBuilder::codegenSingleSlotSampleExpression(
     llvm::Value* output_buffer_byte_stream,
     llvm::Value* out_row_idx,
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   CHECK_EQ(size_t(1), sample_exprs_to_codegen.size());
   CHECK(!sample_exprs_to_codegen.front().target_info.sql_type.is_varlen());
   CHECK(co.device_type == ExecutorDeviceType::GPU);
@@ -679,6 +685,7 @@ void TargetExprCodegenBuilder::codegenMultiSlotSampleExpressions(
     llvm::Value* output_buffer_byte_stream,
     llvm::Value* out_row_idx,
     GroupByAndAggregate::DiamondCodegen& diamond_codegen) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   CHECK(sample_exprs_to_codegen.size() > 1 ||
         sample_exprs_to_codegen.front().target_info.sql_type.is_varlen());
   CHECK(co.device_type == ExecutorDeviceType::GPU);
@@ -734,6 +741,7 @@ llvm::Value* TargetExprCodegenBuilder::codegenSlotEmptyKey(
     std::vector<llvm::Value*>& target_lvs,
     Executor* executor,
     const int64_t init_val) const {
+  AUTOMATIC_IR_METADATA(executor->cgen_state_.get());
   const auto& first_sample_expr = sample_exprs_to_codegen.front();
   const auto first_sample_slot_bytes =
       first_sample_expr.target_info.sql_type.is_varlen()

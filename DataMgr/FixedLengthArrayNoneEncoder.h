@@ -24,7 +24,7 @@
 #ifndef FIXED_LENGTH_ARRAY_NONE_ENCODER_H
 #define FIXED_LENGTH_ARRAY_NONE_ENCODER_H
 
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 #include <cassert>
 #include <cstring>
@@ -113,8 +113,22 @@ class FixedLengthArrayNoneEncoder : public Encoder {
 
   void reduceStats(const Encoder&) override { CHECK(false); }
 
-  void updateStats(const int8_t* const dst, const size_t numBytes) override {
-    CHECK(false);
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    for (size_t n = start_idx; n < start_idx + num_elements; n++) {
+      update_elem_stats((*src_data)[n]);
+    }
   }
 
   void writeMetadata(FILE* f) override {
@@ -212,13 +226,13 @@ class FixedLengthArrayNoneEncoder : public Encoder {
   std::mutex EncoderMutex_;
   size_t array_size;
 
-  bool is_null(int8_t* array) { return is_null(buffer_->sql_type, array); }
+  bool is_null(int8_t* array) { return is_null(buffer_->getSqlType(), array); }
 
   void update_elem_stats(const ArrayDatum& array) {
     if (array.is_null) {
       has_nulls = true;
     }
-    switch (buffer_->sql_type.get_subtype()) {
+    switch (buffer_->getSqlType().get_subtype()) {
       case kBOOLEAN: {
         if (!initialized) {
           elem_min.boolval = true;
@@ -412,7 +426,7 @@ class FixedLengthArrayNoneEncoder : public Encoder {
       case kCHAR:
       case kVARCHAR:
       case kTEXT: {
-        CHECK_EQ(buffer_->sql_type.get_compression(), kENCODING_DICT);
+        CHECK_EQ(buffer_->getSqlType().get_compression(), kENCODING_DICT);
         if (!initialized) {
           elem_min.intval = 1;
           elem_max.intval = 0;

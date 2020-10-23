@@ -17,14 +17,12 @@
 #ifndef SHARED_STRINGTRANSFORM_H
 #define SHARED_STRINGTRANSFORM_H
 
-#include "Logger.h"
-
 #ifndef __CUDACC__
 #include <boost/config.hpp>
 #include <boost/regex.hpp>
 #include <optional>
 #include <string_view>
-#endif
+#endif  // __CUDACC__
 
 #include <algorithm>
 #include <iomanip>
@@ -41,24 +39,22 @@ void apply_shim(std::string& result,
 template <typename... Ts>
 std::string cat(Ts&&... args) {
   std::ostringstream oss;
-#ifdef BOOST_NO_CXX17_FOLD_EXPRESSIONS
-  (void)(int[]){0, ((void)(oss << std::forward<Ts>(args)), 0)...};
-#else
   (oss << ... << std::forward<Ts>(args));
-#endif
   return oss.str();
 }
-#endif
+#endif  // __CUDACC__
 
 std::vector<std::pair<size_t, size_t>> find_string_literals(const std::string& query);
 
 // Replace passwords, keys, etc. in a sql query with 'XXXXXXXX'.
 std::string hide_sensitive_data_from_query(std::string const& query_str);
 
-ssize_t inside_string_literal(
+#ifndef __CUDACC__
+std::optional<size_t> inside_string_literal(
     const size_t start,
     const size_t length,
     const std::vector<std::pair<size_t, size_t>>& literal_positions);
+#endif  // __CUDACC__
 
 template <typename T>
 std::string join(T const& container, std::string const& delim) {
@@ -119,10 +115,12 @@ std::string strip(std::string_view str);
 bool remove_unquoted_newlines_linefeeds_and_tabs_from_sql_string(
     std::string& str) noexcept;
 
-// Remove quotes if they match from beginning and end of string.
-// Return true if string was changed, false if not.
-// Does not check for escaped quotes within string.
-bool unquote(std::string&);
+#ifndef __CUDACC__
+//! Quote a string while escaping any existing quotes in the string.
+std::string get_quoted_string(const std::string& filename,
+                              char quote = '"',
+                              char escape = '\\');
+#endif  // __CUDACC__
 
 #ifndef __CUDACC__
 namespace {
@@ -197,6 +195,90 @@ std::string concat_with(std::string_view with, Types&&... parms) {
   (j.append(stringlike(std::forward<Types>(parms))), ...);
   return std::move(j.txt);
 }
+#endif  // __CUDACC__
+
+#ifndef __CUDACC__
+
+/*
+   toString(T) -> std::string
+
+   Convert (almost) any object to string. Pretty-printing is enabled
+   for objects that types define toString() method.
+*/
+
+#include <cxxabi.h>
+#include <sstream>
+#include <type_traits>
+
+template <typename T>
+std::string typeName(const T* v) {
+  std::stringstream stream;
+  int status;
+  char* demangled = abi::__cxa_demangle(typeid(T).name(), 0, 0, &status);
+  stream << std::string(demangled);
+  free(demangled);
+  return stream.str();
+}
+
+namespace {
+
+template <typename T, typename = void>
+struct has_toString : std::false_type {};
+template <typename T>
+struct has_toString<T, decltype(std::declval<T>().toString(), void())> : std::true_type {
+};
+template <class T>
+inline constexpr bool has_toString_v = has_toString<T>::value;
+
+template <typename T, typename = void>
+struct get_has_toString : std::false_type {};
+template <typename T>
+struct get_has_toString<T, decltype(std::declval<T>().get()->toString(), void())>
+    : std::true_type {};
+template <class T>
+inline constexpr bool get_has_toString_v = get_has_toString<T>::value;
+
+}  // namespace
+
+template <typename T>
+std::string toString(const T& v) {
+  if constexpr (std::is_same_v<T, std::string>) {
+    return "\"" + v + "\"";
+  } else if constexpr (std::is_arithmetic_v<T>) {
+    return std::to_string(v);
+  } else if constexpr (has_toString_v<T>) {
+    return v.toString();
+  } else if constexpr (get_has_toString_v<T>) {
+    return v.get()->toString();
+  } else if constexpr (std::is_same_v<T, void*>) {
+    std::ostringstream ss;
+    ss << std::hex << (uintptr_t)v;
+    return "0x" + ss.str();
+  } else if constexpr (std::is_pointer_v<T>) {
+    return (v == NULL ? "NULL" : "&" + toString(*v));
+  } else {
+    return typeName(&v);
+  }
+}
+
+template <typename T>
+std::string toString(const std::pair<T, T>& v) {
+  return cat("(", toString(v.first), ", ", toString(v.second), ")");
+}
+
+template <typename T>
+std::string toString(const std::vector<T>& v) {
+  auto result = std::string("[");
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) {
+      result += ", ";
+    }
+    result += toString(v[i]);
+  }
+  result += "]";
+  return result;
+}
+
 #endif  // __CUDACC__
 
 #endif  // SHARED_STRINGTRANSFORM_H

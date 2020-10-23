@@ -27,7 +27,7 @@ static constexpr int64_t kMilliSecsPerSec = 1000;
 static constexpr int64_t kSecsPerMin = 60;
 static constexpr int64_t kMinsPerHour = 60;
 static constexpr int64_t kHoursPerDay = 24;
-static constexpr int64_t kSecPerHour = 3600;
+static constexpr int64_t kSecsPerHour = 3600;
 static constexpr int64_t kSecsPerDay = 86400;
 static constexpr int64_t kSecsPerQuarterDay = 21600;
 static constexpr int32_t kDaysPerWeek = 7;
@@ -66,6 +66,10 @@ static constexpr uint32_t kUSecsPerDay = 86400;
 static constexpr uint32_t kEpochOffsetYear1900 = 2208988800;
 static constexpr uint32_t kSecsJanToMar1900 = 5097600;
 
+// Number of days from March 1 to Jan 1.
+constexpr unsigned MARJAN = 31 + 30 + 31 + 30 + 31 + 31 + 30 + 31 + 30 + 31;
+constexpr unsigned JANMAR = 31 + 28;  // leap day handled separately
+
 enum ExtractField {
   kYEAR,
   kQUARTER,
@@ -86,12 +90,22 @@ enum ExtractField {
   kDATEEPOCH
 };
 
-// Shared by DateTruncate
-DEVICE int32_t extract_dow(const int64_t lcltime);
+DEVICE int64_t ExtractFromTime(ExtractField field, const int64_t timeval);
 
-DEVICE tm gmtime_r_newlib(const int64_t lcltime, tm& res);
+// Return floor(dividend / divisor).
+// Assumes 0 < divisor.
+DEVICE inline int64_t floor_div(int64_t const dividend, int64_t const divisor) {
+  return (dividend < 0 ? dividend - (divisor - 1) : dividend) / divisor;
+}
 
-extern "C" DEVICE NEVER_INLINE int64_t ExtractFromTime(ExtractField field,
-                                                       const int64_t timeval);
+// Return remainer r of dividend / divisor, where 0 <= r < divisor.
+// Assumes 0 < divisor.
+DEVICE inline int64_t unsigned_mod(int64_t const dividend, int64_t const divisor) {
+  int64_t mod = dividend % divisor;
+  if (mod < 0) {
+    mod += divisor;
+  }
+  return mod;
+}
 
 #endif  // QUERYENGINE_EXTRACTFROMTIME_H

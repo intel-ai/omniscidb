@@ -20,9 +20,9 @@
 #include "../Shared/sqldefs.h"
 #include "DeepCopyVisitor.h"
 #include "Execute.h"
+#include "Logger/Logger.h"
 #include "RelAlgTranslator.h"
 #include "ScalarExprVisitor.h"
-#include "Shared/Logger.h"
 #include "WindowExpressionRewrite.h"
 
 #include <boost/locale/conversion.hpp>
@@ -79,6 +79,11 @@ class OrToInVisitor : public ScalarExprVisitor<std::shared_ptr<Analyzer::InValue
 
   std::shared_ptr<Analyzer::InValues> visitKeyForString(
       const Analyzer::KeyForStringExpr*) const override {
+    return nullptr;
+  }
+
+  std::shared_ptr<Analyzer::InValues> visitSampleRatio(
+      const Analyzer::SampleRatioExpr*) const override {
     return nullptr;
   }
 
@@ -962,4 +967,26 @@ std::shared_ptr<Analyzer::Expr> fold_expr(const Analyzer::Expr* expr) {
         rewritten_expr, expr_with_likelihood->get_likelihood());
   }
   return rewritten_expr;
+}
+
+bool self_join_not_covered_by_left_deep_tree(const Analyzer::ColumnVar* key_side,
+                                             const Analyzer::ColumnVar* val_side,
+                                             const int max_rte_covered) {
+  if (key_side->get_table_id() == val_side->get_table_id() &&
+      key_side->get_rte_idx() == val_side->get_rte_idx() &&
+      key_side->get_rte_idx() > max_rte_covered) {
+    return true;
+  }
+  return false;
+}
+
+const int get_max_rte_scan_table(
+    std::unordered_map<int, llvm::Value*>& scan_idx_to_hash_pos) {
+  int ret = INT32_MIN;
+  for (auto& kv : scan_idx_to_hash_pos) {
+    if (kv.first > ret) {
+      ret = kv.first;
+    }
+  }
+  return ret;
 }

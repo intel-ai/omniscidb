@@ -23,7 +23,7 @@
  **/
 #ifndef STRING_NONE_ENCODER_H
 #define STRING_NONE_ENCODER_H
-#include "Shared/Logger.h"
+#include "Logger/Logger.h"
 
 #include <cassert>
 #include <string>
@@ -79,8 +79,18 @@ class StringNoneEncoder : public Encoder {
 
   void updateStats(const double, const bool) override { CHECK(false); }
 
-  void updateStats(const int8_t* const dst, const size_t numBytes) override {
-    CHECK(false);
+  void updateStats(const int8_t* const src_data, const size_t num_elements) override {
+    UNREACHABLE();
+  }
+
+  void updateStats(const std::vector<std::string>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override;
+
+  void updateStats(const std::vector<ArrayDatum>* const src_data,
+                   const size_t start_idx,
+                   const size_t num_elements) override {
+    UNREACHABLE();
   }
 
   void reduceStats(const Encoder&) override { CHECK(false); }
@@ -109,6 +119,8 @@ class StringNoneEncoder : public Encoder {
   AbstractBuffer* index_buf;
   StringOffsetT last_offset;
   bool has_nulls;
+
+  void update_elem_stats(const std::string& elem);
 
 };  // class StringNoneEncoder
 

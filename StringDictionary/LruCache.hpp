@@ -24,7 +24,7 @@ class LruCache {
  public:
   LruCache(const size_t max_size) : max_size_(max_size) {}
 
-  void put(key_t const& key, value_t&& value) {
+  void put(const key_t& key, value_t&& value) {
     auto it = cache_items_map_.find(key);
     cache_items_list_.emplace_front(key, std::forward<value_t&&>(value));
     putCommon(it, key);
@@ -48,8 +48,11 @@ class LruCache {
 
   const_list_iterator_t find(const key_t& key) const {
     auto it = cache_items_map_.find(key);
-    auto val = (it == cache_items_map_.end() ? cend() : it->second);
-    return (val);
+    if (it == cache_items_map_.end()) {
+      return cend();
+    } else {
+      return it->second;
+    }
   }
 
   const_list_iterator_t cend() const { return (cache_items_list_.cend()); }
@@ -57,6 +60,19 @@ class LruCache {
   void clear() {
     cache_items_list_.clear();
     cache_items_map_.clear();
+  }
+
+  void evictFractionEntries(const float fraction) {
+    size_t entries_to_evict =
+        std::min(std::max(static_cast<size_t>(cache_items_map_.size() * fraction),
+                          static_cast<size_t>(1)),
+                 cache_items_map_.size());
+    evictCommon(entries_to_evict);
+  }
+
+  void evictNEntries(const size_t n) {
+    size_t entries_to_evict = std::min(n, cache_items_map_.size());
+    evictCommon(entries_to_evict);
   }
 
  private:
@@ -72,6 +88,17 @@ class LruCache {
       last--;
       cache_items_map_.erase(last->first);
       cache_items_list_.pop_back();
+    }
+  }
+
+  void evictCommon(const size_t entries_to_evict) {
+    auto last = cache_items_list_.end();
+    size_t entries_erased = 0;
+    while (entries_erased < entries_to_evict && last != cache_items_list_.begin()) {
+      last--;
+      cache_items_map_.erase(last->first);
+      last = cache_items_list_.erase(last);
+      entries_erased++;
     }
   }
 

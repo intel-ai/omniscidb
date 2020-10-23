@@ -1,9 +1,10 @@
 class ApacheArrowOmnisci < Formula
   desc "Columnar in-memory analytics layer designed to accelerate big data"
   homepage "https://arrow.apache.org/"
-  url "https://github.com/apache/arrow/archive/apache-arrow-0.16.0.tar.gz"
+  url "https://github.com/apache/arrow/archive/apache-arrow-1.0.0.tar.gz"
   head "https://github.com/apache/arrow.git"
-  sha256 "d7b3838758a365c8c47d55ab0df1006a70db951c6964440ba354f81f518b8d8d"
+  sha256 "08fbd4c633c08939850d619ca0224c75d7a0526467c721c0838b8aa7efccb270"
+  revision 2
 
   depends_on "cmake" => :build
   depends_on "boost"
@@ -28,6 +29,8 @@ class ApacheArrowOmnisci < Formula
       "-DARROW_JSON=ON",
       "-DARROW_BOOST_USE_SHARED=ON",
       "-DARROW_PARQUET=ON",
+      "-DARROW_FILESYSTEM=ON",
+      "-DARROW_S3=ON",
       "-DARROW_JEMALLOC=OFF",
       "-DTHRIFT_HOME=#{Formula["thrift"].opt_prefix}"
     ]

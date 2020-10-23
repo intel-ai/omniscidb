@@ -80,6 +80,18 @@ SQLTypeInfo TemporaryTable::getColType(const size_t col_idx) const {
   return results_.front()->getColType(col_idx);
 }
 
+void TemporaryTable::setKernelQueueTime(const int64_t kernel_queue_time) {
+  if (empty()) {
+    results_.front()->setKernelQueueTime(kernel_queue_time);
+  }
+}
+
+void TemporaryTable::addCompilationQueueTime(const int64_t compilation_queue_time) {
+  if (!empty()) {
+    results_.front()->addCompilationQueueTime(compilation_queue_time);
+  }
+}
+
 Fragmenter_Namespace::TableInfo InputTableInfoCache::getTableInfo(const int table_id) {
   const auto it = cache_.find(table_id);
   if (it != cache_.end()) {
