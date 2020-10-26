@@ -426,7 +426,7 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
               }
             } else {
               auto b = mgr->createBuffer(key);
-              b->setSize(frag.sz * b->getSqlType().get_size());
+              b->setSize(frag.sz * c.columnType.get_size());
               b->initEncoder(c.columnType);
               if (!empty) {
                 size_t type_size = c.columnType.get_size();
