@@ -439,8 +439,8 @@ void ArrowForeignStorageBase::parseArrowTable(Catalog_Namespace::Catalog* catalo
                                                                : (chunk->length - offset);
                     sz += size;
                     auto data = chunk->buffers[1]->data();
-                    b->getEncoder()->updateStats((const int8_t*)data + offset * type_size,
-                                                 size);
+                    b->getEncoder()->updateStatsEncoded(
+                        (const int8_t*)data + offset * type_size, size);
                   }
                 });
               }
