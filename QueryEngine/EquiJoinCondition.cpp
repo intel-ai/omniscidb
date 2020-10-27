@@ -34,9 +34,9 @@ bool can_combine_with(const Analyzer::Expr* crt, const Analyzer::Expr* prev) {
     return false;
   }
   const auto crt_inner = std::dynamic_pointer_cast<Analyzer::ColumnVar>(
-      remove_cast(crt_bin->get_own_right_operand()));
+      remove_cast(crt_bin->get_own_right_operand(), true));
   const auto prev_inner = std::dynamic_pointer_cast<Analyzer::ColumnVar>(
-      remove_cast(prev_bin->get_own_right_operand()));
+      remove_cast(prev_bin->get_own_right_operand(), true));
   AllRangeTableIndexVisitor visitor;
   const auto crt_outer_rte_set = visitor.visit(crt_bin->get_left_operand());
   const auto prev_outer_rte_set = visitor.visit(prev_bin->get_left_operand());
@@ -63,8 +63,8 @@ std::list<std::shared_ptr<Analyzer::Expr>> make_composite_equals_impl(
     const auto qual_binary = std::dynamic_pointer_cast<Analyzer::BinOper>(qual);
     CHECK(qual_binary);
     not_null = not_null && qual_binary->get_type_info().get_notnull();
-    const auto lhs_col = remove_cast(qual_binary->get_own_left_operand());
-    const auto rhs_col = remove_cast(qual_binary->get_own_right_operand());
+    const auto lhs_col = remove_cast(qual_binary->get_own_left_operand(), true);
+    const auto rhs_col = remove_cast(qual_binary->get_own_right_operand(), true);
     const auto lhs_ti = lhs_col->get_type_info();
     // Coalesce cols for integers, bool, and dict encoded strings. Forces baseline hash
     // join.

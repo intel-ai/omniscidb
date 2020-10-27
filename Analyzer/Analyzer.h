@@ -1592,6 +1592,7 @@ bool expr_list_match(const std::vector<std::shared_ptr<Analyzer::Expr>>& lhs,
                      const std::vector<std::shared_ptr<Analyzer::Expr>>& rhs);
 
 // Remove a cast operator if present.
-std::shared_ptr<Analyzer::Expr> remove_cast(const std::shared_ptr<Analyzer::Expr>& expr);
+std::shared_ptr<Analyzer::Expr> remove_cast(const std::shared_ptr<Analyzer::Expr>& expr,
+                                            bool for_join_qual = false);
 
 #endif  // ANALYZER_H

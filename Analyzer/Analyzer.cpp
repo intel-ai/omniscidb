@@ -3069,10 +3069,17 @@ bool expr_list_match(const std::vector<std::shared_ptr<Analyzer::Expr>>& lhs,
   return true;
 }
 
-std::shared_ptr<Analyzer::Expr> remove_cast(const std::shared_ptr<Analyzer::Expr>& expr) {
+std::shared_ptr<Analyzer::Expr> remove_cast(const std::shared_ptr<Analyzer::Expr>& expr,
+                                            bool for_join_qual) {
   const auto uoper = dynamic_cast<const Analyzer::UOper*>(expr.get());
   if (!uoper || uoper->get_optype() != kCAST) {
     return expr;
+  }
+  if (for_join_qual && uoper && uoper->get_operand() && uoper->get_optype() == kCAST) {
+    if (uoper->get_type_info().is_integer() &&
+        uoper->get_operand()->get_type_info().is_integer()) {
+      return expr;
+    }
   }
   return uoper->get_own_operand();
 }
