@@ -15,11 +15,11 @@ channels:
   - conda-forge
 
 dependencies:
-  - gxx_linux-64   9.3
-  - gcc_linux-64   9.3
+  - gxx_linux-64   8.*
+  - gcc_linux-64   8.*
   - ccache
   - libgdal    >=2.3
-  - sysroot_linux-64 #>=2.14
+  - sysroot_linux-64 >=2.14
   - arrow-cpp  1.0
   - pyarrow    1.0
   - pandas     1.1.3
@@ -28,7 +28,9 @@ dependencies:
   - llvmdev     9.*
   - librdkafka <1.4
   - openjdk     8.*
-  - cmake      >3.14
+  - cmake       3.16
+  - libgdal     2.4.4
+  - libwebp
   - libpng
   - tbb-devel
   - cython
