@@ -29,8 +29,6 @@ dependencies:
   - librdkafka <1.4
   - openjdk     8.*
   - cmake       3.16
-  - libgdal     2.4.4
-  - libwebp
   - libpng
   - tbb-devel
   - cython
