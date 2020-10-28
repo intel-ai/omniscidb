@@ -52,6 +52,11 @@ std::shared_ptr<ForeignStorageInterface> fsi;
  */
 class ForeignTableTest : public DBHandlerTestFixture {
  protected:
+  static void SetUpTestSuite() {
+    setupFSI(fsi);
+    DBHandlerTestFixture::SetUpTestSuite();
+  }
+
   void SetUp() override { DBHandlerTestFixture::SetUp(); }
   void TearDown() override { DBHandlerTestFixture::TearDown(); }
   static std::string getCreateForeignTableQuery(const std::string& columns,
@@ -3158,6 +3163,7 @@ class ForeignStorageCacheQueryTest : public ForeignTableTest {
       query_table_prefix;
 
   static void SetUpTestSuite() {
+    setupFSI(fsi);
     DBHandlerTestFixture::SetUpTestSuite();
     cat = &getCatalog();
     cache = cat->getDataMgr().getPersistentStorageMgr()->getDiskCache();
@@ -3247,7 +3253,13 @@ TEST_F(ForeignStorageCacheQueryTest, CacheWithLimitCachesWholeChunks) {
   sqlAndCompareResult("SELECT SUM(i) FROM " + default_table_name + ";", {{i(32640)}});
 }
 
-class CacheDefaultTest : public DBHandlerTestFixture {};
+class CacheDefaultTest : public DBHandlerTestFixture {
+  protected:
+  static void SetUpTestSuite() {
+    setupFSI(fsi);
+    DBHandlerTestFixture::SetUpTestSuite();
+  }
+};
 TEST_F(CacheDefaultTest, Path) {
   auto cat = &getCatalog();
   auto cache = cat->getDataMgr().getPersistentStorageMgr()->getDiskCache();
