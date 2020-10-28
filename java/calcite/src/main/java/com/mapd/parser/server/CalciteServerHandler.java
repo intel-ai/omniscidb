@@ -297,16 +297,24 @@ public class CalciteServerHandler implements CalciteServer.Iface {
           planner.applyQueryOptimizationRules(relR);
           planner.applyFilterPushdown(relR);
 
+
+          // omnisci uses this rules only to optimize views, but they may be useful
+          // and we didn't find any cases where they generate invalid IR
           ProjectMergeRule projectMergeRule =
                   new ProjectMergeRule(true, RelFactories.LOGICAL_BUILDER);
           final Program program = Programs.hep(
                   ImmutableList.of(FilterProjectTransposeRule.INSTANCE,
                           projectMergeRule,
                           ProjectProjectRemoveRule.INSTANCE,
-                          FilterMergeRule.INSTANCE,
-                          JoinProjectTransposeRule.LEFT_PROJECT_INCLUDE_OUTER,
-                          JoinProjectTransposeRule.RIGHT_PROJECT_INCLUDE_OUTER,
-                          JoinProjectTransposeRule.BOTH_PROJECT_INCLUDE_OUTER
+                          FilterMergeRule.INSTANCE
+                          // this rules could generate invalid IR, so we won't use them
+                          
+                          // JoinProjectTransposeRule.LEFT_PROJECT_INCLUDE_OUTER,
+                          // JoinProjectTransposeRule.RIGHT_PROJECT_INCLUDE_OUTER,
+                          // JoinProjectTransposeRule.BOTH_PROJECT_INCLUDE_OUTER
+
+                          //omnisci doesn't use the following rules at all
+                          
                           // EnumerableRules.ENUMERABLE_JOIN_RULE,
                           // EnumerableRules.ENUMERABLE_MERGE_JOIN_RULE,
                           // EnumerableRules.ENUMERABLE_CORRELATE_RULE,
