@@ -29,6 +29,11 @@ if(PYTHON_EXECUTABLE)
         COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && ${PYTHON_EXECUTABLE} ${SETUP_PY} build_ext -g -f -I ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDS DBEngine ${pydeps}
     )
+    add_custom_target(dbe4py-test
+        COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && ${PYTHON_EXECUTABLE} ${SETUP_PY} build_ext -g -f -I ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMAND ${PYTHON_EXECUTABLE} -m pytest -v ${CMAKE_CURRENT_SOURCE_DIR}/test/test_exceptions.py
+        DEPENDS DBEngine ${pydeps} mapd_java_components
+    )
     add_custom_target(dbe4py-install
         COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && ${PYTHON_EXECUTABLE} ${SETUP_PY} build_ext -g -f -I ${CMAKE_CURRENT_SOURCE_DIR} install
         DEPENDS DBEngine ${pydeps}

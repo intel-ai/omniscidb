@@ -320,6 +320,9 @@ add_custom_target(all_tests
                 ${CMAKE_CTEST_COMMAND} --verbose
     DEPENDS ${TEST_PROGRAMS} ProfileTest UtilTest RunQueryLoop StringDictionaryTest StringTransformTest StoragePerfTest
     USES_TERMINAL)
+if(ENABLE_DBE)
+  add_dependencies(all_tests dbe4py-test)
+endif()
 
 add_custom_target(storage_perf_tests
     COMMAND mkdir -p ${TEST_BASE_PATH}
@@ -332,3 +335,17 @@ add_custom_target(topk_tests
     COMMAND initdb -f ${TEST_BASE_PATH}
     COMMAND ${CMAKE_CTEST_COMMAND} --verbose --tests-regex "\"(TopKTest)\""
     DEPENDS TopKTest)
+
+if(ENABLE_DBE)
+  set(DBE_TEST_PROGRAMS EmbeddedDatabaseTest)
+  set_tests_properties(${DBE_TEST_PROGRAMS} PROPERTIES LABELS "embedded")
+  add_custom_target(dbe_tests
+    COMMAND mkdir -p ${TEST_BASE_PATH}
+    COMMAND env AWS_REGION=${AWS_REGION}
+                AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                ${CMAKE_CTEST_COMMAND} --verbose --label-regex embedded
+    DEPENDS DBEngine ${DBE_TEST_PROGRAMS}
+    USES_TERMINAL)
+  add_dependencies(dbe_tests dbe4py-test)
+endif()

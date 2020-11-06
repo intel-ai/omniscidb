@@ -14,6 +14,7 @@ else()
 endif()
 
 add_library(QueryState QueryState.cpp)
+add_dependencies(QueryState thrift_gen)
 
 add_library(token_completion_hints TokenCompletionHints.cpp)
 target_link_libraries(token_completion_hints mapd_thrift)
