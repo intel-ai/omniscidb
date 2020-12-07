@@ -119,7 +119,7 @@ TEST_F(DBEngineSQLTest, InsertShardedTableWithGeo) {
 }
 
 TEST_F(DBEngineSQLTest, UpdateText) {
-  SetUp("(t text)");
+  SetUp("(t text encoding none)");
 
   run_dml("insert into dbe_test values ('do');");
   run_dml("insert into dbe_test values ('you');");
@@ -249,17 +249,14 @@ int main(int argc, char** argv) {
   po::notify(vm);
 
   if (vm.count("test-help")) {
-    std::cout << "Usage: EmbeddedDbTest" << std::endl << std::endl;
+    std::cout << "Usage: EmbeddedDatabaseTest" << std::endl << std::endl;
     std::cout << desc << std::endl;
     return 0;
   }
 
   logger::init(log_options);
 
-  std::map<std::string, std::string> parameters = {
-    {"path", std::string(BASE_PATH)}};
-
-  engine = DBEngine::create(parameters);
+  engine = DBEngine::create("--data " + std::string(BASE_PATH));
 
   int err{0};
 

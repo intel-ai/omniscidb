@@ -191,6 +191,7 @@ class DBHandler : public OmniSciIf {
             const std::string& libgeos_so_filename,
 #endif
             const DiskCacheConfig& disk_cache_config,
+            const bool is_new_db = false,
             std::shared_ptr<ForeignStorageInterface> fsi = nullptr);
 
   ~DBHandler() override;
@@ -269,6 +270,13 @@ class DBHandler : public OmniSciIf {
                         const std::vector<TTableEpochInfo>& table_epochs) override;
 
   void get_session_info(TSessionInfo& _return, const TSessionId& session) override;
+
+  void sql_execute(ExecutionResult& _return,
+                   const TSessionId& session,
+                   const std::string& query,
+                   const bool column_format,
+                   const int32_t first_n,
+                   const int32_t at_most_n);
   // query, render
   void sql_execute(TQueryResult& _return,
                    const TSessionId& session,
@@ -628,13 +636,32 @@ class DBHandler : public OmniSciIf {
       const std::string& query_str,
       const std::vector<TFilterPushDownInfo>& filter_push_down_info,
       const bool acquire_locks,
-      const SystemParameters system_parameters,
+      const SystemParameters& system_parameters,
       bool check_privileges = true);
 
-  void sql_execute_impl(TQueryResult& _return,
+  void sql_execute_local(TQueryResult& _return,
+                         const QueryStateProxy& query_state_proxy,
+                         const std::shared_ptr<Catalog_Namespace::SessionInfo> session_ptr,
+                         const std::string& query_str,
+                         const bool column_format,
+                         const std::string& nonce,
+                         const int32_t first_n,
+                         const int32_t at_most_n);
+
+  int64_t process_geo_copy_from(const TSessionId& session_id);
+
+  void convert_data(TQueryResult& _return,
+                     const ExecutionResult& result,
+                     const QueryStateProxy& query_state_proxy,
+                     const std::string& query_str,
+                     const bool column_format,
+                     const int32_t first_n,
+                     const int32_t at_most_n);
+
+  void sql_execute_impl(ExecutionResult& _return,
                         QueryStateProxy,
                         const bool column_format,
-                        const std::string& nonce,
+                        //const std::string& nonce,
                         const ExecutorDeviceType executor_device_type,
                         const int32_t first_n,
                         const int32_t at_most_n);
@@ -650,7 +677,7 @@ class DBHandler : public OmniSciIf {
   TQueryResult validate_rel_alg(const std::string& query_ra, QueryStateProxy);
 
   std::vector<PushedDownFilterInfo> execute_rel_alg(
-      TQueryResult& _return,
+      ExecutionResult& _return,
       QueryStateProxy,
       const std::string& query_ra,
       const bool column_format,
@@ -663,7 +690,7 @@ class DBHandler : public OmniSciIf {
       const std::optional<size_t> executor_index = std::nullopt) const;
 
   void execute_rel_alg_with_filter_push_down(
-      TQueryResult& _return,
+      ExecutionResult& _return,
       QueryStateProxy,
       std::string& query_ra,
       const bool column_format,
@@ -685,6 +712,9 @@ class DBHandler : public OmniSciIf {
 
   void executeDdl(TQueryResult& _return,
                   const std::string& query_ra,
+                  std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr);
+
+  void executeDdl(ExecutionResult& _return,
                   std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr);
 
   TColumnType populateThriftColumnType(const Catalog_Namespace::Catalog* cat,

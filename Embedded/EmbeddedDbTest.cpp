@@ -66,11 +66,11 @@ int main(int argc, char* argv[]) {
   }
 
   try {
-    std::map<std::string, std::string> parameters = {
-      {"path", base_path},
-      {"port", std::to_string(calcite_port)}};
-    auto dbe = DBEngine::create(parameters);
-
+    auto opt_str = base_path + " --calcite-port " + std::to_string(calcite_port);
+    if (columnar_output) {
+      opt_str +=  "--columnar-output";
+    }
+    auto dbe = DBEngine::create(opt_str);
     if (dbe) {
       auto memory_pool = arrow::default_memory_pool();
       auto arrow_parse_options = arrow::csv::ParseOptions::Defaults();

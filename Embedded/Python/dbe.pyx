@@ -163,9 +163,9 @@ cdef class PyDbEngine:
     cdef map[string, string] c_parameters
 
     def __cinit__(self, **kwargs):
-        for key, value in kwargs.items():
-            self.c_parameters[key] = str(value)
-        self.c_dbe = DBEngine.create(self.c_parameters)
+        cmd_str = "".join(' --%s %r' % x for x in kwargs.iteritems())
+        cmd_str = cmd_str.replace("_", "-")
+        self.c_dbe = DBEngine.create(bytes(cmd_str, 'utf-8'))
         if self.closed:
             raise RuntimeError('Initialization failed')
 
