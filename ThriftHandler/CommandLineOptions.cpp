@@ -278,6 +278,17 @@ void CommandLineOptions::fillOptions() {
           ->default_value(g_null_div_by_zero)
           ->implicit_value(true),
       "Return null on division by zero instead of throwing an exception.");
+  help_desc.add_options()("inf-div-by-zero",
+                          po::value<bool>(&g_inf_div_by_zero)
+                              ->default_value(g_inf_div_by_zero)
+                              ->implicit_value(true),
+                          "Return infinity on division float or double by zero "
+                          "instead of throwing an exception or returning null.");
+  help_desc.add_options()("monday-first-weekday",
+                          po::value<bool>(&g_monday_first_weekday)
+                              ->default_value(g_monday_first_weekday)
+                              ->implicit_value(true),
+                          "Set Monday as first day of week instead of Sunday");
   help_desc.add_options()(
       "num-reader-threads",
       po::value<size_t>(&num_reader_threads)->default_value(num_reader_threads),

@@ -134,6 +134,8 @@ bool g_is_test_env{false};  // operating under a unit test environment. Currentl
 size_t g_enable_parallel_linearization{
     10000};  // # rows that we are trying to linearize varlen col in parallel
 
+bool g_monday_first_weekday{false};
+
 size_t g_approx_quantile_buffer{1000};
 size_t g_approx_quantile_centroids{300};
 
