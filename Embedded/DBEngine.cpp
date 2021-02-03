@@ -507,6 +507,8 @@ std::shared_ptr<DBEngine> DBEngine::create(
       g_null_div_by_zero = std::stoi(value);
     } else if (key == "enable_multifrag_rs") {
       g_enable_multifrag_rs = std::stoi(value);
+    } else if (key == "monday_first_weekday") {
+      g_monday_first_weekday = std::stoi(value);
     } else {
       std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
                 << std::endl;
