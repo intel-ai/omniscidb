@@ -179,6 +179,7 @@ extern bool g_use_estimator_result_cache;
 extern bool g_enable_lazy_fetch;
 extern bool g_enable_multifrag_rs;
 extern bool g_inf_div_by_zero;
+extern bool g_monday_first_weekday;
 
 extern int64_t g_omni_kafka_seek;
 extern size_t g_leaf_count;
