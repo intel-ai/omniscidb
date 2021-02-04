@@ -44,6 +44,13 @@ else
    export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DENABLE_TESTS=on"
 fi
 
+if [[ "$CMAKE_BUILD_TYPE" ]]
+then
+    export BUILD_TYPE="$CMAKE_BUILD_TYPE"
+else
+    export BUILD_TYPE="release"
+fi
+
 export EXTRA_CMAKE_OPTIONS="$EXTRA_CMAKE_OPTIONS -DBoost_NO_BOOST_CMAKE=on"
 
 this_dir=$(dirname "${BASH_SOURCE[0]}")
@@ -64,7 +71,7 @@ cd build
 cmake -Wno-dev \
     -DCMAKE_PREFIX_PATH=$PREFIX \
     -DCMAKE_INSTALL_PREFIX=$PREFIX/$INSTALL_BASE \
-    -DCMAKE_BUILD_TYPE=release \
+    -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
     -DMAPD_DOCS_DOWNLOAD=off \
     -DENABLE_AWS_S3=off \
     -DENABLE_FOLLY=off \
@@ -74,10 +81,13 @@ cmake -Wno-dev \
     -DENABLE_CUDA=off \
     -DENABLE_DBE=ON \
     -DENABLE_FSI=ON \
+    -DENABLE_ITT=OFF \
+    -DENABLE_JIT_DEBUG=OFF \
+    -DENABLE_INTEL_JIT_LISTENER=OFF \
     $EXTRA_CMAKE_OPTIONS \
     ..
 
-make -j ${CPU_COUNT:-`nproc`}
+make -j ${CPU_COUNT:-`nproc`} || make -j ${CPU_COUNT:-`nproc`} || make
 
 
 if [[ "$RUN_TESTS" == "2" ]]

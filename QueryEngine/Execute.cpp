@@ -124,6 +124,7 @@ bool g_enable_smem_non_grouped_agg{
             // non-grouped aggregates
 bool g_is_test_env{false};  // operating under a unit test environment. Currently only
                             // limits the allocation for the output buffer arena
+bool g_monday_first_weekday{false};
 
 extern bool g_cache_string_hash;
 
