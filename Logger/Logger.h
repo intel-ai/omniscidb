@@ -309,6 +309,8 @@ void debug_timer_new_thread(ThreadId parent_thread_id);
 
 ThreadId thread_id();
 
+void addTreeLog(const std::string& msg);
+
 // Typical usage: auto timer = DEBUG_TIMER(__func__);
 #define DEBUG_TIMER(name) logger::DebugTimer(logger::INFO, __FILE__, __LINE__, name)
 
@@ -317,10 +319,7 @@ ThreadId thread_id();
 // Beware of threads that are re-used.
 #define DEBUG_TIMER_NEW_THREAD(parent_thread_id)        \
   do {                                                  \
-    if (g_enable_debug_timer)                           \
-      logger::debug_timer_new_thread(parent_thread_id); \
   } while (false)
-
 }  // namespace logger
 
 #endif  // SHARED_LOGGER_H

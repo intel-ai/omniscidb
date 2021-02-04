@@ -463,7 +463,14 @@ class Duration {
   typename Units::rep value() const;
 };
 
-using DurationTreeNode = boost::variant<Duration, DurationTree&>;
+struct CustomTreeLog {
+  int depth;
+  std::string text;
+
+  explicit CustomTreeLog(int depth, const std::string& log) : depth(depth), text(log) {}
+};
+
+using DurationTreeNode = boost::variant<Duration, DurationTree&, CustomTreeLog>;
 using DurationTreeNodes = std::deque<DurationTreeNode>;
 
 class DurationTree {
@@ -483,6 +490,11 @@ class DurationTree {
   void pushDurationTree(DurationTree& duration_tree) {
     durations_.emplace_back(duration_tree);
   }
+
+  void addTreeLog(const std::string& msg) {
+    durations_.emplace_back(CustomTreeLog(current_depth_, msg));
+  }
+
   const Duration& rootDuration() const {
     CHECK(!durations_.empty());
     return boost::get<Duration>(durations_.front());
@@ -518,6 +530,7 @@ typename Units::rep Duration::value() const {
 struct GetDepth : boost::static_visitor<int> {
   int operator()(Duration const& duration) const { return duration.depth_; }
   int operator()(DurationTree const& duration_tree) const { return duration_tree.depth_; }
+  int operator()(CustomTreeLog const& log) const { return log.depth; }
 };
 
 using DurationTreeMap = std::unordered_map<ThreadId, std::unique_ptr<DurationTree>>;
@@ -540,10 +553,26 @@ Duration* newDuration(Severity severity, Ts&&... args) {
   return nullptr;  // Inactive - don't measure or report timing.
 }
 
+void addTreeLog(const std::string& msg) {
+  if (!g_enable_debug_timer) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock_guard(g_duration_tree_map_mutex);
+  auto& duration_tree_ptr = g_duration_tree_map[g_thread_id];
+  if (!duration_tree_ptr) {
+    duration_tree_ptr = std::make_unique<DurationTree>(g_thread_id, 0);
+  }
+  return duration_tree_ptr->addTreeLog(msg);
+}
+
 std::ostream& operator<<(std::ostream& os, Duration const& duration) {
   return os << std::setw(2 * duration.depth_) << ' ' << duration.value() << "ms start("
             << duration.relative_start_time() << "ms) " << duration.name_ << ' '
             << filename(duration.file_) << ':' << duration.line_;
+}
+
+std::ostream& operator<<(std::ostream& os, CustomTreeLog const& log) {
+  return os << std::setw(2 * log.depth) << " " << log.text;
 }
 
 std::ostream& operator<<(std::ostream& os, DurationTree const& duration_tree) {
@@ -614,6 +643,13 @@ class JsonEncoder : boost::static_visitor<rapidjson::Value> {
     retval.AddMember("children", childNodes(duration_tree.depth_), alloc_);
     return retval;
   }
+
+  rapidjson::Value operator()(CustomTreeLog const& log) {
+    rapidjson::Value retval(rapidjson::kObjectType);
+    retval.AddMember("message", log.text, alloc_);
+    return retval;
+  }
+
   rapidjson::Value childNodes(int const parent_depth) {
     GetDepth const get_depth;
     rapidjson::Value children(rapidjson::kArrayType);
@@ -671,6 +707,7 @@ struct EraseDurationTrees : boost::static_visitor<> {
     }
     g_duration_tree_map.erase(duration_tree.thread_id_);
   }
+  void operator()(CustomTreeLog const& log) const {}
 };
 
 void logAndEraseDurationTree(std::string* json_str) {

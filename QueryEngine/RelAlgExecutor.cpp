@@ -1825,6 +1825,7 @@ void RelAlgExecutor::computeWindow(const RelAlgExecutionUnit& ra_exe_unit,
                                    const ExecutionOptions& eo,
                                    ColumnCacheMap& column_cache_map,
                                    const int64_t queue_time_ms) {
+  auto timer = DEBUG_TIMER(__func__);
   auto query_infos = get_table_infos(ra_exe_unit.input_descs, executor_);
   CHECK_EQ(query_infos.size(), size_t(1));
   if (query_infos.front().info.fragments.size() != 1) {
@@ -2630,6 +2631,8 @@ namespace {
  * is the reason this estimation isn't entirely reliable.
  */
 size_t groups_approx_upper_bound(const std::vector<InputTableInfo>& table_infos) {
+  auto timer = DEBUG_TIMER(__func__);
+
   CHECK(!table_infos.empty());
   const auto& first_table = table_infos.front();
   size_t max_num_groups = first_table.info.getNumTuplesUpperBound();
@@ -2738,6 +2741,7 @@ RelAlgExecutionUnit decide_approx_count_distinct_implementation(
 void build_render_targets(RenderInfo& render_info,
                           const std::vector<Analyzer::Expr*>& work_unit_target_exprs,
                           const std::vector<TargetMetaInfo>& targets_meta) {
+  auto timer = DEBUG_TIMER(__func__);
   CHECK_EQ(work_unit_target_exprs.size(), targets_meta.size());
   render_info.targets.clear();
   for (size_t i = 0; i < targets_meta.size(); ++i) {
@@ -2927,6 +2931,8 @@ std::optional<size_t> RelAlgExecutor::getFilteredCountAll(const WorkUnit& work_u
                                                           const bool is_agg,
                                                           const CompilationOptions& co,
                                                           const ExecutionOptions& eo) {
+  auto timer = DEBUG_TIMER(__func__);
+
   const auto count =
       makeExpr<Analyzer::AggExpr>(SQLTypeInfo(g_bigint_count ? kBIGINT : kINT, false),
                                   kCOUNT,

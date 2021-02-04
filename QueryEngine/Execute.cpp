@@ -72,6 +72,9 @@
 #include <numeric>
 #include <set>
 #include <thread>
+#include <mutex>
+#include <sstream>
+#include <numeric>
 
 bool g_enable_watchdog{false};
 bool g_enable_dynamic_watchdog{false};
@@ -853,6 +856,7 @@ ResultSetPtr get_merged_result(
 
 ResultSetPtr Executor::resultsUnion(SharedKernelContext& shared_context,
                                     const RelAlgExecutionUnit& ra_exe_unit) {
+  auto timer = DEBUG_TIMER(__func__);
   auto& results_per_device = shared_context.getFragmentResults();
   if (results_per_device.empty()) {
     std::vector<TargetInfo> targets;
@@ -1209,6 +1213,7 @@ std::string sort_algorithm_to_string(const SortAlgorithm algorithm) {
 }  // namespace
 
 std::string ra_exec_unit_desc_for_caching(const RelAlgExecutionUnit& ra_exe_unit) {
+  auto timer = DEBUG_TIMER(__func__);
   // todo(yoonmin): replace a cache key as a DAG representation of a query plan
   // instead of ra_exec_unit description if possible
   std::ostringstream os;
@@ -1339,7 +1344,7 @@ ResultSetPtr Executor::executeWorkUnit(size_t& max_groups_buffer_entry_guess,
                                        const bool has_cardinality_estimation,
                                        ColumnCacheMap& column_cache) {
   VLOG(1) << "Executor " << executor_id_ << " is executing work unit:" << ra_exe_unit_in;
-
+  auto timer = DEBUG_TIMER(__func__);
   ScopeGuard cleanup_post_execution = [this] {
     // cleanup/unpin GPU buffer allocations
     // TODO: separate out this state into a single object
@@ -1403,6 +1408,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     const bool has_cardinality_estimation,
     ColumnCacheMap& column_cache) {
   INJECT_TIMER(Exec_executeWorkUnit);
+  auto timer = DEBUG_TIMER(__func__);
   const auto [ra_exe_unit, deleted_cols_map] = addDeletedColumn(ra_exe_unit_in, co);
   const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type);
   CHECK(!query_infos.empty());
@@ -1423,6 +1429,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     if (eo.executor_type == ExecutorType::Native) {
       try {
         INJECT_TIMER(query_step_compilation);
+        auto compilation_timer = DEBUG_TIMER("compilation");
         auto clock_begin = timer_start();
         std::lock_guard<std::mutex> compilation_lock(compilation_mutex_);
         compilation_queue_time_ms_ += timer_stop(clock_begin);
@@ -1979,6 +1986,7 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
     RenderInfo* render_info,
     std::unordered_set<int>& available_gpus,
     int& available_cpus) {
+  auto timer = DEBUG_TIMER(__func__);
   std::vector<std::unique_ptr<ExecutionKernel>> execution_kernels;
 
   QueryFragmentDescriptor fragment_descriptor(
@@ -2102,23 +2110,39 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
 template <typename THREAD_POOL>
 void Executor::launchKernels(SharedKernelContext& shared_context,
                              std::vector<std::unique_ptr<ExecutionKernel>>&& kernels) {
+  auto timer = DEBUG_TIMER(__func__);
+
   auto clock_begin = timer_start();
   std::lock_guard<std::mutex> kernel_lock(kernel_mutex_);
   kernel_queue_time_ms_ += timer_stop(clock_begin);
 
   THREAD_POOL thread_pool;
+  std::vector<long> kernel_times(kernels.size()); 
+
   VLOG(1) << "Launching " << kernels.size() << " kernels for query.";
-  for (auto& kernel : kernels) {
+  for(size_t i=0; i<kernels.size(); i++) {
+    auto &kernel = kernels[i];
     thread_pool.spawn(
-        [this, &shared_context, parent_thread_id = logger::thread_id()](
+        [this, i, &shared_context, &kernel_times](
             ExecutionKernel* kernel) {
           CHECK(kernel);
-          DEBUG_TIMER_NEW_THREAD(parent_thread_id);
-          kernel->run(this, shared_context);
+          kernel_times[i] = measure<>::execution([&](){
+            kernel->run(this, shared_context);
+          });
         },
         kernel.get());
   }
   thread_pool.join();
+
+  std::stringstream log;
+
+  log << "Running kernels in " << kernels.size() << " tasks. ";
+
+  log << "[Max kernel time: " << *std::max_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+  log << "[Min kernel time: " << *std::min_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+  log << "[Mean kernel time: " << (std::accumulate(kernel_times.begin(), kernel_times.end(), 0) / kernels.size()) << "ms] ";
+
+  logger::addTreeLog(log.str());
 }
 
 std::vector<size_t> Executor::getTableFragmentIndices(
