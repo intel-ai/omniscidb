@@ -6,7 +6,7 @@ import dbe
 import ctypes
 ctypes._dlopen('libDBEngine.so', ctypes.RTLD_GLOBAL)
 
-d = dbe.PyDbEngine('enable-fsi', **{'data':'data', 'calcite-port':9091})
+d = dbe.PyDbEngine(enable_fsi=1, data='data', calcite_port=9091)
 assert not d.closed
 
 root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
