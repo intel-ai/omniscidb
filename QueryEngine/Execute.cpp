@@ -155,7 +155,7 @@ std::shared_ptr<Executor> Executor::getExecutor(
     const ExecutorId executor_id,
     const std::string& debug_dir,
     const std::string& debug_file,
-    const SystemParameters system_parameters) {
+    const SystemParameters& system_parameters) {
   INJECT_TIMER(getExecutor);
 
   mapd_unique_lock<mapd_shared_mutex> write_lock(executors_cache_mutex_);

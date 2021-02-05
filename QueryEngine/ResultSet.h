@@ -449,6 +449,12 @@ class ResultSet {
   bool isTruncated() const;
 
   bool isExplain() const;
+  std::string getExplanation() const {
+    if (just_explain_) {
+      return explanation_;
+    }
+    return {};
+  }
 
   bool isGeoColOnGpu(const size_t col_idx) const;
   int getDeviceId() const;

@@ -97,7 +97,7 @@ cdef extern from "DBEngine.h" namespace 'EmbeddedDatabase':
         bool setDatabase(string db_name) except +
         bool login(string db_name, string user_name, string password) except +
         @staticmethod
-        shared_ptr[DBEngine] create(map[string, string]) except+
+        shared_ptr[DBEngine] create(string cmd_str) except+
 
 cdef extern from "DBETypes.h" namespace 'EmbeddedDatabase::ColumnType':
     cdef ColumnType SMALLINT

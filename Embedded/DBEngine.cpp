@@ -26,11 +26,11 @@
 #include "QueryEngine/Execute.h"
 #include "QueryEngine/ExtensionFunctionsWhitelist.h"
 #include "QueryEngine/TableFunctions/TableFunctionsFactory.h"
-#include "QueryRunner/QueryRunner.h"
+#include "ThriftHandler/CommandLineOptions.h"
+#include "ThriftHandler/DBHandler.h"
 
 extern bool g_enable_union;
-
-using QR = QueryRunner::QueryRunner;
+extern bool g_serialize_temp_tables;
 
 namespace EmbeddedDatabase {
 
@@ -102,73 +102,134 @@ class DBEngineImpl : public DBEngine {
 
   ~DBEngineImpl() { reset(); }
 
-  bool init(const std::string& base_path, int port, const std::string& udf_filename) {
+  bool init(const std::string& cmd_line) {
     static bool initialized{false};
     if (initialized) {
       throw std::runtime_error("Database engine already initialized");
     }
-    SystemParameters mapd_parms;
-    std::string db_path = base_path;
-    fsi_.reset(new ForeignStorageInterface());
-    registerArrowForeignStorage(fsi_);
-    registerArrowCsvForeignStorage(fsi_);
+
+    g_serialize_temp_tables = true;
+
+    // Split the command line into parameters
+    std::vector<std::string> parameters;
+    if (!cmd_line.empty()) {
+      parameters = boost::program_options::split_unix(cmd_line);
+    }
+
+    // Generate command line to initialize CommandLineOptions for DBHandler
+    const char* log_option = "omnisci_dbe";
+    std::vector<const char*> cstrings;
+    cstrings.push_back(log_option);
+    for(auto& param : parameters){
+      cstrings.push_back(param.c_str());
+    }
+    int argc = cstrings.size();
+    const char** argv = cstrings.data();
+
+    CommandLineOptions prog_config_opts(log_option);
+    if (prog_config_opts.parse_command_line(argc, argv, false)) {
+      throw std::runtime_error("DBE paramerameters parsing failed");
+    }
+
+    auto base_path = prog_config_opts.base_path;
+
+    // Check path to the database
     bool is_new_db = base_path.empty() || !catalogExists(base_path);
     if (is_new_db) {
-      db_path = createCatalog(base_path);
-      if (db_path.empty()) {
+      base_path = createCatalog(base_path);
+      if (base_path.empty()) {
         throw std::runtime_error("Database directory could not be created");
       }
     }
-    logger::LogOptions log_options(db_path.c_str());
-    log_options.set_base_path(db_path);
-    logger::init(log_options);
+    prog_config_opts.base_path = base_path;
+    prog_config_opts.init_logging();
 
-    auto data_path = db_path + +"/mapd_data";
-    data_mgr_ =
-        std::make_shared<Data_Namespace::DataMgr>(data_path, fsi_, mapd_parms, false, 0);
-    calcite_ = std::make_shared<Calcite>(-1, port, db_path, 1024, 5000, true);
+    prog_config_opts.system_parameters.omnisci_server_port = -1;
+    prog_config_opts.system_parameters.calcite_keepalive = true;
 
-    ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
-    if (!udf_filename.empty()) {
-      ExtensionFunctionsWhitelist::addUdfs(calcite_->getUserDefinedFunctionWhitelist());
+    fsi_.reset(new ForeignStorageInterface());
+    registerArrowForeignStorage(fsi_);
+    registerArrowCsvForeignStorage(fsi_);
+
+    try {
+      db_handler_ = mapd::make_shared<DBHandler>(
+              prog_config_opts.db_leaves,
+              prog_config_opts.string_leaves,
+              prog_config_opts.base_path,
+              prog_config_opts.cpu_only,
+              prog_config_opts.allow_multifrag,
+              prog_config_opts.jit_debug,
+              prog_config_opts.intel_jit_profile,
+              prog_config_opts.read_only,
+              prog_config_opts.allow_loop_joins,
+              prog_config_opts.enable_rendering,
+              prog_config_opts.renderer_use_vulkan_driver,
+              prog_config_opts.enable_auto_clear_render_mem,
+              prog_config_opts.render_oom_retry_threshold,
+              prog_config_opts.render_mem_bytes,
+              prog_config_opts.max_concurrent_render_sessions,
+              prog_config_opts.num_gpus,
+              prog_config_opts.start_gpu,
+              prog_config_opts.reserved_gpu_mem,
+              prog_config_opts.render_compositor_use_last_gpu,
+              prog_config_opts.num_reader_threads,
+              prog_config_opts.authMetadata,
+              prog_config_opts.system_parameters,
+              prog_config_opts.enable_legacy_syntax,
+              prog_config_opts.idle_session_duration,
+              prog_config_opts.max_session_duration,
+              prog_config_opts.enable_runtime_udf,
+              prog_config_opts.udf_file_name,
+              prog_config_opts.udf_compiler_path,
+              prog_config_opts.udf_compiler_options,
+#ifdef ENABLE_GEOS
+              prog_config_opts.libgeos_so_filename,
+#endif
+              prog_config_opts.disk_cache_config,
+              is_new_db,
+              fsi_);
+    } catch (const std::exception& e) {
+      LOG(FATAL) << "Failed to initialize database handler: " << e.what();
     }
-    table_functions::TableFunctionsFactory::init();
-
-    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-    sys_cat.init(db_path, fsi_, data_mgr_, {}, calcite_, is_new_db, false, {});
-
-    if (!sys_cat.getSqliteConnector()) {
-      throw std::runtime_error("System catalog initialization failed");
-    }
-
-    sys_cat.getMetadataForDB(OMNISCI_DEFAULT_DB, database_);
-    auto catalog = Catalog_Namespace::Catalog::get(db_path,
-                                                   fsi_,
-                                                   database_,
-                                                   data_mgr_,
-                                                   std::vector<LeafHostInfo>(),
-                                                   calcite_,
-                                                   false);
-    sys_cat.getMetadataForUser(OMNISCI_ROOT_USER, user_);
-    auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
-        catalog, user_, ExecutorDeviceType::CPU, "");
-    QR::init(session);
-    base_path_ = db_path;
+    db_handler_->connect(session_id_, OMNISCI_ROOT_USER, OMNISCI_ROOT_PASSWD_DEFAULT, OMNISCI_DEFAULT_DB);
+    base_path_ = base_path;
     initialized = true;
     return true;
   }
 
-  void executeDDL(const std::string& query) { QR::get()->runDDLStatement(query); }
+  std::shared_ptr<CursorImpl> sql_execute_dbe(const TSessionId& session_id,
+                                              const std::string& query_str,
+                                              const bool column_format,
+                                              const int32_t first_n,
+                                              const int32_t at_most_n) {
+    ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
+                                                     ExecutorDeviceType::CPU,
+                                                     QueryMemoryDescriptor(),
+                                                     nullptr,
+                                                     nullptr),
+                         {}};
+    db_handler_->sql_execute(result, session_id, query_str, column_format, first_n, at_most_n);
+    auto& targets = result.getTargetsMeta();
+    std::vector<std::string> col_names;
+    for (const auto target : targets) {
+      col_names.push_back(target.get_resname());
+    }
+    return std::make_shared<CursorImpl>(result.getRows(), col_names);
+  }
+
+  void executeDDL(const std::string& query) {
+    auto res = sql_execute_dbe(session_id_, query, false, -1, -1);
+  }
 
   void importArrowTable(const std::string& name,
                         std::shared_ptr<arrow::Table>& table,
                         uint64_t fragment_size) {
     setArrowTable(name, table);
     try {
-      auto session = QR::get()->getSession();
+      auto session = db_handler_->get_session_copy(session_id_);
       TableDescriptor td;
       td.tableName = name;
-      td.userId = session->get_currentUser().userId;
+      td.userId = session.get_currentUser().userId;
       td.storageType = "ARROW:" + name;
       td.persistenceLevel = Data_Namespace::MemoryLevel::CPU_LEVEL;
       td.isView = false;
@@ -182,11 +243,11 @@ class DBEngineImpl : public DBEngine {
 
       std::list<ColumnDescriptor> cols;
       std::vector<Parser::SharedDictionaryDef> dictionaries;
-      auto catalog = QR::get()->getCatalog();
+      auto catalog = session.get_catalog_ptr();
       // nColumns
       catalog->createTable(td, cols, dictionaries, false);
       Catalog_Namespace::SysCatalog::instance().createDBObject(
-          session->get_currentUser(), td.tableName, TableDBObjectType, *catalog);
+          session.get_currentUser(), td.tableName, TableDBObjectType, *catalog);
     } catch (...) {
       releaseArrowTable(name);
       throw;
@@ -195,51 +256,16 @@ class DBEngineImpl : public DBEngine {
   }
 
   std::shared_ptr<CursorImpl> executeDML(const std::string& query) {
-    ParserWrapper pw{query};
-    if (pw.isCalcitePathPermissable()) {
-      const auto execution_result =
-          QR::get()->runSelectQuery(query, ExecutorDeviceType::CPU, true, true);
-      auto targets = execution_result->getTargetsMeta();
-      std::vector<std::string> col_names;
-      for (const auto target : targets) {
-        col_names.push_back(target.get_resname());
-      }
-      return std::make_shared<CursorImpl>(execution_result->getRows(), col_names);
-    }
-
-    auto session_info = QR::get()->getSession();
-    auto query_state = QR::create_query_state(session_info, query);
-    auto stdlog = STDLOG(query_state);
-
-    SQLParser parser;
-    std::list<std::unique_ptr<Parser::Stmt>> parse_trees;
-    std::string last_parsed;
-    CHECK_EQ(parser.parse(query, parse_trees, last_parsed), 0) << query;
-    CHECK_EQ(parse_trees.size(), size_t(1));
-    auto stmt = parse_trees.front().get();
-    auto insert_values_stmt = dynamic_cast<InsertValuesStmt*>(stmt);
-    CHECK(insert_values_stmt);
-    insert_values_stmt->execute(*session_info);
-    return std::shared_ptr<CursorImpl>();
+    return sql_execute_dbe(session_id_, query, false, -1, -1);
   }
 
   std::shared_ptr<CursorImpl> executeRA(const std::string& query) {
-    if (boost::starts_with(query, "execute calcite")) {
-      return executeDML(query);
-    }
-    const auto execution_result =
-        QR::get()->runSelectQueryRA(query, ExecutorDeviceType::CPU, true, true);
-    auto targets = execution_result->getTargetsMeta();
-    std::vector<std::string> col_names;
-    for (const auto target : targets) {
-      col_names.push_back(target.get_resname());
-    }
-    return std::make_shared<CursorImpl>(execution_result->getRows(), col_names);
+    return sql_execute_dbe(session_id_, query, false, -1, -1);
   }
 
   std::vector<std::string> getTables() {
     std::vector<std::string> table_names;
-    auto catalog = QR::get()->getCatalog();
+    auto catalog = db_handler_->get_session_copy(session_id_).get_catalog_ptr();
     if (catalog) {
       const auto tables = catalog->getAllTableMetadata();
       for (const auto td : tables) {
@@ -257,7 +283,7 @@ class DBEngineImpl : public DBEngine {
 
   std::vector<ColumnDetails> getTableDetails(const std::string& table_name) {
     std::vector<ColumnDetails> result;
-    auto catalog = QR::get()->getCatalog();
+    auto catalog = db_handler_->get_session_copy(session_id_).get_catalog_ptr();
     if (catalog) {
       auto metadata = catalog->getMetadataForTable(table_name, false);
       if (metadata) {
@@ -325,9 +351,10 @@ class DBEngineImpl : public DBEngine {
 
   void createDatabase(const std::string& db_name) {
     Catalog_Namespace::DBMetadata db;
+    auto user = db_handler_->get_session_copy(session_id_).get_currentUser();
     auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
     if (!sys_cat.getMetadataForDB(db_name, db)) {
-      sys_cat.createDatabase(db_name, user_.userId);
+      sys_cat.createDatabase(db_name, user.userId);
     }
   }
 
@@ -341,47 +368,37 @@ class DBEngineImpl : public DBEngine {
 
   bool setDatabase(std::string& db_name) {
     auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-    auto catalog = sys_cat.switchDatabase(db_name, user_.userName);
-    updateSession(catalog);
-    sys_cat.getMetadataForDB(db_name, database_);
+    auto& user = db_handler_->get_session_copy(session_id_).get_currentUser();
+    sys_cat.switchDatabase(db_name, user.userName);
     return true;
   }
 
   bool login(std::string& db_name, std::string& user_name, const std::string& password) {
-    Catalog_Namespace::UserMetadata user_meta;
-    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-    auto catalog = sys_cat.login(db_name, user_name, password, user_meta, true);
-    updateSession(catalog);
-    sys_cat.getMetadataForDB(db_name, database_);
-    sys_cat.getMetadataForUser(user_name, user_);
+    db_handler_->disconnect(session_id_);
+    db_handler_->connect(session_id_, user_name, password, db_name);
     return true;
   }
 
  protected:
   void reset() {
     std::weak_ptr<ForeignStorageInterface> weak_fsi = fsi_;
-    if (calcite_) {
-      calcite_->close_calcite_server();
-      calcite_.reset();
+    if (db_handler_) {
+      db_handler_->disconnect(session_id_);
+      db_handler_->shutdown();
     }
     Catalog_Namespace::SysCatalog::destroy();
     Catalog_Namespace::Catalog::clear();
-    QR::reset();
+    db_handler_.reset();
     fsi_.reset();
-    data_mgr_.reset();
+
     // By that moment FSI should be destroyed.
     CHECK(!weak_fsi.lock());
+
+    logger::shutdown();
     if (is_temp_db_) {
       boost::filesystem::remove_all(base_path_);
     }
-    logger::shutdown();
     base_path_.clear();
-  }
-
-  void updateSession(std::shared_ptr<Catalog_Namespace::Catalog> catalog) {
-    auto session = std::make_unique<Catalog_Namespace::SessionInfo>(
-        catalog, user_, ExecutorDeviceType::CPU, "");
-    QR::init(session);
   }
 
   bool catalogExists(const std::string& base_path) {
@@ -452,11 +469,9 @@ class DBEngineImpl : public DBEngine {
 
  private:
   std::string base_path_;
+  std::string session_id_;
   std::shared_ptr<ForeignStorageInterface> fsi_;
-  std::shared_ptr<Data_Namespace::DataMgr> data_mgr_;
-  std::shared_ptr<Calcite> calcite_;
-  Catalog_Namespace::DBMetadata database_;
-  Catalog_Namespace::UserMetadata user_;
+  mapd::shared_ptr<DBHandler> db_handler_;
   bool is_temp_db_;
   std::string udf_filename_;
 
@@ -469,52 +484,10 @@ namespace {
 std::mutex engine_create_mutex;
 }
 
-std::shared_ptr<DBEngine> DBEngine::create(const std::string& path, int port) {
+std::shared_ptr<DBEngine> DBEngine::create(const std::string& cmd_line) {
   const std::lock_guard<std::mutex> lock(engine_create_mutex);
   auto engine = std::make_shared<DBEngineImpl>();
-  g_enable_union = false;
-  g_enable_columnar_output = true;
-  if (!engine->init(path, port, "")) {
-    throw std::runtime_error("DBE initialization failed");
-  }
-  return engine;
-}
-
-std::shared_ptr<DBEngine> DBEngine::create(
-    const std::map<std::string, std::string>& parameters) {
-  const std::lock_guard<std::mutex> lock(engine_create_mutex);
-  auto engine = std::make_shared<DBEngineImpl>();
-  int port = DEFAULT_CALCITE_PORT;
-  std::string path, udf_filename;
-  g_enable_union = false;
-  g_enable_columnar_output = true;
-  for (const auto& [key, value] : parameters) {
-    if (key == "path") {
-      path = value;
-    } else if (key == "port") {
-      port = std::stoi(value);
-    } else if (key == "enable_columnar_output") {
-      g_enable_columnar_output = std::stoi(value);
-    } else if (key == "enable_union") {
-      g_enable_union = std::stoi(value);
-    } else if (key == "enable_debug_timer") {
-      g_enable_debug_timer = std::stoi(value);
-    } else if (key == "enable_lazy_fetch") {
-      g_enable_lazy_fetch = std::stoi(value);
-    } else if (key == "udf_filename") {
-      udf_filename = value;
-    } else if (key == "null_div_by_zero") {
-      g_null_div_by_zero = std::stoi(value);
-    } else if (key == "enable_multifrag_rs") {
-      g_enable_multifrag_rs = std::stoi(value);
-    } else if (key == "monday_first_weekday") {
-      g_monday_first_weekday = std::stoi(value);
-    } else {
-      std::cerr << "WARNING: ignoring unknown DBEngine parameter '" << key << "'"
-                << std::endl;
-    }
-  }
-  if (!engine->init(path, port, udf_filename)) {
+  if (!engine->init(cmd_line)) {
     throw std::runtime_error("DBE initialization failed");
   }
   return engine;

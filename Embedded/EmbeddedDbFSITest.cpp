@@ -41,7 +41,7 @@ int main(int argc, char* argv[]) {
       "csv",
       po::value<std::string>(&csv_path)->required(),
       "Directory path to CSV file")(
-      "csv_path",
+      "calcite-port",
       po::value<int>(&calcite_port)->default_value(calcite_port),
       "Calcite port")("columnar-output",
                       po::value<bool>(&columnar_output)->default_value(columnar_output),
@@ -69,10 +69,11 @@ int main(int argc, char* argv[]) {
   }
 
   try {
-    std::map<std::string, std::string> parameters = {
-      {"path", base_path},
-      {"port", std::to_string(calcite_port)}};
-    auto dbe = DBEngine::create(parameters);
+    auto opt_str = base_path + " --calcite-port " + std::to_string(calcite_port);
+    if (columnar_output) {
+      opt_str +=  "--columnar-output";
+    }
+    auto dbe = DBEngine::create(opt_str);
     if (dbe) {
       dbe->executeDDL(std::string(R"(
 CREATE TEMPORARY TABLE test (

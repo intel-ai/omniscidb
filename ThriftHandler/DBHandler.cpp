@@ -206,6 +206,7 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
                      const std::string& libgeos_so_filename,
 #endif
                      const DiskCacheConfig& disk_cache_config,
+                     const bool is_new_db,
                      std::shared_ptr<ForeignStorageInterface> fsi)
     : leaf_aggregator_(db_leaves)
     , string_leaves_(string_leaves)
@@ -343,7 +344,7 @@ DBHandler::DBHandler(const std::vector<LeafHostInfo>& db_leaves,
                                 data_mgr_,
                                 authMetadata,
                                 calcite_,
-                                false,
+                                is_new_db,
                                 !db_leaves.empty(),
                                 string_leaves_);
   } catch (const std::exception& e) {
@@ -983,6 +984,92 @@ TDatum DBHandler::value_to_thrift(const TargetValue& tv, const SQLTypeInfo& ti) 
   return datum;
 }
 
+void DBHandler::sql_execute_local(TQueryResult& _return,
+                                  const QueryStateProxy& query_state_proxy,
+                                  const std::shared_ptr<Catalog_Namespace::SessionInfo> session_ptr,
+                                  const std::string& query_str,
+                                  const bool column_format,
+                                  const std::string& nonce,
+                                  const int32_t first_n,
+                                  const int32_t at_most_n) {
+  _return.total_time_ms = 0;
+  _return.nonce = nonce;
+  ParserWrapper pw{query_str};
+  switch (pw.getQueryType()) {
+    case ParserWrapper::QueryType::Read: {
+      _return.query_type = TQueryType::READ;
+      VLOG(1) << "query type: READ";
+      break;
+    }
+    case ParserWrapper::QueryType::Write: {
+      _return.query_type = TQueryType::WRITE;
+      VLOG(1) << "query type: WRITE";
+      break;
+    }
+    case ParserWrapper::QueryType::SchemaRead: {
+      _return.query_type = TQueryType::SCHEMA_READ;
+      VLOG(1) << "query type: SCHEMA READ";
+      break;
+    }
+    case ParserWrapper::QueryType::SchemaWrite: {
+      _return.query_type = TQueryType::SCHEMA_WRITE;
+      VLOG(1) << "query type: SCHEMA WRITE";
+      break;
+    }
+    default: {
+      _return.query_type = TQueryType::UNKNOWN;
+      LOG(WARNING) << "query type: UNKNOWN";
+      break;
+    }
+  }
+  ExecutionResult result;
+  _return.total_time_ms += measure<>::execution([&]() {
+    DBHandler::sql_execute_impl(result,
+                                query_state_proxy,
+                                column_format,
+                                session_ptr->get_executor_device_type(),
+                                first_n,
+                                at_most_n);
+    if (result.getResultType() == ExecutionResult::CalciteDdl) {
+      executeDdl(_return, result.getExplanation(), session_ptr);
+    } else {
+      convert_data(_return,
+                   result,
+                   query_state_proxy,
+                   query_str,
+                   column_format,
+                   first_n,
+                   at_most_n);
+    }
+  });
+}
+
+void DBHandler::convert_data(TQueryResult& _return,
+                             const ExecutionResult& result,
+                             const QueryStateProxy& query_state_proxy,
+                             const std::string& query_str,
+                             const bool column_format,
+                             const int32_t first_n,
+                             const int32_t at_most_n) {
+  switch(result.getResultType()) {
+    case ExecutionResult::QueryResult:
+      convert_rows(_return,
+                   query_state_proxy,
+                   result.getTargetsMeta(),
+                   *result.getRows(),
+                   column_format,
+                   first_n,
+                   at_most_n);
+      break;
+    case ExecutionResult::SimpleResult:
+      convert_result(_return, *result.getRows(), true);
+      break;
+    case ExecutionResult::Explaination:
+      convert_explain(_return, *result.getRows(), true);
+      break;
+  }
+}
+
 void DBHandler::sql_execute(TQueryResult& _return,
                             const TSessionId& session,
                             const std::string& query_str,
@@ -1023,45 +1110,17 @@ void DBHandler::sql_execute(TQueryResult& _return,
       });
       _return.nonce = nonce;
     } else {
-      _return.total_time_ms = measure<>::execution([&]() {
-        DBHandler::sql_execute_impl(_return,
-                                    query_state->createQueryStateProxy(),
-                                    column_format,
-                                    nonce,
-                                    session_ptr->get_executor_device_type(),
-                                    first_n,
-                                    at_most_n);
-      });
+      sql_execute_local(_return,
+                        query_state->createQueryStateProxy(),
+                        session_ptr,
+                        query_str,
+                        column_format,
+                        nonce,
+                        first_n,
+                        at_most_n);
     }
+    _return.total_time_ms += process_geo_copy_from(session);
 
-    // if the SQL statement we just executed was a geo COPY FROM, the import
-    // parameters were captured, and this flag set, so we do the actual import here
-    if (auto geo_copy_from_state =
-            geo_copy_from_sessions(session_ptr->get_session_id())) {
-      // import_geo_table() calls create_table() which calls this function to
-      // do the work, so reset the flag now to avoid executing this part a
-      // second time at the end of that, which would fail as the table was
-      // already created! Also reset the flag with a ScopeGuard on exiting
-      // this function any other way, such as an exception from the code above!
-      geo_copy_from_sessions.remove(session_ptr->get_session_id());
-
-      // create table as replicated?
-      TCreateParams create_params;
-      if (geo_copy_from_state->geo_copy_from_partitions == "REPLICATED") {
-        create_params.is_replicated = true;
-      }
-
-      // now do (and time) the import
-      _return.total_time_ms = measure<>::execution([&]() {
-        import_geo_table(
-            session,
-            geo_copy_from_state->geo_copy_from_table,
-            geo_copy_from_state->geo_copy_from_file_name,
-            copyparams_to_thrift(geo_copy_from_state->geo_copy_from_copy_params),
-            TRowDescriptor(),
-            create_params);
-      });
-    }
     std::string debug_json = timer.stopAndGetJson();
     if (!debug_json.empty()) {
       _return.__set_debug(std::move(debug_json));
@@ -1080,12 +1139,100 @@ void DBHandler::sql_execute(TQueryResult& _return,
     } else if (strstr(e.what(), "Parse failed: Encountered \";\"")) {
       THROW_MAPD_EXCEPTION("multiple SQL statements not allowed");
     } else if (strstr(e.what(),
+                  "Parse failed: Encountered \"<EOF>\" at line 0, column 0")) {
+      THROW_MAPD_EXCEPTION("empty SQL statment not allowed");
+    } else {
+      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
+    }
+  }
+}
+
+void DBHandler::sql_execute(ExecutionResult& _return,
+                            const TSessionId& session,
+                            const std::string& query_str,
+                            const bool column_format,
+                            const int32_t first_n,
+                            const int32_t at_most_n) {
+  auto session_ptr = get_session_ptr(session);
+  auto query_state = create_query_state(session_ptr, query_str);
+  auto stdlog = STDLOG(session_ptr, query_state);
+  auto timer = DEBUG_TIMER(__func__);
+
+  try {
+    ScopeGuard reset_was_geo_copy_from = [this, &session_ptr] {
+      geo_copy_from_sessions.remove(session_ptr->get_session_id());
+    };
+
+    if (first_n >= 0 && at_most_n >= 0) {
+      THROW_MAPD_EXCEPTION(
+          std::string("At most one of first_n and at_most_n can be set"));
+    }
+    auto total_time_ms = measure<>::execution([&]() {
+      DBHandler::sql_execute_impl(_return,
+                                  query_state->createQueryStateProxy(),
+                                  column_format,
+                                  session_ptr->get_executor_device_type(),
+                                  first_n,
+                                  at_most_n);
+      if (_return.getResultType() == ExecutionResult::CalciteDdl) {
+        executeDdl(_return, session_ptr);
+      }
+    });
+
+    _return.setExecutionTime(total_time_ms + process_geo_copy_from(session));
+
+    stdlog.appendNameValuePairs(
+        "execution_time_ms",
+        _return.getExecutionTime(),
+        "total_time_ms",  // BE-3420 - Redundant with duration field
+        stdlog.duration<std::chrono::milliseconds>());
+    VLOG(1) << "Table Schema Locks:\n" << lockmgr::TableSchemaLockMgr::instance();
+    VLOG(1) << "Table Data Locks:\n" << lockmgr::TableDataLockMgr::instance();
+  } catch (const std::exception& e) {
+    if (strstr(e.what(), "java.lang.NullPointerException")) {
+      THROW_MAPD_EXCEPTION(std::string("Exception: ") +
+                           "query failed from broken view or other schema related issue");
+    } else if (strstr(e.what(), "Parse failed: Encountered \";\"")) {
+      THROW_MAPD_EXCEPTION("multiple SQL statements not allowed");
+    } else if (strstr(e.what(),
                       "Parse failed: Encountered \"<EOF>\" at line 0, column 0")) {
       THROW_MAPD_EXCEPTION("empty SQL statment not allowed");
     } else {
       THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
     }
   }
+}
+
+int64_t DBHandler::process_geo_copy_from(const TSessionId& session_id) {
+    int64_t total_time_ms(0);
+	// if the SQL statement we just executed was a geo COPY FROM, the import
+	// parameters were captured, and this flag set, so we do the actual import here
+	if (auto geo_copy_from_state = geo_copy_from_sessions(session_id)) {
+		// import_geo_table() calls create_table() which calls this function to
+		// do the work, so reset the flag now to avoid executing this part a
+		// second time at the end of that, which would fail as the table was
+		// already created! Also reset the flag with a ScopeGuard on exiting
+		// this function any other way, such as an exception from the code above!
+		geo_copy_from_sessions.remove(session_id);
+
+		// create table as replicated?
+		TCreateParams create_params;
+		if (geo_copy_from_state->geo_copy_from_partitions == "REPLICATED") {
+		  create_params.is_replicated = true;
+		}
+
+		// now do (and time) the import
+		total_time_ms = measure<>::execution([&]() {
+		  import_geo_table(
+			  session_id,
+			  geo_copy_from_state->geo_copy_from_table,
+			  geo_copy_from_state->geo_copy_from_file_name,
+			  copyparams_to_thrift(geo_copy_from_state->geo_copy_from_copy_params),
+			  TRowDescriptor(),
+			  create_params);
+		});
+    }
+    return total_time_ms;
 }
 
 void DBHandler::sql_execute_df(TDataFrame& _return,
@@ -1446,7 +1593,8 @@ std::unordered_set<std::string> DBHandler::get_uc_compatible_table_names_by_colu
 
 TQueryResult DBHandler::validate_rel_alg(const std::string& query_ra,
                                          QueryStateProxy query_state_proxy) {
-  TQueryResult result;
+  TQueryResult _return;
+  ExecutionResult result;
   auto execute_rel_alg_task = std::make_shared<QueryDispatchQueue::Task>(
       [this, &result, &query_state_proxy, &query_ra](const size_t executor_index) {
         execute_rel_alg(result,
@@ -1465,7 +1613,8 @@ TQueryResult DBHandler::validate_rel_alg(const std::string& query_ra,
   dispatch_queue_->submit(execute_rel_alg_task, /*is_update_delete=*/false);
   auto result_future = execute_rel_alg_task->get_future();
   result_future.get();
-  return result;
+  convert_data(_return, result, query_state_proxy, query_ra, true, -1, -1);
+  return _return;
 }
 
 void DBHandler::get_roles(std::vector<std::string>& roles, const TSessionId& session) {
@@ -2151,8 +2300,8 @@ void DBHandler::get_tables_meta_impl(std::vector<TTableMeta>& _return,
             query_state_proxy, td->viewSQL, {}, with_table_locks, system_parameters_);
         const auto query_ra = parse_result.plan_result;
 
-        TQueryResult result;
-        execute_rel_alg(result,
+        ExecutionResult ex_result;
+        execute_rel_alg(ex_result,
                         query_state_proxy,
                         query_ra,
                         true,
@@ -2162,6 +2311,8 @@ void DBHandler::get_tables_meta_impl(std::vector<TTableMeta>& _return,
                         /*just_validate=*/true,
                         /*find_push_down_candidates=*/false,
                         ExplainInfo::defaults());
+        TQueryResult result;
+        convert_data(result, ex_result, query_state_proxy, query_ra, true, -1, -1);
         num_cols = result.row_set.row_desc.size();
         for (const auto& col : result.row_set.row_desc) {
           if (col.is_physical) {
@@ -4721,7 +4872,7 @@ void DBHandler::set_execution_mode_nolock(Catalog_Namespace::SessionInfo* sessio
 }
 
 std::vector<PushedDownFilterInfo> DBHandler::execute_rel_alg(
-    TQueryResult& _return,
+    ExecutionResult& _return,
     QueryStateProxy query_state_proxy,
     const std::string& query_ra,
     const bool column_format,
@@ -4773,32 +4924,20 @@ std::vector<PushedDownFilterInfo> DBHandler::execute_rel_alg(
                          system_parameters_.gpu_input_mem_limit,
                          g_enable_runtime_query_interrupt,
                          g_runtime_query_interrupt_frequency};
-  ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
-                                                     ExecutorDeviceType::CPU,
-                                                     QueryMemoryDescriptor(),
-                                                     nullptr,
-                                                     nullptr),
-                         {}};
-  _return.execution_time_ms += measure<>::execution([&]() {
-    result = ra_executor.executeRelAlgQuery(co, eo, explain_info.explain_plan, nullptr);
+  auto execution_time_ms = _return.getExecutionTime() + measure<>::execution([&]() {
+    _return = ra_executor.executeRelAlgQuery(co, eo, explain_info.explain_plan, nullptr);
   });
   // reduce execution time by the time spent during queue waiting
-  _return.execution_time_ms -= result.getRows()->getQueueTime();
+  _return.setExecutionTime(execution_time_ms -= _return.getRows()->getQueueTime());
   VLOG(1) << cat.getDataMgr().getSystemMemoryUsage();
-  const auto& filter_push_down_info = result.getPushedDownFilterInfo();
+  const auto& filter_push_down_info = _return.getPushedDownFilterInfo();
   if (!filter_push_down_info.empty()) {
     return filter_push_down_info;
   }
   if (explain_info.justExplain()) {
-    convert_explain(_return, *result.getRows(), column_format);
+    _return.setResultType(ExecutionResult::Explaination);
   } else if (!explain_info.justCalciteExplain()) {
-    convert_rows(_return,
-                 timer.createQueryStateProxy(),
-                 result.getTargetsMeta(),
-                 *result.getRows(),
-                 column_format,
-                 first_n,
-                 at_most_n);
+    _return.setResultType(ExecutionResult::QueryResult);
   }
   return {};
 }
@@ -4845,12 +4984,7 @@ void DBHandler::execute_rel_alg_df(TDataFrame& _return,
                          system_parameters_.gpu_input_mem_limit,
                          g_enable_runtime_query_interrupt,
                          g_runtime_query_interrupt_frequency};
-  ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
-                                                     ExecutorDeviceType::CPU,
-                                                     QueryMemoryDescriptor(),
-                                                     nullptr,
-                                                     nullptr),
-                         {}};
+  ExecutionResult result;
   _return.execution_time_ms += measure<>::execution(
       [&]() { result = ra_executor.executeRelAlgQuery(co, eo, false, nullptr); });
   _return.execution_time_ms -= result.getRows()->getQueueTime();
@@ -5112,19 +5246,15 @@ void DBHandler::check_and_invalidate_sessions(Parser::DDLStmt* ddl) {
   }
 }
 
-void DBHandler::sql_execute_impl(TQueryResult& _return,
+void DBHandler::sql_execute_impl(ExecutionResult& _return,
                                  QueryStateProxy query_state_proxy,
                                  const bool column_format,
-                                 const std::string& nonce,
                                  const ExecutorDeviceType executor_device_type,
                                  const int32_t first_n,
                                  const int32_t at_most_n) {
   if (leaf_handler_) {
     leaf_handler_->flush_queue();
   }
-
-  _return.nonce = nonce;
-  _return.execution_time_ms = 0;
   auto const query_str = strip(query_state_proxy.getQueryState().getQueryStr());
   auto session_ptr = query_state_proxy.getQueryState().getConstSessionInfo();
   // Call to DistributedValidate() below may change cat.
@@ -5137,33 +5267,6 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
 
   lockmgr::LockedTableDescriptors locks;
   ParserWrapper pw{query_str};
-  switch (pw.getQueryType()) {
-    case ParserWrapper::QueryType::Read: {
-      _return.query_type = TQueryType::READ;
-      VLOG(1) << "query type: READ";
-      break;
-    }
-    case ParserWrapper::QueryType::Write: {
-      _return.query_type = TQueryType::WRITE;
-      VLOG(1) << "query type: WRITE";
-      break;
-    }
-    case ParserWrapper::QueryType::SchemaRead: {
-      _return.query_type = TQueryType::SCHEMA_READ;
-      VLOG(1) << "query type: SCHEMA READ";
-      break;
-    }
-    case ParserWrapper::QueryType::SchemaWrite: {
-      _return.query_type = TQueryType::SCHEMA_WRITE;
-      VLOG(1) << "query type: SCHEMA WRITE";
-      break;
-    }
-    default: {
-      _return.query_type = TQueryType::UNKNOWN;
-      LOG(WARNING) << "query type: UNKNOWN";
-      break;
-    }
-  }
   if (pw.isCalcitePathPermissable(read_only_)) {
     executeReadLock = mapd_shared_lock<mapd_shared_mutex>(
         *legacylockmgr::LockMgr<mapd_shared_mutex, bool>::getMutex(
@@ -5173,18 +5276,18 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
     if (pw.is_exec_ra) {
       query_ra = pw.actual_query;
     } else {
-      _return.execution_time_ms += measure<>::execution([&]() {
+      _return.addExecutionTime(measure<>::execution([&]() {
         TPlanResult result;
         std::tie(result, locks) =
             parse_to_ra(query_state_proxy, query_str, {}, true, system_parameters_);
         query_ra = result.plan_result;
-      });
+      }));
     }
 
     std::string query_ra_calcite_explain;
     if (pw.isCalciteExplain() && (!g_enable_filter_push_down || g_cluster)) {
       // return the ra as the result
-      convert_explain(_return, ResultSet(query_ra), true);
+      _return.updateResultSet(query_ra, ExecutionResult::Explaination);
       return;
     } else if (pw.isCalciteExplain()) {
       // removing the "explain calcite " from the beginning of the "query_str":
@@ -5196,7 +5299,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
           parse_to_ra(query_state_proxy, temp_query_str, {}, false, system_parameters_)
               .first.plan_result;
     } else if (pw.isCalciteDdl()) {
-      executeDdl(_return, query_ra, session_ptr);
+      _return.updateResultSet(query_ra, ExecutionResult::CalciteDdl);
       return;
     }
     const auto explain_info = pw.getExplainInfo();
@@ -5230,7 +5333,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
           if (explain_info.justCalciteExplain() && filter_push_down_requests.empty()) {
             // we only reach here if filter push down was enabled, but no filter
             // push down candidate was found
-            convert_explain(_return, ResultSet(query_ra), true);
+            _return.updateResultSet(query_ra, ExecutionResult::Explaination);
           } else if (!filter_push_down_requests.empty()) {
             CHECK(!locks.empty());
             execute_rel_alg_with_filter_push_down(_return,
@@ -5243,8 +5346,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
                                                   explain_info.justExplain(),
                                                   explain_info.justCalciteExplain(),
                                                   filter_push_down_requests);
-          } else if (explain_info.justCalciteExplain() &&
-                     filter_push_down_requests.empty()) {
+          } else if (explain_info.justCalciteExplain() && filter_push_down_requests.empty()) {
             // return the ra as the result:
             // If we reach here, the 'filter_push_down_request' turned out to be
             // empty, i.e., no filter push down so we continue with the initial
@@ -5253,7 +5355,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
             query_ra =
                 parse_to_ra(query_state_proxy, query_str, {}, false, system_parameters_)
                     .first.plan_result;
-            convert_explain(_return, ResultSet(query_ra), true);
+            _return.updateResultSet(query_ra, ExecutionResult::Explaination);
           }
         });
     CHECK(dispatch_queue_);
@@ -5272,7 +5374,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
           dynamic_cast<Parser::OptimizeTableStmt*>(parse_trees.front().get());
       CHECK(optimize_stmt);
 
-      _return.execution_time_ms += measure<>::execution([&]() {
+      _return.addExecutionTime(measure<>::execution([&]() {
         const auto td_with_lock =
             lockmgr::TableSchemaLockContainer<lockmgr::WriteLock>::acquireTableDescriptor(
                 cat, optimize_stmt->getTableName());
@@ -5298,8 +5400,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
           optimizer.vacuumDeletedRows();
         }
         optimizer.recomputeMetadata();
-      });
-
+      }));
       return;
     }
     if (pw.is_validate) {
@@ -5318,7 +5419,7 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
 
       std::string output{"Result for validate"};
       if (g_cluster && leaf_aggregator_.leafCount()) {
-        _return.execution_time_ms += measure<>::execution([&]() {
+        _return.addExecutionTime(measure<>::execution([&]() {
           const DistributedValidate validator(validate_stmt->getType(),
                                               validate_stmt->isRepairTypeRemove(),
                                               cat,  // tables may be dropped here
@@ -5326,11 +5427,11 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
                                               *session_ptr,
                                               *this);
           output = validator.validate(query_state_proxy);
-        });
+        }));
       } else {
         output = "Not running on a cluster nothing to validate";
       }
-      convert_result(_return, ResultSet(output), true);
+      _return.updateResultSet(output, ExecutionResult::SimpleResult);
       return;
     }
   }
@@ -5345,10 +5446,10 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
     }
     const auto show_create_stmt = dynamic_cast<Parser::ShowCreateTableStmt*>(ddl);
     if (show_create_stmt) {
-      _return.execution_time_ms +=
-          measure<>::execution([&]() { ddl->execute(*session_ptr); });
+      _return.addExecutionTime(measure<>::execution([&]() {
+          ddl->execute(*session_ptr); }));
       const auto create_string = show_create_stmt->getCreateStmt();
-      convert_result(_return, ResultSet(create_string), true);
+      _return.updateResultSet(create_string, ExecutionResult::SimpleResult);
       return true;
     }
 
@@ -5359,16 +5460,16 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
         throw std::runtime_error(
             "Cannot import on an individual leaf. Please import from the Aggregator.");
       } else if (leaf_aggregator_.leafCount() > 0) {
-        _return.execution_time_ms += measure<>::execution(
-            [&]() { execute_distributed_copy_statement(import_stmt, *session_ptr); });
+        _return.addExecutionTime(measure<>::execution(
+            [&]() { execute_distributed_copy_statement(import_stmt, *session_ptr); }));
       } else {
-        _return.execution_time_ms +=
-            measure<>::execution([&]() { ddl->execute(*session_ptr); });
+        _return.addExecutionTime(measure<>::execution([&]() { ddl->execute(*session_ptr); }));
       }
 
       // Read response message
-      convert_result(_return, ResultSet(*import_stmt->return_message.get()), true);
-      _return.success = import_stmt->get_success();
+      _return.updateResultSet(*import_stmt->return_message.get(),
+                              ExecutionResult::SimpleResult,
+                              import_stmt->get_success());
 
       // get geo_copy_from info
       if (import_stmt->was_geo_copy_from()) {
@@ -5392,10 +5493,10 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
       std::tie(result, locks) =
           parse_to_ra(query_state_proxy, query_string, {}, true, system_parameters_);
     }
-    _return.execution_time_ms += measure<>::execution([&]() {
+    _return.addExecutionTime(measure<>::execution([&]() {
       ddl->execute(*session_ptr);
       check_and_invalidate_sessions(ddl);
-    });
+    }));
     return true;
   };
 
@@ -5412,15 +5513,13 @@ void DBHandler::sql_execute_impl(TQueryResult& _return,
       if (parse_trees.size() != 1) {
         throw std::runtime_error("Can only run one INSERT INTO query at a time.");
       }
-
-      _return.execution_time_ms +=
-          measure<>::execution([&]() { stmtp->execute(*session_ptr); });
+      _return.addExecutionTime(measure<>::execution([&]() { stmtp->execute(*session_ptr); }));
     }
   }
 }
 
 void DBHandler::execute_rel_alg_with_filter_push_down(
-    TQueryResult& _return,
+    ExecutionResult& _return,
     QueryStateProxy query_state_proxy,
     std::string& query_ra,
     const bool column_format,
@@ -5440,18 +5539,18 @@ void DBHandler::execute_rel_alg_with_filter_push_down(
     filter_push_down_info.push_back(filter_push_down_info_for_request);
   }
   // deriving the new relational algebra plan with respect to the pushed down filters
-  _return.execution_time_ms += measure<>::execution([&]() {
+  _return.addExecutionTime(measure<>::execution([&]() {
     query_ra = parse_to_ra(query_state_proxy,
                            query_state_proxy.getQueryState().getQueryStr(),
                            filter_push_down_info,
                            false,
                            system_parameters_)
                    .first.plan_result;
-  });
+  }));
 
   if (just_calcite_explain) {
     // return the new ra as the result
-    convert_explain(_return, ResultSet(query_ra), true);
+    _return.updateResultSet(query_ra, ExecutionResult::Explaination);
     return;
   }
 
@@ -5491,7 +5590,7 @@ std::pair<TPlanResult, lockmgr::LockedTableDescriptors> DBHandler::parse_to_ra(
     const std::string& query_str,
     const std::vector<TFilterPushDownInfo>& filter_push_down_info,
     const bool acquire_locks,
-    const SystemParameters system_parameters,
+    const SystemParameters& system_parameters,
     bool check_privileges) {
   query_state::Timer timer = query_state_proxy.createTimer(__func__);
   ParserWrapper pw{query_str};
@@ -6304,4 +6403,13 @@ void DBHandler::executeDdl(
   } else {
     executor.execute(_return);
   }
+}
+
+void DBHandler::executeDdl(
+    ExecutionResult& _return,
+    std::shared_ptr<Catalog_Namespace::SessionInfo const> session_ptr) {
+  auto query_ra = _return.getExplanation(); 
+  DdlCommandExecutor executor = DdlCommandExecutor(query_ra, session_ptr);
+  TQueryResult result;
+  executor.execute(result);
 }
