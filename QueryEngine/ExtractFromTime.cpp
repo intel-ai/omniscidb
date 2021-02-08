@@ -48,31 +48,6 @@ DEVICE int64_t get_doy(const int64_t timeval) {
   return doe - (kDaysPerYear * yoe + yoe / 4 - yoe / 100);
 }
 
-// Return day-of-year since on January 1
-DEVICE int64_t get_converted_doy(const int64_t timeval) {
-  int64_t const day = floor_div(timeval, kSecsPerDay);
-  unsigned const doe = unsigned_mod(day - kEpochAdjustedDays, kDaysPer400Years);
-  unsigned const yoe = (doe - doe / (kDaysPer4Years - 1) + doe / kDaysPer100Years -
-                        (doe == kDaysPer400Years - 1)) /
-                       kDaysPerYear;
-  unsigned const doy = doe - (kDaysPerYear * yoe + yoe / 4 - yoe / 100);
-  return doy + (doy < MARJAN
-                    ? 1 + JANMAR + (yoe % 4 == 0 && (yoe % 100 != 0 || yoe % 400 == 0))
-                    : 1 - MARJAN);
-}
-
-// Return year
-DEVICE int64_t get_year(const int64_t timeval) {
-  int64_t const day = floor_div(timeval, kSecsPerDay);
-  int64_t const era = floor_div(day - kEpochAdjustedDays, kDaysPer400Years);
-  unsigned const doe = unsigned_mod(day - kEpochAdjustedDays, kDaysPer400Years);
-  unsigned const yoe = (doe - doe / (kDaysPer4Years - 1) + doe / kDaysPer100Years -
-                        (doe == kDaysPer400Years - 1)) /
-                       kDaysPerYear;
-  unsigned const doy = doe - (kDaysPerYear * yoe + yoe / 4 - yoe / 100);
-  return 2000 + era * 400 + yoe + (MARJAN <= doy);
-}
-
 DEVICE bool is_leap(const int64_t year) {
   return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
 }
@@ -265,20 +240,20 @@ extern "C" ALWAYS_INLINE DEVICE int64_t extract_year(const int64_t timeval) {
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_last_day_of_month(const int64_t timeval) {
   constexpr int64_t days[12]{31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 28};
   unsigned const doy = get_doy(timeval);
-  unsigned const year = get_year(timeval);
+  unsigned const year = extract_year(timeval);
   unsigned const moy = (5 * doy - 2) / 153;
   return moy != 11 ? days[moy] : is_leap(year) ? days[moy] + 1 : days[moy];
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_leap_year(const int64_t timeval) {
-  unsigned const year = get_year(timeval);
+  unsigned const year = extract_year(timeval);
   return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_month_end(const int64_t timeval) {
   constexpr int64_t days[12]{31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 28};
   unsigned const doy = get_doy(timeval) - 1;
-  unsigned const year = get_year(timeval);
+  unsigned const year = extract_year(timeval);
   unsigned const moy = (5 * doy - 2) / 153;
   unsigned const dom = extract_day(timeval);
   return moy != 11 ? (dom == days[moy])
@@ -290,23 +265,21 @@ extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_month_start(const int64_t tim
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_quarter_end(const int64_t timeval) {
-  unsigned const d = get_converted_doy(timeval);
-  unsigned const year = get_year(timeval);
+  unsigned const d = extract_day_of_year(timeval);
+  unsigned const year = extract_year(timeval);
   return is_leap(year) ? (d == 91 || d == 182 || d == 274 || d == 366)
                        : (d == 90 || d == 181 || d == 273 || d == 365);
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_quarter_start(const int64_t timeval) {
-  unsigned const d = get_converted_doy(timeval);
-  unsigned const year = get_year(timeval);
+  unsigned const d = extract_day_of_year(timeval);
+  unsigned const year = extract_year(timeval);
   return is_leap(year) ? (d == 1 || d == 92 || d == 183 || d == 275)
                        : (d == 1 || d == 91 || d == 182 || d == 274);
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_year_end(const int64_t timeval) {
-  unsigned const d = get_doy(timeval);
-  unsigned const year = get_year(timeval);
-  return is_leap(year) ? (d == MARJAN - 1) : (d == MARJAN - 1);
+  return MARJAN - 1 == get_doy(timeval);
 }
 
 extern "C" ALWAYS_INLINE DEVICE int64_t extract_is_year_start(const int64_t timeval) {
