@@ -94,10 +94,15 @@ class TbbThreadPool : public TbbThreadPoolBase {
 
   template <class Function, class... Args>
   void spawn(Function&& f, Args&&... args) {
-    tasks_.run([f, args...] { f(args...); });
+    tasks_.run([f{std::move(f)}, args...] { f(args...); });
   }
 
   void join() { tasks_.wait(); }
+
+  template <class Function, class... Args>
+  void addSubtask(Function&& f, Args&&... args) {
+    tasks_.run([f, args...]{ f(std::forward(args...)); });
+  }
 };
 
 template <typename T>
@@ -110,7 +115,7 @@ class TbbThreadPool<T, std::enable_if_t<std::is_object<T>::value>>
   void spawn(Function&& f, Args&&... args) {
     const size_t result_idx = results_.size();
     results_.emplace_back(T{});
-    tasks_.run([this, result_idx, f, args...] { results_[result_idx] = f(args...); });
+    tasks_.run([this, result_idx, f{std::move(f)}, args...] { results_[result_idx] = f(args...); });
   }
 
   auto join() {

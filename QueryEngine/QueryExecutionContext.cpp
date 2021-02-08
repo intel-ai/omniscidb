@@ -568,6 +568,10 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
 #endif
 }
 
+#ifdef DBG_PRINT
+std::mutex dbg_print_mutex;
+#endif
+
 std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CpuCompilationContext* native_code,
@@ -579,7 +583,8 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     const int32_t scan_limit,
     int32_t* error_code,
     const uint32_t num_tables,
-    const std::vector<int64_t>& join_hash_tables) {
+    const std::vector<int64_t>& join_hash_tables,
+    const int64_t rows_to_process) {
   DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(lauchCpuCode);
 
@@ -622,10 +627,22 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     flatened_frag_offsets.insert(
         flatened_frag_offsets.end(), offsets.begin(), offsets.end());
   }
-  int64_t rowid_lookup_num_rows{*error_code ? *error_code + 1 : 0};
+  // TODO: check if there is a bug. error_code is supposed to hold start position
+  // to resume execution. Why do we use it as a number of rows to process?
+  int64_t rowid_lookup_num_rows = {*error_code ? *error_code + 1 : 0};
   auto num_rows_ptr =
-      rowid_lookup_num_rows ? &rowid_lookup_num_rows : &flatened_num_rows[0];
+      (rows_to_process > 0)
+          ? &rows_to_process
+          : (rowid_lookup_num_rows ? &rowid_lookup_num_rows : &flatened_num_rows[0]);
   int32_t total_matched_init{0};
+
+#ifdef DBG_PRINT
+  {
+    std::lock_guard<std::mutex> loc(dbg_print_mutex);
+    std::cout << "Run CPU code for range: [" << *error_code << ", " << *num_rows_ptr
+              << ")" << std::endl;
+  }
+#endif
 
   std::vector<int64_t> cmpt_val_buff;
   if (is_group_by) {
@@ -655,6 +672,7 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
                                const int64_t*);  // join_hash_tables_ptr
     if (is_group_by) {
       reinterpret_cast<agg_query>(native_code->func())(
+          // manual_func(
           multifrag_cols_ptr,
           &num_fragments,
           &literal_buff[0],

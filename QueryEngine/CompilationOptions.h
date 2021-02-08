@@ -25,7 +25,7 @@ enum class ExecutorOptLevel { Default, LoopStrengthReduction, ReductionJIT };
 
 enum class ExecutorExplainType { Default, Optimized };
 
-enum class ExecutorDispatchMode { KernelPerFragment, MultifragmentKernel };
+enum class ExecutorDispatchMode { KernelPerFragment, MultifragmentKernel }; // TODO: add KernelPerSubfragment
 
 struct CompilationOptions {
   ExecutorDeviceType device_type;

@@ -194,6 +194,7 @@ extern bool g_enable_s3_fsi;
 extern bool g_enable_interop;
 extern bool g_enable_union;
 extern bool g_use_tbb_pool;
+extern bool g_enable_subfragments;
 extern bool g_enable_filter_function;
 extern size_t g_max_import_threads;
 extern bool g_cleanup_join_hash_table_cache;
