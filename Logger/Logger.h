@@ -319,7 +319,7 @@ class DebugTimer {
 
 using ThreadId = uint64_t;
 
-void debug_timer_new_thread(ThreadId parent_thread_id);
+void debug_timer_maybe_new_thread(ThreadId parent_thread_id);
 
 ThreadId thread_id();
 
@@ -342,8 +342,10 @@ void addTreeLog(const std::string& msg);
 // This MUST NOT be called more than once per thread, otherwise a failed CHECK() occurs.
 // Best practice is to call it from the point where the new thread is spawned.
 // Beware of threads that are re-used.
-#define DEBUG_TIMER_NEW_THREAD(parent_thread_id) \
-  do {                                           \
+#define DEBUG_TIMER_NEW_THREAD(parent_thread_id)              \
+  do {                                                        \
+    if (g_enable_debug_timer)                                 \
+      logger::debug_timer_maybe_new_thread(parent_thread_id); \
   } while (false)
 }  // namespace logger
 
