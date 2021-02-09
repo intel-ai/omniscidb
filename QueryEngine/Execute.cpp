@@ -79,6 +79,7 @@ bool g_enable_watchdog{false};
 bool g_enable_dynamic_watchdog{false};
 bool g_use_tbb_pool{false};
 bool g_enable_subfragments{false};
+size_t g_subfragment_size{1000000};
 bool g_enable_filter_function{true};
 unsigned g_dynamic_watchdog_time_limit{10000};
 bool g_allow_cpu_retry{true};

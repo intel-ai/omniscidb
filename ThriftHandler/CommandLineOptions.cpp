@@ -505,6 +505,10 @@ void CommandLineOptions::fillAdvancedOptions() {
       "Enable data processing on subfragments level. This can improve CPU load balance "
       "and decrease reduction overhead.");
   developer_desc.add_options()(
+      "subfragment-size",
+      po::value<size_t>(&g_subfragment_size)->default_value(g_subfragment_size),
+      "Set subfragment size.");
+  developer_desc.add_options()(
       "skip-intermediate-count",
       po::value<bool>(&g_skip_intermediate_count)
           ->default_value(g_skip_intermediate_count)

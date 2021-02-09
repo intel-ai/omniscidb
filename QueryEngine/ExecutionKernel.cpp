@@ -305,7 +305,7 @@ void ExecutionKernel::runImpl(Executor* executor, SharedKernelContext& shared_co
 
   if (can_run_subkernels) {
     size_t total_rows = fetch_result->num_rows[0][0];
-    size_t sub_size = total_rows / 5;
+    size_t sub_size = g_subfragment_size;
 
     for (size_t sub_start = start_rowid; sub_start < total_rows; sub_start += sub_size) {
       sub_size = (sub_start + sub_size > total_rows) ? total_rows - sub_start : sub_size;
