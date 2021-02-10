@@ -615,7 +615,7 @@ std::unique_ptr<QueryExecutionContext> QueryMemoryDescriptor::getQueryExecutionC
     const bool output_columnar,
     const bool sort_on_gpu,
     RenderInfo* render_info) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (frag_offsets.empty()) {
     return nullptr;
   }

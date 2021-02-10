@@ -204,6 +204,9 @@ void result_set::fill_empty_key(void* key_ptr,
 void ResultSetStorage::reduce(const ResultSetStorage& that,
                               const std::vector<std::string>& serialized_varlen_buffer,
                               const ReductionCode& reduction_code) const {
+
+  DEBUG_TIMER_THIS_FUNC();
+
   auto entry_count = query_mem_desc_.getEntryCount();
   CHECK_GT(entry_count, size_t(0));
   if (query_mem_desc_.didOutputColumnar()) {
@@ -1133,6 +1136,9 @@ void ResultSetStorage::fillOneEntryRowWise(const std::vector<int64_t>& entry) {
 }
 
 void ResultSetStorage::initializeRowWise() const {
+  
+  DEBUG_TIMER_THIS_FUNC();
+
   const auto key_count = query_mem_desc_.getGroupbyColCount();
   const auto row_size = get_row_bytes(query_mem_desc_);
   CHECK_EQ(row_size % 8, 0u);
@@ -1187,6 +1193,9 @@ void ResultSetStorage::fillOneEntryColWise(const std::vector<int64_t>& entry) {
 }
 
 void ResultSetStorage::initializeColWise() const {
+  
+  DEBUG_TIMER_THIS_FUNC();
+
   const auto key_count = query_mem_desc_.getGroupbyColCount();
   auto this_buff = reinterpret_cast<int64_t*>(buff_);
   CHECK(!query_mem_desc_.hasKeylessHash());

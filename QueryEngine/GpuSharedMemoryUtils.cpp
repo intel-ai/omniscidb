@@ -48,7 +48,7 @@ GpuSharedMemCodeBuilder::GpuSharedMemCodeBuilder(
 }
 
 void GpuSharedMemCodeBuilder::codegen() {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   // codegen the init function
   init_func_ = createInitFunction();

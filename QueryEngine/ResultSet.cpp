@@ -237,6 +237,9 @@ void ResultSet::append(ResultSet& that) {
   if (!that.storage_) {
     return;
   }
+  
+  DEBUG_TIMER_THIS_FUNC();
+
   appended_storage_.push_back(std::move(that.storage_));
   query_mem_desc_.setEntryCount(
       query_mem_desc_.getEntryCount() +
@@ -494,7 +497,7 @@ QueryMemoryDescriptor ResultSet::fixupQueryMemoryDescriptor(
 void ResultSet::sort(const std::list<Analyzer::OrderEntry>& order_entries,
                      const size_t top_n,
                      const Executor* executor) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   if (!storage_) {
     return;
@@ -554,7 +557,7 @@ void ResultSet::sort(const std::list<Analyzer::OrderEntry>& order_entries,
 void ResultSet::baselineSort(const std::list<Analyzer::OrderEntry>& order_entries,
                              const size_t top_n,
                              const Executor* executor) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   // If we only have on GPU, it's usually faster to do multi-threaded radix sort on CPU
   if (getGpuCount() > 1) {
     try {
@@ -570,7 +573,7 @@ void ResultSet::baselineSort(const std::list<Analyzer::OrderEntry>& order_entrie
 
 std::vector<uint32_t> ResultSet::initPermutationBuffer(const size_t start,
                                                        const size_t step) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_NE(size_t(0), step);
   std::vector<uint32_t> permutation;
   const auto total_entries = query_mem_desc_.getEntryCount();
@@ -594,7 +597,7 @@ const std::vector<uint32_t>& ResultSet::getPermutationBuffer() const {
 void ResultSet::parallelTop(const std::list<Analyzer::OrderEntry>& order_entries,
                             const size_t top_n,
                             const Executor* executor) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const size_t step = cpu_threads();
   std::vector<std::vector<uint32_t>> strided_permutations(step);
   std::vector<std::future<void>> init_futures;
@@ -856,7 +859,7 @@ void ResultSet::topPermutation(
     std::vector<uint32_t>& to_sort,
     const size_t n,
     const std::function<bool(const uint32_t, const uint32_t)> compare) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::make_heap(to_sort.begin(), to_sort.end(), compare);
   std::vector<uint32_t> permutation_top;
   permutation_top.reserve(n);
@@ -870,13 +873,13 @@ void ResultSet::topPermutation(
 
 void ResultSet::sortPermutation(
     const std::function<bool(const uint32_t, const uint32_t)> compare) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::sort(permutation_.begin(), permutation_.end(), compare);
 }
 
 void ResultSet::radixSortOnGpu(
     const std::list<Analyzer::OrderEntry>& order_entries) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto data_mgr = &catalog_->getDataMgr();
   const int device_id{0};
   CudaAllocator cuda_allocator(data_mgr, device_id);
@@ -913,7 +916,7 @@ void ResultSet::radixSortOnGpu(
 
 void ResultSet::radixSortOnCpu(
     const std::list<Analyzer::OrderEntry>& order_entries) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK(!query_mem_desc_.hasKeylessHash());
   std::vector<int64_t> tmp_buff(query_mem_desc_.getEntryCount());
   std::vector<int32_t> idx_buff(query_mem_desc_.getEntryCount());

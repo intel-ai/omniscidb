@@ -133,7 +133,7 @@ int64_t QueryExecutionContext::getAggInitValForIndex(const size_t index) const {
 ResultSetPtr QueryExecutionContext::getRowSet(
     const RelAlgExecutionUnit& ra_exe_unit,
     const QueryMemoryDescriptor& query_mem_desc) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::vector<std::pair<ResultSetPtr, std::vector<size_t>>> results_per_sm;
   CHECK(query_buffers_);
   const auto group_by_buffers_size = query_buffers_->getNumBuffers();
@@ -196,7 +196,7 @@ std::vector<int64_t*> QueryExecutionContext::launchGpuCode(
     const uint32_t num_tables,
     const std::vector<int64_t>& join_hash_tables,
     RenderAllocatorMap* render_allocator_map) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(lauchGpuCode);
 #ifdef HAVE_CUDA
   CHECK(gpu_allocator_);
@@ -580,7 +580,7 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
     int32_t* error_code,
     const uint32_t num_tables,
     const std::vector<int64_t>& join_hash_tables) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(lauchCpuCode);
 
   CHECK(query_buffers_);

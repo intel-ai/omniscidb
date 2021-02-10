@@ -299,7 +299,7 @@ std::vector<Fragmenter_Namespace::FragmentInfo> only_shards_for_device(
 }
 
 void PerfectJoinHashTable::reify() {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_LT(0, device_count_);
   catalog_ = const_cast<Catalog_Namespace::Catalog*>(executor_->getCatalog());
   const auto cols =
@@ -488,7 +488,7 @@ int PerfectJoinHashTable::initHashTableForDevice(
     const HashType layout,
     const Data_Namespace::MemoryLevel effective_memory_level,
     const int device_id) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto inner_col = cols.first;
   CHECK(inner_col);
 
@@ -642,7 +642,7 @@ std::shared_ptr<PerfectHashTable> PerfectJoinHashTable::initHashTableOnCpuFromCa
     const ChunkKey& chunk_key,
     const size_t num_elements,
     const InnerOuter& cols) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_GE(chunk_key.size(), size_t(2));
   if (chunk_key[1] < 0) {
     // Do not cache hash tables over intermediate results

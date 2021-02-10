@@ -124,7 +124,7 @@ std::shared_ptr<OverlapsJoinHashTable> OverlapsJoinHashTable::getInstance(
 }
 
 void OverlapsJoinHashTable::reifyWithLayout(const HashType layout) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK(layoutRequiresAdditionalBuffers(layout));
   const auto& query_info =
       get_inner_query_info(HashJoin::getInnerTableId(inner_outer_pairs_), query_infos_)
@@ -551,7 +551,7 @@ size_t OverlapsJoinHashTable::getKeyComponentCount() const {
 }
 
 void OverlapsJoinHashTable::reify(const HashType preferred_layout) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_LT(0, device_count_);
   const auto composite_key_info =
       HashJoin::getCompositeKeyInfo(inner_outer_pairs_, executor_);
@@ -683,7 +683,7 @@ std::shared_ptr<BaselineHashTable> OverlapsJoinHashTable::initHashTableOnCpu(
     const HashType layout,
     const size_t entry_count,
     const size_t emitted_keys_count) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto composite_key_info =
       HashJoin::getCompositeKeyInfo(inner_outer_pairs_, executor_);
   CHECK(!join_columns.empty());
@@ -1077,7 +1077,7 @@ int OverlapsJoinHashTable::getInnerTableId() const noexcept {
 
 std::shared_ptr<HashTable> OverlapsJoinHashTable::initHashTableOnCpuFromCache(
     const HashTableCacheKey& key) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   VLOG(1) << "Checking CPU hash table cache.";
   CHECK(hash_table_cache_);
   return hash_table_cache_->get(key);

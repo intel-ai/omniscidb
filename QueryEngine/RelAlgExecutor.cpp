@@ -218,7 +218,7 @@ ExecutionResult RelAlgExecutor::executeRelAlgQuery(const CompilationOptions& co,
                                                    const bool just_explain_plan,
                                                    RenderInfo* render_info) {
   CHECK(query_dag_);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(executeRelAlgQuery);
 
   auto run_query = [&](const CompilationOptions& co_in) {
@@ -261,8 +261,8 @@ ExecutionResult RelAlgExecutor::executeRelAlgQueryNoRetry(const CompilationOptio
                                                           const bool just_explain_plan,
                                                           RenderInfo* render_info) {
   INJECT_TIMER(executeRelAlgQueryNoRetry);
-  auto timer = DEBUG_TIMER(__func__);
-  auto timer_setup = DEBUG_TIMER("Query pre-execution steps");
+  DEBUG_TIMER_THIS_FUNC();
+  DEBUG_TIMER(timer_setup, "Query pre-execution steps");
 
   query_dag_->resetQueryExecutionState();
   const auto& ra = query_dag_->getRootNode();
@@ -580,7 +580,7 @@ ExecutionResult RelAlgExecutor::executeRelAlgSeq(const RaExecutionSequence& seq,
                                                  const int64_t queue_time_ms,
                                                  const bool with_existing_temp_tables) {
   INJECT_TIMER(executeRelAlgSeq);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (!with_existing_temp_tables) {
     decltype(temporary_tables_)().swap(temporary_tables_);
   }
@@ -659,7 +659,7 @@ void RelAlgExecutor::executeRelAlgStep(const RaExecutionSequence& seq,
                                        RenderInfo* render_info,
                                        const int64_t queue_time_ms) {
   INJECT_TIMER(executeRelAlgStep);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   WindowProjectNodeContext::reset(executor_);
   auto exec_desc_ptr = seq.getDescriptor(step_idx);
   CHECK(exec_desc_ptr);
@@ -1469,7 +1469,7 @@ void RelAlgExecutor::executeUpdate(const RelAlgNode* node,
                                    const ExecutionOptions& eo_in,
                                    const int64_t queue_time_ms) {
   CHECK(node);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   UpdateTriggeredCacheInvalidator::invalidateCaches();
 
@@ -1582,7 +1582,7 @@ void RelAlgExecutor::executeDelete(const RelAlgNode* node,
                                    const ExecutionOptions& eo_in,
                                    const int64_t queue_time_ms) {
   CHECK(node);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   DeleteTriggeredCacheInvalidator::invalidateCaches();
 
@@ -1673,7 +1673,7 @@ ExecutionResult RelAlgExecutor::executeCompound(const RelCompound* compound,
                                                 const ExecutionOptions& eo,
                                                 RenderInfo* render_info,
                                                 const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto work_unit =
       createCompoundWorkUnit(compound, {{}, SortAlgorithm::Default, 0, 0}, eo);
   CompilationOptions co_compound = co;
@@ -1691,7 +1691,7 @@ ExecutionResult RelAlgExecutor::executeAggregate(const RelAggregate* aggregate,
                                                  const ExecutionOptions& eo,
                                                  RenderInfo* render_info,
                                                  const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto work_unit = createAggregateWorkUnit(
       aggregate, {{}, SortAlgorithm::Default, 0, 0}, eo.just_explain);
   return executeWorkUnit(work_unit,
@@ -1723,7 +1723,7 @@ ExecutionResult RelAlgExecutor::executeProject(
     RenderInfo* render_info,
     const int64_t queue_time_ms,
     const std::optional<size_t> previous_count) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto work_unit = createProjectWorkUnit(project, {{}, SortAlgorithm::Default, 0, 0}, eo);
   CompilationOptions co_project = co;
   if (project->isSimple()) {
@@ -1753,7 +1753,7 @@ ExecutionResult RelAlgExecutor::executeTableFunction(const RelTableFunction* tab
                                                      const ExecutionOptions& eo,
                                                      const int64_t queue_time_ms) {
   INJECT_TIMER(executeTableFunction);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   auto co = co_in;
 
@@ -1825,7 +1825,7 @@ void RelAlgExecutor::computeWindow(const RelAlgExecutionUnit& ra_exe_unit,
                                    const ExecutionOptions& eo,
                                    ColumnCacheMap& column_cache_map,
                                    const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto query_infos = get_table_infos(ra_exe_unit.input_descs, executor_);
   CHECK_EQ(query_infos.size(), size_t(1));
   if (query_infos.front().info.fragments.size() != 1) {
@@ -1935,7 +1935,7 @@ ExecutionResult RelAlgExecutor::executeFilter(const RelFilter* filter,
                                               const ExecutionOptions& eo,
                                               RenderInfo* render_info,
                                               const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto work_unit =
       createFilterWorkUnit(filter, {{}, SortAlgorithm::Default, 0, 0}, eo.just_explain);
   return executeWorkUnit(
@@ -1965,7 +1965,7 @@ ExecutionResult RelAlgExecutor::executeUnion(const RelLogicalUnion* logical_unio
                                              const ExecutionOptions& eo,
                                              RenderInfo* render_info,
                                              const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (!logical_union->isAll()) {
     throw std::runtime_error("UNION without ALL is not supported yet.");
   }
@@ -1998,7 +1998,7 @@ ExecutionResult RelAlgExecutor::executeUnion(const RelLogicalUnion* logical_unio
 ExecutionResult RelAlgExecutor::executeLogicalValues(
     const RelLogicalValues* logical_values,
     const ExecutionOptions& eo) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (eo.just_explain) {
     throw std::runtime_error("EXPLAIN not supported for LogicalValues");
   }
@@ -2096,7 +2096,7 @@ int64_t insert_one_dict_str(T* col_data,
 
 ExecutionResult RelAlgExecutor::executeModify(const RelModify* modify,
                                               const ExecutionOptions& eo) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (eo.just_explain) {
     throw std::runtime_error("EXPLAIN not supported for ModifyTable");
   }
@@ -2445,7 +2445,7 @@ ExecutionResult RelAlgExecutor::executeSort(const RelSort* sort,
                                             const ExecutionOptions& eo,
                                             RenderInfo* render_info,
                                             const int64_t queue_time_ms) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   check_sort_node_source_constraint(sort);
   const auto source = sort->getInput(0);
   const bool is_aggregate = node_is_aggregate(source);
@@ -2634,7 +2634,7 @@ namespace {
  * is the reason this estimation isn't entirely reliable.
  */
 size_t groups_approx_upper_bound(const std::vector<InputTableInfo>& table_infos) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   CHECK(!table_infos.empty());
   const auto& first_table = table_infos.front();
@@ -2744,7 +2744,7 @@ RelAlgExecutionUnit decide_approx_count_distinct_implementation(
 void build_render_targets(RenderInfo& render_info,
                           const std::vector<Analyzer::Expr*>& work_unit_target_exprs,
                           const std::vector<TargetMetaInfo>& targets_meta) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_EQ(work_unit_target_exprs.size(), targets_meta.size());
   render_info.targets.clear();
   for (size_t i = 0; i < targets_meta.size(); ++i) {
@@ -2774,7 +2774,7 @@ ExecutionResult RelAlgExecutor::executeWorkUnit(
     const int64_t queue_time_ms,
     const std::optional<size_t> previous_count) {
   INJECT_TIMER(executeWorkUnit);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   auto co = co_in;
   ColumnCacheMap column_cache;
@@ -2939,7 +2939,7 @@ std::optional<size_t> RelAlgExecutor::getFilteredCountAll(const WorkUnit& work_u
                                                           const bool is_agg,
                                                           const CompilationOptions& co,
                                                           const ExecutionOptions& eo) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   const auto count =
       makeExpr<Analyzer::AggExpr>(SQLTypeInfo(g_bigint_count ? kBIGINT : kINT, false),

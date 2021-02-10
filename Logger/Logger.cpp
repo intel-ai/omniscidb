@@ -725,13 +725,26 @@ void logAndEraseDurationTree(std::string* json_str) {
   EraseDurationTrees erase_duration_trees;
   erase_duration_trees(itr);
 }
+#if ENABLE_ITT
+static __itt_string_handle* g_itt_task = __itt_string_handle_create("task");
+DebugTimer::DebugTimer(Severity severity, char const* file, int line, char const* name, __itt_domain* ittdomain)
+    : duration_(newDuration(severity, file, line, name)), ittdomain_(ittdomain){
+      __itt_task_begin(ittdomain, __itt_null, __itt_null, g_itt_task);
+}
 
+DebugTimer::~DebugTimer() {
+  __itt_task_end(ittdomain_);
+  stop();
+}
+#else
 DebugTimer::DebugTimer(Severity severity, char const* file, int line, char const* name)
     : duration_(newDuration(severity, file, line, name)) {}
 
 DebugTimer::~DebugTimer() {
   stop();
 }
+#endif
+
 
 void DebugTimer::stop() {
   if (duration_) {

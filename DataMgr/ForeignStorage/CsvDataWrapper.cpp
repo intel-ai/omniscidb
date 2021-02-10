@@ -216,7 +216,7 @@ void CsvDataWrapper::populateChunkMapForColumns(
 void CsvDataWrapper::populateChunkBuffers(
     std::map<ChunkKey, AbstractBuffer*>& required_buffers,
     std::map<ChunkKey, AbstractBuffer*>& optional_buffers) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto catalog = Catalog_Namespace::SysCatalog::instance().getCatalog(db_id_);
   CHECK(catalog);
   CHECK(!required_buffers.empty());
@@ -962,7 +962,7 @@ void add_placeholder_metadata(
  * @param chunk_metadata_vector - vector to be populated with chunk metadata
  */
 void CsvDataWrapper::populateChunkMetadata(ChunkMetadataVector& chunk_metadata_vector) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   const auto copy_params = validateAndGetCopyParams();
   const auto file_path = foreign_table_->getFullFilePath();

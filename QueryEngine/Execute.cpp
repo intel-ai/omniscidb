@@ -69,12 +69,11 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <set>
-#include <thread>
-#include <mutex>
 #include <sstream>
-#include <numeric>
+#include <thread>
 
 bool g_enable_watchdog{false};
 bool g_enable_dynamic_watchdog{false};
@@ -870,7 +869,7 @@ ResultSetPtr get_merged_result(
 
 ResultSetPtr Executor::resultsUnion(SharedKernelContext& shared_context,
                                     const RelAlgExecutionUnit& ra_exe_unit) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto& results_per_device = shared_context.getFragmentResults();
   if (results_per_device.empty()) {
     std::vector<TargetInfo> targets;
@@ -902,7 +901,7 @@ ResultSetPtr Executor::reduceMultiDeviceResults(
     std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   if (ra_exe_unit.estimator) {
     return reduce_estimator_results(ra_exe_unit, results_per_device);
   }
@@ -948,7 +947,7 @@ ResultSetPtr Executor::reduceMultiDeviceResultSets(
     std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::shared_ptr<ResultSet> reduced_results;
 
   const auto& first = results_per_device.front().first;
@@ -1227,7 +1226,7 @@ std::string sort_algorithm_to_string(const SortAlgorithm algorithm) {
 }  // namespace
 
 std::string ra_exec_unit_desc_for_caching(const RelAlgExecutionUnit& ra_exe_unit) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   // todo(yoonmin): replace a cache key as a DAG representation of a query plan
   // instead of ra_exec_unit description if possible
   std::ostringstream os;
@@ -1359,7 +1358,7 @@ ResultSetPtr Executor::executeWorkUnit(size_t& max_groups_buffer_entry_guess,
                                        const bool has_cardinality_estimation,
                                        ColumnCacheMap& column_cache) {
   VLOG(1) << "Executor " << executor_id_ << " is executing work unit:" << ra_exe_unit_in;
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   ScopeGuard cleanup_post_execution = [this] {
     // cleanup/unpin GPU buffer allocations
     // TODO: separate out this state into a single object
@@ -1429,7 +1428,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     const bool has_cardinality_estimation,
     ColumnCacheMap& column_cache) {
   INJECT_TIMER(Exec_executeWorkUnit);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto [ra_exe_unit, deleted_cols_map] = addDeletedColumn(ra_exe_unit_in, co);
   const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type);
   CHECK(!query_infos.empty());
@@ -1450,7 +1449,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
     if (eo.executor_type == ExecutorType::Native) {
       try {
         INJECT_TIMER(query_step_compilation);
-        auto compilation_timer = DEBUG_TIMER("compilation");
+        DEBUG_TIMER(compilation_timer, "compilation");
         auto clock_begin = timer_start();
         std::lock_guard<std::mutex> compilation_lock(compilation_mutex_);
         compilation_queue_time_ms_ += timer_stop(clock_begin);
@@ -1808,7 +1807,7 @@ ResultSetPtr Executor::collectAllDeviceResults(
     const QueryMemoryDescriptor& query_mem_desc,
     const ExecutorDeviceType device_type,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   auto& result_per_device = shared_context.getFragmentResults();
   if (result_per_device.empty() && query_mem_desc.getQueryDescriptionType() ==
                                        QueryDescriptionType::NonGroupedAggregate) {
@@ -2007,7 +2006,7 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
     RenderInfo* render_info,
     std::unordered_set<int>& available_gpus,
     int& available_cpus) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::vector<std::unique_ptr<ExecutionKernel>> execution_kernels;
 
   QueryFragmentDescriptor fragment_descriptor(
@@ -2131,25 +2130,23 @@ std::vector<std::unique_ptr<ExecutionKernel>> Executor::createKernels(
 template <typename THREAD_POOL>
 void Executor::launchKernels(SharedKernelContext& shared_context,
                              std::vector<std::unique_ptr<ExecutionKernel>>&& kernels) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   auto clock_begin = timer_start();
   std::lock_guard<std::mutex> kernel_lock(kernel_mutex_);
   kernel_queue_time_ms_ += timer_stop(clock_begin);
 
   THREAD_POOL thread_pool;
-  std::vector<long> kernel_times(kernels.size()); 
+  std::vector<long> kernel_times(kernels.size());
 
-  VLOG(1) << "Launching " << kernels.size() << " kernels for query.";
-  for(size_t i=0; i<kernels.size(); i++) {
-    auto &kernel = kernels[i];
+  LOG(INFO) << "Launching " << kernels.size() << " kernels for query.";
+  for (size_t i = 0; i < kernels.size(); i++) {
+    auto& kernel = kernels[i];
     thread_pool.spawn(
-        [this, i, &shared_context, &kernel_times](
-            ExecutionKernel* kernel) {
+        [this, i, &shared_context, &kernel_times](ExecutionKernel* kernel) {
           CHECK(kernel);
-          kernel_times[i] = measure<>::execution([&](){
-            kernel->run(this, shared_context);
-          });
+          kernel_times[i] =
+              measure<>::execution([&]() { kernel->run(this, shared_context); });
         },
         kernel.get());
   }
@@ -2159,9 +2156,13 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
 
   log << "Running kernels in " << kernels.size() << " tasks. ";
 
-  log << "[Max kernel time: " << *std::max_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
-  log << "[Min kernel time: " << *std::min_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
-  log << "[Mean kernel time: " << (std::accumulate(kernel_times.begin(), kernel_times.end(), 0) / kernels.size()) << "ms] ";
+  log << "[Max kernel time: "
+      << *std::max_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+  log << "[Min kernel time: "
+      << *std::min_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+  log << "[Mean kernel time: "
+      << (std::accumulate(kernel_times.begin(), kernel_times.end(), 0) / kernels.size())
+      << "ms] ";
 
   logger::addTreeLog(log.str());
 }
@@ -2383,7 +2384,7 @@ FetchResult Executor::fetchChunks(
     std::list<ChunkIter>& chunk_iterators,
     std::list<std::shared_ptr<Chunk_NS::Chunk>>& chunks,
     DeviceAllocator* device_allocator) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(fetchChunks);
   const auto& col_global_ids = ra_exe_unit.input_col_descs;
   std::vector<std::vector<size_t>> selected_fragments_crossjoin;
@@ -2482,7 +2483,7 @@ FetchResult Executor::fetchUnionChunks(
     std::list<ChunkIter>& chunk_iterators,
     std::list<std::shared_ptr<Chunk_NS::Chunk>>& chunks,
     DeviceAllocator* device_allocator) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(fetchUnionChunks);
 
   std::vector<std::vector<const int8_t*>> all_frag_col_buffers;
@@ -2736,7 +2737,7 @@ int32_t Executor::executePlanWithoutGroupBy(
     const uint32_t num_tables,
     RenderInfo* render_info) {
   INJECT_TIMER(executePlanWithoutGroupBy);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK(!results);
   if (col_buffers.empty()) {
     return 0;
@@ -2937,7 +2938,7 @@ int32_t Executor::executePlanWithGroupBy(
     const uint32_t start_rowid,
     const uint32_t num_tables,
     RenderInfo* render_info) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   INJECT_TIMER(executePlanWithGroupBy);
   CHECK(!results);
   if (col_buffers.empty()) {

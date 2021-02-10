@@ -71,14 +71,14 @@ struct InjectTimer {
       : description_(description), lineNum_(lineNum), func_(func) {
     if (g_enable_debug_timer) {
       start_ = timer_start();
-      LOG(INFO) << "Timer start " << std::setfill(' ') << std::setw(35) << description_
+      VLOG(1)   << "Timer start " << std::setfill(' ') << std::setw(35) << description_
                 << " " << std::setw(35) << func_ << ":" << std::setw(5) << lineNum_;
     }
   }
 
   ~InjectTimer() {
     if (g_enable_debug_timer) {
-      LOG(INFO) << "Timer end   " << std::setfill(' ') << std::setw(35) << description_
+      VLOG(1)   << "Timer end   " << std::setfill(' ') << std::setw(35) << description_
                 << " " << std::setw(35) << func_ << ":" << std::setw(5) << lineNum_
                 << " elapsed " << timer_stop(start_) << " ms";
     }

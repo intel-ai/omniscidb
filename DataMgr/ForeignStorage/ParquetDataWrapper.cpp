@@ -309,7 +309,7 @@ std::set<std::string> ParquetDataWrapper::getProcessedFilePaths() {
 }
 
 std::set<std::string> ParquetDataWrapper::getAllFilePaths() {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::set<std::string> file_paths;
   arrow::fs::FileSelector file_selector{};
   std::string base_path = foreign_table_->getFullFilePath();

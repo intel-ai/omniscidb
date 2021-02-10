@@ -52,6 +52,9 @@
 #include <array>
 #include <sstream>
 #include <thread>
+#if ENABLE_ITT
+#include <ittnotify.h>
+#endif
 
 extern bool g_enable_debug_timer;
 
@@ -296,7 +299,17 @@ class DebugTimer {
   Duration* duration_;
 
  public:
+#if ENABLE_ITT
+  __itt_domain* ittdomain_;
+  DebugTimer(Severity,
+             char const* file,
+             int line,
+             char const* name,
+             __itt_domain* ittdomain);
+#else
   DebugTimer(Severity, char const* file, int line, char const* name);
+#endif
+
   ~DebugTimer();
   void stop();
   // json is returned only when called on the root DurationTree.
@@ -311,14 +324,24 @@ ThreadId thread_id();
 
 void addTreeLog(const std::string& msg);
 
-// Typical usage: auto timer = DEBUG_TIMER(__func__);
-#define DEBUG_TIMER(name) logger::DebugTimer(logger::INFO, __FILE__, __LINE__, name)
+#if ENABLE_ITT
+#define DEBUG_TIMER(inst, name)                                                           \
+    static __itt_domain* ittdomain##inst = __itt_domain_create(name);                      \
+    auto inst = logger::DebugTimer(logger::INFO, __FILE__, __LINE__, name, ittdomain##inst)
+#define DEBUG_TIMER_THIS_FUNC() DEBUG_TIMER(timer, __func__)
+#define DEBUG_TIMER_NAME(name) DEBUG_TIMER(timer, name)
+#else
+// Typical usage: DEBUG_TIMER_THIS_FUNC(); or DEBUG_TIMER(timer, __func__)
+#define DEBUG_TIMER(inst, name) auto inst = logger::DebugTimer(logger::INFO, __FILE__, __LINE__, name)
+#define DEBUG_TIMER_THIS_FUNC() DEBUG_TIMER(timer, __func__)
+#define DEBUG_TIMER_NAME(name) DEBUG_TIMER(timer, name)
+#endif
 
 // This MUST NOT be called more than once per thread, otherwise a failed CHECK() occurs.
 // Best practice is to call it from the point where the new thread is spawned.
 // Beware of threads that are re-used.
-#define DEBUG_TIMER_NEW_THREAD(parent_thread_id)        \
-  do {                                                  \
+#define DEBUG_TIMER_NEW_THREAD(parent_thread_id) \
+  do {                                           \
   } while (false)
 }  // namespace logger
 

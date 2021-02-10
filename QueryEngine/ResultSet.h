@@ -638,7 +638,7 @@ class ResultSet {
       const std::list<Analyzer::OrderEntry>& order_entries,
       const bool use_heap,
       const Executor* executor) {
-    auto timer = DEBUG_TIMER(__func__);
+    DEBUG_TIMER_THIS_FUNC();
     if (query_mem_desc_.didOutputColumnar()) {
       column_wise_comparator_ =
           std::make_unique<ResultSetComparator<ColumnWiseTargetAccessor>>(

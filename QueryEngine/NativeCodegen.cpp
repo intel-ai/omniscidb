@@ -2457,7 +2457,7 @@ Executor::compileWorkUnit(const std::vector<InputTableInfo>& query_infos,
                           const bool has_cardinality_estimation,
                           ColumnCacheMap& column_cache,
                           RenderInfo* render_info) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   if (co.device_type == ExecutorDeviceType::GPU) {
     const auto cuda_mgr = catalog_->getDataMgr().getCudaMgr();

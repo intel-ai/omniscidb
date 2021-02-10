@@ -176,7 +176,7 @@ class PerfectJoinHashTableBuilder {
                                   const HashEntryInfo hash_entry_info,
                                   const int32_t hash_join_invalid_val,
                                   const Executor* executor) {
-    auto timer = DEBUG_TIMER(__func__);
+    DEBUG_TIMER_THIS_FUNC();
     const auto inner_col = cols.first;
     CHECK(inner_col);
     const auto& ti = inner_col->get_type_info();
@@ -275,7 +275,7 @@ class PerfectJoinHashTableBuilder {
       const HashEntryInfo hash_entry_info,
       const int32_t hash_join_invalid_val,
       const Executor* executor) {
-    auto timer = DEBUG_TIMER(__func__);
+    DEBUG_TIMER_THIS_FUNC();
     const auto inner_col = cols.first;
     CHECK(inner_col);
     const auto& ti = inner_col->get_type_info();

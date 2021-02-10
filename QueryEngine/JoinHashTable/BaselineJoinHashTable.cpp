@@ -208,7 +208,7 @@ std::set<DecodedJoinHashBufferEntry> BaselineJoinHashTable::toSet(
 }
 
 void BaselineJoinHashTable::reify(const HashType preferred_layout) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   CHECK_LT(0, device_count_);
   const auto composite_key_info =
       HashJoin::getCompositeKeyInfo(inner_outer_pairs_, executor_);
@@ -540,7 +540,7 @@ int BaselineJoinHashTable::initHashTableForDevice(
     const size_t entry_count,
     const size_t emitted_keys_count,
     const int device_id) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   const auto key_component_count = getKeyComponentCount();
   int err = 0;
 
@@ -860,7 +860,7 @@ int BaselineJoinHashTable::getInnerTableId(
 
 std::shared_ptr<HashTable> BaselineJoinHashTable::initHashTableOnCpuFromCache(
     const HashTableCacheKey& key) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   VLOG(1) << "Checking CPU hash table cache.";
   CHECK(hash_table_cache_);
   return hash_table_cache_->get(key);

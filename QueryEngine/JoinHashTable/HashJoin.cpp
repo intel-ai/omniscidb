@@ -224,7 +224,7 @@ std::shared_ptr<HashJoin> HashJoin::getInstance(
     ColumnCacheMap& column_cache,
     Executor* executor,
     const QueryHint& query_hint) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   std::shared_ptr<HashJoin> join_hash_table;
   CHECK_GT(device_count, 0);
   if (!g_enable_overlaps_hashjoin && qual_bin_oper->is_overlaps_oper()) {

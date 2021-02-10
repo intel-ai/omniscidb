@@ -1003,7 +1003,7 @@ void DBHandler::sql_execute(TQueryResult& _return,
   auto stdlog = STDLOG(session_ptr, query_state);
   stdlog.appendNameValuePairs("client", getConnectionInfo().toString());
   stdlog.appendNameValuePairs("nonce", nonce);
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
 
   try {
     ScopeGuard reset_was_geo_copy_from = [this, &session_ptr] {

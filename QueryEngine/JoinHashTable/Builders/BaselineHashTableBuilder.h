@@ -228,7 +228,7 @@ class BaselineJoinHashTableBuilder {
                          const HashType layout,
                          const size_t key_component_width,
                          const size_t key_component_count) {
-    auto timer = DEBUG_TIMER(__func__);
+    DEBUG_TIMER_THIS_FUNC();
     const auto entry_size =
         (key_component_count + (layout == HashType::OneToOne ? 1 : 0)) *
         key_component_width;
@@ -440,7 +440,7 @@ class BaselineJoinHashTableBuilder {
                          const size_t keyspace_entry_count,
                          const size_t emitted_keys_count,
                          const int device_id) {
-    auto timer = DEBUG_TIMER(__func__);
+    DEBUG_TIMER_THIS_FUNC();
     int err = 0;
 #ifdef HAVE_CUDA
     allocateDeviceMemory(layout,

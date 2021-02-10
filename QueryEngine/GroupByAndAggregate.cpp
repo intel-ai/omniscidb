@@ -579,7 +579,7 @@ void GroupByAndAggregate::addTransientStringLiterals(
     const RelAlgExecutionUnit& ra_exe_unit,
     Executor* executor,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner) {
-  auto timer = DEBUG_TIMER(__func__);
+  DEBUG_TIMER_THIS_FUNC();
   for (const auto& group_expr : ra_exe_unit.groupby_exprs) {
     add_transient_string_literals_for_expression(
         group_expr.get(), executor, row_set_mem_owner);
