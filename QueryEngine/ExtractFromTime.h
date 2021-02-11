@@ -87,7 +87,15 @@ enum ExtractField {
   kEPOCH,
   kQUARTERDAY,
   kWEEK,
-  kDATEEPOCH
+  kDATEEPOCH,
+  kLDOM,
+  kISLEAP,
+  kISEOM,
+  kISSOM,
+  kISEOQ,
+  kISSOQ,
+  kISEOY,
+  kISSOY
 };
 
 DEVICE int64_t ExtractFromTime(ExtractField field, const int64_t timeval);
