@@ -261,8 +261,20 @@ void ExecutionKernel::runImpl(Executor* executor, SharedKernelContext& shared_co
     }
   }
 
+  uint32_t start_rowid{0};
+  if (rowid_lookup_key >= 0) {
+    if (!frag_list.empty()) {
+      const auto& all_frag_row_offsets = shared_context.getFragOffsets();
+      start_rowid = rowid_lookup_key -
+                    all_frag_row_offsets[frag_list.begin()->fragment_ids.front()];
+    }
+  }
+
 #ifdef HAVE_TBB
   bool can_run_subkernels = shared_context.thread_pool != nullptr;
+
+  // Subfragments are supported for groupby queries only for now.
+  can_run_subkernels = can_run_subkernels && !ra_exe_unit_.groupby_exprs.empty();
 
   // In case some column is lazily fetched, we cannot mix different
   // fragments in a single ResultSet.
@@ -293,15 +305,6 @@ void ExecutionKernel::runImpl(Executor* executor, SharedKernelContext& shared_co
   // TODO: check for literals. We serialize literals before execution
   // and hold them in result sets. Can we simply do it once and hold
   // in an outer structure?
-
-  uint32_t start_rowid{0};
-  if (rowid_lookup_key >= 0) {
-    if (!frag_list.empty()) {
-      const auto& all_frag_row_offsets = shared_context.getFragOffsets();
-      start_rowid = rowid_lookup_key -
-                    all_frag_row_offsets[frag_list.begin()->fragment_ids.front()];
-    }
-  }
 
   if (can_run_subkernels) {
     size_t total_rows = fetch_result->num_rows[0][0];
