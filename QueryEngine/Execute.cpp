@@ -2152,17 +2152,18 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
 
   std::stringstream log;
 
-  log << "Running kernels in " << kernels.size() << " tasks. ";
+  if (kernels.size() > 0) {
+    log << "Running kernels in " << kernels.size() << " tasks. ";
 
-  log << "[Max kernel time: "
-      << *std::max_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
-  log << "[Min kernel time: "
-      << *std::min_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
-  log << "[Mean kernel time: "
-      << (std::accumulate(kernel_times.begin(), kernel_times.end(), 0) / kernels.size())
-      << "ms] ";
-
-  logger::addTreeLog(log.str());
+    log << "[Max kernel time: "
+        << *std::max_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+    log << "[Min kernel time: "
+        << *std::min_element(kernel_times.begin(), kernel_times.end()) << "ms] ";
+    log << "[Mean kernel time: "
+        << (std::accumulate(kernel_times.begin(), kernel_times.end(), 0) / kernels.size())
+        << "ms] ";
+    logger::addTreeLog(log.str());
+  }
 }
 
 std::vector<size_t> Executor::getTableFragmentIndices(
