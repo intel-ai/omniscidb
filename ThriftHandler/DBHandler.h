@@ -837,9 +837,9 @@ class DBHandler : public OmniSciIf {
   mutable std::mutex handle_to_dev_ptr_mutex_;
   mutable std::unordered_map<std::string, std::string> ipc_handle_to_dev_ptr_;
 
-  friend void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
-                                 std::string base_path,
-                                 std::string query_file_path);
+  friend int run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
+                                std::string base_path,
+                                std::string query_file_path);
 
   friend class RenderHandler::Impl;
   friend class MapDAggHandler;

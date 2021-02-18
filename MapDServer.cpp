@@ -90,8 +90,7 @@ std::once_flag g_shutdown_once_flag;
 
 #ifdef HAVE_TBB
 std::unique_ptr<tbb::global_control> threadpool::TbbThreadPoolBase::g_ctl_ptr;
-#endif // HAVE_TBB
-
+#endif  // HAVE_TBB
 
 void shutdown_handler() {
   if (g_mapd_handler) {
@@ -190,14 +189,15 @@ void releaseWarmupSession(TSessionId& sessionId, std::ifstream& query_file) {
 #if ENABLE_ITT
 __itt_domain* ittquery = __itt_domain_create("Query");
 #endif
-void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
-                        std::string base_path,
-                        std::string query_file_path) {
+int run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
+                       std::string base_path,
+                       std::string query_file_path) {
   // run warmup queries to load cache if requested
   if (query_file_path.empty()) {
-    return;
+    return 0;
   }
   LOG(INFO) << "Running DB warmup with queries from " << query_file_path;
+  int retcode = 0;
   try {
     g_warmup_handler = handler;
     std::string db_info;
@@ -209,8 +209,7 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
 
     ScopeGuard session_guard = [&] { releaseWarmupSession(sessionId, query_file); };
     query_file.open(query_file_path);
-    bool stop = false;
-    while (!stop && std::getline(query_file, db_info)) {
+    while (!retcode && std::getline(query_file, db_info)) {
       if (db_info.length() == 0) {
         continue;
       }
@@ -259,11 +258,11 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
           } catch (std::exception& e) {
             LOG(WARNING) << "Exception " << e.what() << " while executing '"
                          << single_query;
-            stop = true;
+            retcode = 1;
             break;
           } catch (...) {
             LOG(WARNING) << "Exception while executing '" << single_query << "'";
-            stop = true;
+            retcode = 2;
             break;
           }
           single_query.clear();
@@ -278,6 +277,7 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
         LOG(WARNING) << "\nSyntax error in the file: " << query_file_path.c_str()
                      << " Missing expected keyword USER. Following line will be ignored: "
                      << db_info.c_str() << std::endl;
+        retcode = 3;
       }
       db_info.clear();
     }
@@ -285,7 +285,10 @@ void run_warmup_queries(mapd::shared_ptr<DBHandler> handler,
     LOG(WARNING) << "Exception while executing warmup queries. "
                  << "Warmup may not be fully completed. Will proceed nevertheless."
                  << std::endl;
+    retcode = 4;
   }
+
+  return retcode;
 }
 
 void heartbeat() {
@@ -478,10 +481,14 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
     // TEMPORARY
     auto warmup_queries = [&prog_config_opts]() {
       // run warm up queries if any exists
-      run_warmup_queries(
+      auto ret = run_warmup_queries(
           g_mapd_handler, prog_config_opts.base_path, prog_config_opts.db_query_file);
       if (prog_config_opts.exit_after_warmup) {
-        g_running = false;
+        if (ret) {
+          exit(ret);
+        } else {
+          g_running = false;
+        }
       }
     };
 
