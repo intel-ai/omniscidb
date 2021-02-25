@@ -2171,8 +2171,10 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
   for (size_t i = 0; i < kernels.size(); i++) {
     auto& kernel = kernels[i];
     thread_pool.spawn(
-        [this, i, &shared_context, &kernel_times](ExecutionKernel* kernel) {
+        [this, i, &shared_context, &kernel_times, parent_thread_id = logger::thread_id()](
+            ExecutionKernel* kernel) {
           CHECK(kernel);
+          DEBUG_TIMER_NEW_THREAD(parent_thread_id);
           kernel_times[i] =
               measure<>::execution([&]() { kernel->run(this, shared_context); });
         },
