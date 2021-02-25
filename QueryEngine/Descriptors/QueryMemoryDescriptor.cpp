@@ -27,7 +27,6 @@
 
 bool g_enable_smem_group_by{true};
 extern bool g_enable_columnar_output;
-extern bool g_optimize_row_initialization;
 
 namespace {
 
