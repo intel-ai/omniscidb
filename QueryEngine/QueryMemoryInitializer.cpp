@@ -423,31 +423,36 @@ void QueryMemoryInitializer::initRowGroups(const QueryMemoryDescriptor& query_me
   if (!std::accumulate(agg_bitmap_size.begin(), agg_bitmap_size.end(), 0) &&
       !std::accumulate(tdigest_deferred.begin(), tdigest_deferred.end(), 0) &&
       g_optimize_row_initialization) {
-    std::vector<int8_t> sample_row(row_size - col_base_off);
+    size_t patterns_count = (512 / row_size);
+    std::vector<int8_t> patterns(patterns_count * row_size);
 
-    initColumnsPerRow(query_mem_desc_fixedup,
-                      sample_row.data(),
-                      init_vals,
-                      agg_bitmap_size,
-                      tdigest_deferred);
-
+    for (int i = 0; i < patterns_count; i++) {
+      initColumnsPerRow(query_mem_desc_fixedup,
+                        patterns.data() + row_size * i + col_base_off,
+                        init_vals,
+                        agg_bitmap_size,
+                        tdigest_deferred);
+    }
+    size_t rows_count = 0;
     if (query_mem_desc.hasKeylessHash()) {
       CHECK(warp_size >= 1);
       CHECK(key_count == 1 || warp_size == 1);
-      for (size_t warp_idx = 0; warp_idx < warp_size; ++warp_idx) {
-        for (size_t bin = 0; bin < static_cast<size_t>(groups_buffer_entry_count);
-             ++bin, buffer_ptr += row_size) {
-          memcpy(buffer_ptr + col_base_off, sample_row.data(), sample_row.size());
-        }
+      rows_count = warp_size * groups_buffer_entry_count;
+    } else {
+      rows_count = groups_buffer_entry_count;
+      for (int i = 0; i < patterns_count; i++) {
+        result_set::fill_empty_key(patterns.data() + row_size * i,
+                                   key_count,
+                                   query_mem_desc.getEffectiveKeyWidth());
       }
-      return;
     }
-
-    for (size_t bin = 0; bin < static_cast<size_t>(groups_buffer_entry_count);
-         ++bin, buffer_ptr += row_size) {
-      memcpy(buffer_ptr + col_base_off, sample_row.data(), sample_row.size());
-      result_set::fill_empty_key(
-          buffer_ptr, key_count, query_mem_desc.getEffectiveKeyWidth());
+    size_t bin = 0;
+    for (; bin + patterns_count < rows_count;
+         bin += patterns_count, buffer_ptr += row_size * patterns_count) {
+      memcpy(buffer_ptr, patterns.data(), row_size * patterns_count);
+    }
+    for (; bin < rows_count; ++bin, buffer_ptr += row_size) {
+      memcpy(buffer_ptr, patterns.data(), row_size);
     }
   } else {
     if (query_mem_desc.hasKeylessHash()) {
