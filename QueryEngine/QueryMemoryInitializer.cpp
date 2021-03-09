@@ -423,7 +423,11 @@ void QueryMemoryInitializer::initRowGroups(const QueryMemoryDescriptor& query_me
   if (!std::accumulate(agg_bitmap_size.begin(), agg_bitmap_size.end(), 0) &&
       !std::accumulate(tdigest_deferred.begin(), tdigest_deferred.end(), 0) &&
       g_optimize_row_initialization) {
-    size_t patterns_count = (512 / row_size);
+    size_t patterns_count = 1;
+    if (row_size < 512) {
+      patterns_count = (512 / row_size);
+    }
+
     std::vector<int8_t> patterns(patterns_count * row_size);
 
     for (int i = 0; i < patterns_count; i++) {
@@ -447,7 +451,7 @@ void QueryMemoryInitializer::initRowGroups(const QueryMemoryDescriptor& query_me
       }
     }
     size_t bin = 0;
-    for (; bin + patterns_count < rows_count;
+    for (; bin + patterns_count <= rows_count;
          bin += patterns_count, buffer_ptr += row_size * patterns_count) {
       memcpy(buffer_ptr, patterns.data(), row_size * patterns_count);
     }
