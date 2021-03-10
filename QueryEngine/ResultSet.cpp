@@ -37,6 +37,10 @@
 #include "Shared/thread_count.h"
 #include "Shared/threadpool.h"
 
+#ifdef HAVE_TBB
+#include "tbb/parallel_sort.h"
+#endif
+
 #include <algorithm>
 #include <bitset>
 #include <future>
@@ -238,7 +242,7 @@ void ResultSet::append(ResultSet& that) {
   if (!that.storage_) {
     return;
   }
-  
+
   DEBUG_TIMER_THIS_FUNC();
 
   appended_storage_.push_back(std::move(that.storage_));
@@ -946,7 +950,11 @@ void ResultSet::topPermutation(
 void ResultSet::sortPermutation(
     const std::function<bool(const uint32_t, const uint32_t)> compare) {
   DEBUG_TIMER_THIS_FUNC();
+#ifdef HAVE_TBB
+  tbb::parallel_sort(permutation_.begin(), permutation_.end(), compare);
+#else
   std::sort(permutation_.begin(), permutation_.end(), compare);
+#endif
 }
 
 void ResultSet::radixSortOnGpu(
