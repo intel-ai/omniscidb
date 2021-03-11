@@ -32,6 +32,7 @@ requirements:
     - numpy
     - cython
     - arrow-cpp =2.0
+    - libthrift<0.14.1  # ref: modin gh-2840
     - bisonpp
     - blosc
     - boost-cpp {{ boost_cpp }}
