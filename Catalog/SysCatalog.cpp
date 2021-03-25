@@ -165,7 +165,6 @@ void SysCatalog::init(const std::string& basePath,
   {
     sys_write_lock write_lock(this);
     sys_sqlite_lock sqlite_lock(this);
-
     basePath_ = copy_catalog_if_read_only(basePath).string();
     dataMgr_ = dataMgr;
     authMetadata_ = &authMetadata;

@@ -181,6 +181,7 @@ class DBEngineImpl : public DBEngine {
                                        is_new_db);
     } catch (const std::exception& e) {
       LOG(FATAL) << "Failed to initialize database handler: " << e.what();
+      throw;
     }
     db_handler_->connect(
         session_id_, OMNISCI_ROOT_USER, OMNISCI_ROOT_PASSWD_DEFAULT, OMNISCI_DEFAULT_DB);
@@ -210,6 +211,10 @@ class DBEngineImpl : public DBEngine {
       col_names.push_back(target.get_resname());
     }
     return std::make_shared<CursorImpl>(result.getRows(), col_names);
+  }
+
+  void executeDDL(const std::string& query) {
+    auto res = sql_execute_dbe(session_id_, query, false, -1, -1);
   }
 
   void importArrowTable(const std::string& name,
@@ -418,6 +423,7 @@ class DBEngineImpl : public DBEngine {
     }
     return root_dir;
   }
+
  private:
   std::string base_path_;
   std::string session_id_;
@@ -474,7 +480,7 @@ void DBEngine::importArrowTable(const std::string& name,
                                 std::shared_ptr<arrow::Table>& table,
                                 uint64_t fragment_size) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->importArrowTable(name, table, fragment_size);
+  engine->importArrowTable(name, table, fragment_size);
 }
 
 std::vector<std::string> DBEngine::getTables() {
