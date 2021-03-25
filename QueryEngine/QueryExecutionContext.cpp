@@ -604,8 +604,12 @@ std::vector<int64_t*> QueryExecutionContext::launchCpuCode(
   const bool is_group_by{query_mem_desc_.isGroupBy()};
   std::vector<int64_t*> out_vec;
   if (ra_exe_unit.estimator) {
-    estimator_result_set_.reset(
-        new ResultSet(ra_exe_unit.estimator, ExecutorDeviceType::CPU, 0, nullptr));
+    // Subfragments collect the result from multiple runs in a single
+    // result set.
+    if (!estimator_result_set_) {
+      estimator_result_set_.reset(
+          new ResultSet(ra_exe_unit.estimator, ExecutorDeviceType::CPU, 0, nullptr));
+    }
     out_vec.push_back(
         reinterpret_cast<int64_t*>(estimator_result_set_->getHostEstimatorBuffer()));
   } else {

@@ -273,8 +273,9 @@ void ExecutionKernel::runImpl(Executor* executor, SharedKernelContext& shared_co
 #ifdef HAVE_TBB
   bool can_run_subkernels = shared_context.thread_pool != nullptr;
 
-  // Subfragments are supported for groupby queries only for now.
-  can_run_subkernels = can_run_subkernels && !ra_exe_unit_.groupby_exprs.empty();
+  // Subfragments are supported for groupby queries and estimators only for now.
+  can_run_subkernels = can_run_subkernels &&
+                       (!ra_exe_unit_.groupby_exprs.empty() || ra_exe_unit_.estimator);
 
   // In case some column is lazily fetched, we cannot mix different
   // fragments in a single ResultSet.

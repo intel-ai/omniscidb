@@ -2205,7 +2205,12 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
     // TODO: add QueryExecutionContext::getRowSet() interface
     // for our case.
     if (exec_ctx) {
-      auto results = exec_ctx->getRowSet(*ra_exe_unit, exec_ctx->query_mem_desc_);
+      ResultSetPtr results;
+      if (ra_exe_unit->estimator) {
+        results = std::shared_ptr<ResultSet>(exec_ctx->estimator_result_set_.release());
+      } else {
+        results = exec_ctx->getRowSet(*ra_exe_unit, exec_ctx->query_mem_desc_);
+      }
 #ifdef DBG_PRINT
       std::cout << "Got results from TLS with " << results->rowCount() << " row(s)"
                 << std::endl;
@@ -2787,7 +2792,7 @@ int32_t Executor::executePlanWithoutGroupBy(
     const int64_t rows_to_process) {
   INJECT_TIMER(executePlanWithoutGroupBy);
   DEBUG_TIMER_THIS_FUNC();
-  CHECK(results && !(*results));
+  CHECK(!results || !(*results));
   if (col_buffers.empty()) {
     return 0;
   }
@@ -2869,10 +2874,14 @@ int32_t Executor::executePlanWithoutGroupBy(
   }
   if (ra_exe_unit.estimator) {
     CHECK(!error_code);
-    *results =
-        std::shared_ptr<ResultSet>(query_exe_context->estimator_result_set_.release());
+    if (results) {
+      *results =
+          std::shared_ptr<ResultSet>(query_exe_context->estimator_result_set_.release());
+    }
     return 0;
   }
+  // Expect delayed results extraction (used for sub-fragments) for estimator only;
+  CHECK(results);
   std::vector<int64_t> reduced_outs;
   const auto num_frags = col_buffers.size();
   const size_t entry_count =
