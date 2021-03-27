@@ -87,10 +87,7 @@ mapd::shared_ptr<DBHandler> g_warmup_handler =
 // between "DBHandler" & function "run_warmup_queries"
 mapd::shared_ptr<DBHandler> g_mapd_handler = 0;
 std::once_flag g_shutdown_once_flag;
-
-#ifdef HAVE_TBB
 std::unique_ptr<tbb::global_control> threadpool::TbbThreadPoolBase::g_ctl_ptr;
-#endif  // HAVE_TBB
 
 void shutdown_handler() {
   if (g_mapd_handler) {
@@ -416,11 +413,9 @@ int startMapdServer(CommandLineOptions& prog_config_opts, bool start_http_server
   if (g_enable_fsi) {
     foreign_storage::ForeignTableRefreshScheduler::start(g_running);
   }
-#ifdef HAVE_TBB
   if (g_cpu_threads_override > 0) {
     threadpool::TbbThreadPoolBase::init(g_cpu_threads_override);
   }
-#endif
 
   mapd::shared_ptr<TServerSocket> serverSocket;
   mapd::shared_ptr<TServerSocket> httpServerSocket;

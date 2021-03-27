@@ -16,15 +16,17 @@
 
 #pragma once
 
-#ifdef HAVE_TBB
-#include "tbb/task_group.h"
 #include "tbb/global_control.h"
-#endif
+#include "tbb/concurrent_vector.h"
+#include "tbb/task_arena.h"
+#include "tbb/task_group.h"
 
 #include <future>
 #include <iostream>
 #include <type_traits>
 #include <memory>
+
+#include "Utils/Threading.h"
 
 namespace threadpool {
 
@@ -33,11 +35,12 @@ class FuturesThreadPoolBase {
  public:
   template <class Function, class... Args>
   void spawn(Function&& f, Args&&... args) {
-    threads_.push_back(std::async(std::launch::async, f, args...));
+    threads_.push_back(
+        utils::async(std::forward<Function>(f), std::forward<Args>(args)...));
   }
 
  protected:
-  std::vector<std::future<T>> threads_;
+  std::vector<utils::future<T>> threads_;
 };
 
 template <typename T, typename ENABLE = void>
@@ -48,9 +51,6 @@ class FuturesThreadPool : public FuturesThreadPoolBase<T> {
   void join() {
     for (auto& child : this->threads_) {
       child.wait();
-    }
-    for (auto& child : this->threads_) {
-      child.get();
     }
   }
 };
@@ -74,8 +74,6 @@ class FuturesThreadPool<T, std::enable_if_t<std::is_object<T>::value>>
   }
 };
 
-#ifdef HAVE_TBB
-
 class TbbThreadPoolBase {
   static std::unique_ptr<tbb::global_control> g_ctl_ptr;
  public:
@@ -84,7 +82,7 @@ class TbbThreadPoolBase {
   }
 
  protected:
-  tbb::task_group tasks_;
+  tbb::isolated_task_group tasks_;
 };
 
 template <typename T, typename ENABLE = void>
@@ -94,14 +92,17 @@ class TbbThreadPool : public TbbThreadPoolBase {
 
   template <class Function, class... Args>
   void spawn(Function&& f, Args&&... args) {
-    tasks_.run([f{std::move(f)}, args...] { f(args...); });
+    utils::g_tbb_arena.execute([&, this] { tasks_.run([f{std::move(f)}, args...] { f(args...); }); });
   }
+  //TODO: append?
 
-  void join() { tasks_.wait(); }
-
+  void join() {
+    utils::g_tbb_arena.execute([&, this] { tasks_.wait(); });
+  }
+  
   template <class Function, class... Args>
   void addSubtask(Function&& f, Args&&... args) {
-    tasks_.run([f, args...]{ f(std::forward(args...)); });
+    utils::g_tbb_arena.execute([&, this] { tasks_.run([f{std::move(f)}, args...] { f(args...); }); });
   }
 };
 
@@ -114,12 +115,15 @@ class TbbThreadPool<T, std::enable_if_t<std::is_object<T>::value>>
   template <class Function, class... Args>
   void spawn(Function&& f, Args&&... args) {
     const size_t result_idx = results_.size();
-    results_.emplace_back(T{});
-    tasks_.run([this, result_idx, f{std::move(f)}, args...] { results_[result_idx] = f(args...); });
+    results_.emplace_back(
+        T{});  // TODO: there is a race between accessing the vector and resizing
+    utils::g_tbb_arena.execute([&, this] {
+      tasks_.run([this, result_idx, f{std::move(f)}, args...] { results_[result_idx] = f(args...); });
+    });
   }
 
   auto join() {
-    tasks_.wait();
+    utils::g_tbb_arena.execute([&, this] { tasks_.wait(); });
     return results_;
   }
 
@@ -127,9 +131,7 @@ class TbbThreadPool<T, std::enable_if_t<std::is_object<T>::value>>
   std::vector<T> results_;
 };
 
-#endif
-
-#ifdef HAVE_TBB
+#ifdef ENABLE_TBB
 template <typename T>
 using ThreadPool = TbbThreadPool<T>;
 #else

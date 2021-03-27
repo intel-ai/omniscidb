@@ -18,6 +18,7 @@
 #include "TestHelpers.h"
 #include "Utils/Regexp.h"
 #include "Utils/StringLike.h"
+#include "Utils/Threading.h"
 
 #include <gtest/gtest.h>
 
@@ -35,15 +36,14 @@ TEST(Shared, Intervals) {
   std::array<std::atomic<int>, M> array;
   for (int n_workers = 1; n_workers <= 2 * M; ++n_workers) {
     std::for_each(array.begin(), array.end(), [](auto& v) { v = 0; });
-    std::vector<std::future<void>> threads;
+    std::vector<utils::future<void>> threads;
     int max_interval_size = std::numeric_limits<int>::min();
     int min_interval_size = std::numeric_limits<int>::max();
     for (auto const interval : makeIntervals(0, M, n_workers)) {
       EXPECT_LT(interval.begin, interval.end);
       max_interval_size = std::max(max_interval_size, interval.end - interval.begin);
       min_interval_size = std::min(min_interval_size, interval.end - interval.begin);
-      threads.push_back(std::async(
-          std::launch::async,
+      threads.push_back(utils::async(
           [&array](Interval<int> interval) {
             for (int i = interval.begin; i < interval.end; ++i) {
               ++array.at(i);
@@ -75,7 +75,7 @@ TEST(Shared, IntervalsBounds) {
   // Test with 0-value, and values that go outside the range of Integer.
   for (unsigned n_workers = 0; n_workers <= 260; ++n_workers) {
     std::for_each(array.begin(), array.end(), [](auto& v) { v = 0; });
-    std::vector<std::future<void>> threads;
+    std::vector<utils::future<void>> threads;
     Integer const begin = std::numeric_limits<Integer>::min();
     Integer const end = std::numeric_limits<Integer>::max();
     int const offset = -static_cast<int>(begin);
@@ -87,8 +87,7 @@ TEST(Shared, IntervalsBounds) {
                                    static_cast<Unsigned>(interval.end - interval.begin));
       min_interval_size = std::min(min_interval_size,
                                    static_cast<Unsigned>(interval.end - interval.begin));
-      threads.push_back(std::async(
-          std::launch::async,
+      threads.push_back(utils::async(
           [&array](Interval<Integer> interval) {
             for (Integer i = interval.begin; i < interval.end; ++i) {
               ++array.at(offset + i);

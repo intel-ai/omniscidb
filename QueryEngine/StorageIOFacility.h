@@ -28,6 +28,7 @@
 #include "Shared/UpdelRoll.h"
 #include "Shared/likely.h"
 #include "Shared/thread_count.h"
+#include "Utils/Threading.h"
 
 class StorageIOFacility {
  public:

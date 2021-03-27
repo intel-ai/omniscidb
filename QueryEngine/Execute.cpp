@@ -1530,7 +1530,7 @@ ResultSetPtr Executor::executeWorkUnitImpl(
                                      available_gpus,
                                      available_cpus);
         if (g_use_tbb_pool) {
-#ifdef HAVE_TBB
+#ifdef ENABLE_TBB
           VLOG(1) << "Using TBB thread pool for kernel dispatch.";
           launchKernels<threadpool::TbbThreadPool<void>>(shared_context,
                                                          std::move(kernels));
@@ -2156,7 +2156,6 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
   const RelAlgExecutionUnit* ra_exe_unit =
       kernels.empty() ? nullptr : &kernels[0]->ra_exe_unit_;
 
-#ifdef HAVE_TBB
   if constexpr (std::is_same<decltype(&thread_pool),
                              decltype(shared_context.thread_pool)>::value) {
     if (g_use_tbb_pool && g_enable_subfragments) {
@@ -2166,7 +2165,6 @@ void Executor::launchKernels(SharedKernelContext& shared_context,
       shared_context.thread_pool = &thread_pool;
     }
   }
-#endif  // HAVE_TBB
 
   std::vector<long> kernel_times(kernels.size());
 

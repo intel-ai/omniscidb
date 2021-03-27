@@ -24,6 +24,7 @@
 #include "QueryEngine/JoinHashTable/PerfectJoinHashTable.h"
 #include "QueryEngine/JoinHashTable/Runtime/HashJoinKeyHandlers.h"
 #include "QueryEngine/JoinHashTable/Runtime/JoinHashTableGpuUtils.h"
+#include "Utils/Threading.h"
 
 std::unique_ptr<OverlapsHashTableCache<OverlapsHashTableCacheKey,
                                        OverlapsJoinHashTable::HashTableCacheValue>>
@@ -644,10 +645,9 @@ std::pair<size_t, size_t> OverlapsJoinHashTable::approximateTupleCount(
     host_hll_buffer.resize(count_distinct_desc.bitmapPaddedSizeBytes());
   }
   std::vector<size_t> emitted_keys_count_device_threads(device_count_, 0);
-  std::vector<std::future<void>> approximate_distinct_device_threads;
+  std::vector<utils::future<void>> approximate_distinct_device_threads;
   for (int device_id = 0; device_id < device_count_; ++device_id) {
-    approximate_distinct_device_threads.emplace_back(std::async(
-        std::launch::async,
+    approximate_distinct_device_threads.emplace_back(utils::async(
         [device_id,
          &columns_per_device,
          &count_distinct_desc,

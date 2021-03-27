@@ -21,18 +21,13 @@
 #include "QueryEngine/Descriptors/QueryCompilationDescriptor.h"
 
 #include "Shared/threadpool.h"
-
-#ifdef HAVE_TBB
 #include "tbb/enumerable_thread_specific.h"
-#endif
 
 class SharedKernelContext {
  public:
   SharedKernelContext(const std::vector<InputTableInfo>& query_infos)
       : query_infos_(query_infos)
-#ifdef HAVE_TBB
       , thread_pool(nullptr)
-#endif
   {
   }
 
@@ -47,11 +42,11 @@ class SharedKernelContext {
 
   std::atomic_flag dynamic_watchdog_set = ATOMIC_FLAG_INIT;
 
-#ifdef HAVE_TBB
+#ifdef ENABLE_TBB
   threadpool::ThreadPool<void>* thread_pool;
   tbb::enumerable_thread_specific<std::unique_ptr<QueryExecutionContext>>
       tls_execution_context;
-#endif  // HAVE_TBB
+#endif  // ENABLE_TBB
 
  private:
   std::mutex reduce_mutex_;
@@ -111,7 +106,6 @@ class ExecutionKernel {
   friend class KernelSubtask;
 };
 
-#ifdef HAVE_TBB
 class KernelSubtask {
  public:
   KernelSubtask(ExecutionKernel& k,
@@ -137,4 +131,3 @@ class KernelSubtask {
   size_t start_rowid_;
   size_t num_rows_;
 };
-#endif  // HAVE_TBB
