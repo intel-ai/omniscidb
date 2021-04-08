@@ -28,6 +28,12 @@
 #include "ThriftHandler/CommandLineOptions.h"
 #include "ThriftHandler/DBHandler.h"
 
+#include "gen-cpp/OmniSci.h"
+#include "QueryEngine/ErrorHandling.h"
+#include "QueryEngine/Execute.h"
+#include "Shared/checked_alloc.h"
+
+
 extern bool g_enable_union;
 extern bool g_serialize_temp_tables;
 
@@ -436,15 +442,38 @@ class DBEngineImpl : public DBEngine {
                                               "mapd_export"};
 };
 
+
+
 namespace {
 std::mutex engine_create_mutex;
+
+void exception_handler()
+{
+  try {
+    throw;
+  } catch (const TOmniSciException& ex) {
+    throw std::runtime_error(ex.error_msg);
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
+  } catch (const QueryExecutionError& ex) {
+    throw std::runtime_error(ex.what());
+  } catch (const std::exception& ex) {
+    throw;
+  } catch (...) {
+    throw std::runtime_error("Unknown exception");
+  }
+}
 }
 
 std::shared_ptr<DBEngine> DBEngine::create(const std::string& cmd_line) {
   const std::lock_guard<std::mutex> lock(engine_create_mutex);
   auto engine = std::make_shared<DBEngineImpl>();
-  if (!engine->init(cmd_line)) {
-    throw std::runtime_error("DBE initialization failed");
+  try {
+    if (!engine->init(cmd_line)) {
+      throw std::runtime_error("DBE initialization failed");
+    }
+  } catch(...) {
+    exception_handler();
   }
   return engine;
 }
@@ -463,46 +492,78 @@ inline const DBEngineImpl* getImpl(const DBEngine* ptr) {
 
 void DBEngine::executeDDL(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  engine->executeDDL(query);
+  try {
+    engine->executeDDL(query);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 std::shared_ptr<Cursor> DBEngine::executeDML(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->executeDML(query);
+  try {
+    return engine->executeDML(query);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 std::shared_ptr<Cursor> DBEngine::executeRA(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->executeRA(query);
+  try {
+    return engine->executeRA(query);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 void DBEngine::importArrowTable(const std::string& name,
                                 std::shared_ptr<arrow::Table>& table,
                                 uint64_t fragment_size) {
   DBEngineImpl* engine = getImpl(this);
-  engine->importArrowTable(name, table, fragment_size);
+  try {
+    engine->importArrowTable(name, table, fragment_size);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 std::vector<std::string> DBEngine::getTables() {
   DBEngineImpl* engine = getImpl(this);
-  return engine->getTables();
+  try {
+    return engine->getTables();
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 std::vector<ColumnDetails> DBEngine::getTableDetails(const std::string& table_name) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->getTableDetails(table_name);
+  try {
+    return engine->getTableDetails(table_name);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 bool DBEngine::setDatabase(std::string& db_name) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->setDatabase(db_name);
+  try {
+    return engine->setDatabase(db_name);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 bool DBEngine::login(std::string& db_name,
                      std::string& user_name,
                      const std::string& password) {
   DBEngineImpl* engine = getImpl(this);
-  return engine->login(db_name, user_name, password);
+  try {
+    return engine->login(db_name, user_name, password);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 /** Cursor downcasting methods */
@@ -519,26 +580,46 @@ inline const CursorImpl* getImpl(const Cursor* ptr) {
 
 size_t Cursor::getColCount() {
   CursorImpl* cursor = getImpl(this);
-  return cursor->getColCount();
+  try {
+    return cursor->getColCount();
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 size_t Cursor::getRowCount() {
   CursorImpl* cursor = getImpl(this);
-  return cursor->getRowCount();
+  try {
+    return cursor->getRowCount();
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 Row Cursor::getNextRow() {
   CursorImpl* cursor = getImpl(this);
-  return cursor->getNextRow();
+  try {
+    return cursor->getNextRow();
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 ColumnType Cursor::getColType(uint32_t col_num) {
   CursorImpl* cursor = getImpl(this);
-  return cursor->getColType(col_num);
+  try {
+    return cursor->getColType(col_num);
+  } catch(...) {
+    exception_handler();
+  }
 }
 
 std::shared_ptr<arrow::RecordBatch> Cursor::getArrowRecordBatch() {
   CursorImpl* cursor = getImpl(this);
-  return cursor->getArrowRecordBatch();
+  try {
+    return cursor->getArrowRecordBatch();
+  } catch(...) {
+    exception_handler();
+  }
 }
 }  // namespace EmbeddedDatabase
