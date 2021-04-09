@@ -351,12 +351,15 @@ class DBEngineImpl : public DBEngine {
  protected:
   void reset() {
     if (db_handler_) {
-      db_handler_->disconnect(session_id_);
+      try {
+        db_handler_->disconnect(session_id_);
+      } catch (const apache::thrift::TException& ex) {
+        //scip exception in case of invalid session
+      }
       db_handler_->shutdown();
     }
     Catalog_Namespace::SysCatalog::destroy();
     db_handler_.reset();
-
     logger::shutdown();
     if (is_temp_db_) {
       boost::filesystem::remove_all(base_path_);
@@ -446,23 +449,6 @@ class DBEngineImpl : public DBEngine {
 
 namespace {
 std::mutex engine_create_mutex;
-
-void exception_handler()
-{
-  try {
-    throw;
-  } catch (const TOmniSciException& ex) {
-    throw std::runtime_error(ex.error_msg);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  } catch (const QueryExecutionError& ex) {
-    throw std::runtime_error(ex.what());
-  } catch (const std::exception& ex) {
-    throw;
-  } catch (...) {
-    throw std::runtime_error("Unknown exception");
-  }
-}
 }
 
 std::shared_ptr<DBEngine> DBEngine::create(const std::string& cmd_line) {
@@ -472,8 +458,8 @@ std::shared_ptr<DBEngine> DBEngine::create(const std::string& cmd_line) {
     if (!engine->init(cmd_line)) {
       throw std::runtime_error("DBE initialization failed");
     }
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
   return engine;
 }
@@ -494,8 +480,8 @@ void DBEngine::executeDDL(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   try {
     engine->executeDDL(query);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -503,8 +489,8 @@ std::shared_ptr<Cursor> DBEngine::executeDML(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->executeDML(query);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -512,8 +498,8 @@ std::shared_ptr<Cursor> DBEngine::executeRA(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->executeRA(query);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -523,8 +509,8 @@ void DBEngine::importArrowTable(const std::string& name,
   DBEngineImpl* engine = getImpl(this);
   try {
     engine->importArrowTable(name, table, fragment_size);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -532,8 +518,8 @@ std::vector<std::string> DBEngine::getTables() {
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->getTables();
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -541,8 +527,8 @@ std::vector<ColumnDetails> DBEngine::getTableDetails(const std::string& table_na
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->getTableDetails(table_name);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -550,8 +536,8 @@ bool DBEngine::setDatabase(std::string& db_name) {
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->setDatabase(db_name);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -561,8 +547,8 @@ bool DBEngine::login(std::string& db_name,
   DBEngineImpl* engine = getImpl(this);
   try {
     return engine->login(db_name, user_name, password);
-  } catch(...) {
-    exception_handler();
+  } catch (const apache::thrift::TException& ex) {
+    throw std::runtime_error(ex.what());
   }
 }
 
@@ -580,46 +566,31 @@ inline const CursorImpl* getImpl(const Cursor* ptr) {
 
 size_t Cursor::getColCount() {
   CursorImpl* cursor = getImpl(this);
-  try {
-    return cursor->getColCount();
-  } catch(...) {
-    exception_handler();
-  }
+  CHECK(cursor);
+  return cursor->getColCount();
 }
 
 size_t Cursor::getRowCount() {
   CursorImpl* cursor = getImpl(this);
-  try {
-    return cursor->getRowCount();
-  } catch(...) {
-    exception_handler();
-  }
+  CHECK(cursor);
+  return cursor->getRowCount();
 }
 
 Row Cursor::getNextRow() {
   CursorImpl* cursor = getImpl(this);
-  try {
-    return cursor->getNextRow();
-  } catch(...) {
-    exception_handler();
-  }
+  CHECK(cursor);
+  return cursor->getNextRow();
 }
 
 ColumnType Cursor::getColType(uint32_t col_num) {
   CursorImpl* cursor = getImpl(this);
-  try {
-    return cursor->getColType(col_num);
-  } catch(...) {
-    exception_handler();
-  }
+  CHECK(cursor);
+  return cursor->getColType(col_num);
 }
 
 std::shared_ptr<arrow::RecordBatch> Cursor::getArrowRecordBatch() {
   CursorImpl* cursor = getImpl(this);
-  try {
-    return cursor->getArrowRecordBatch();
-  } catch(...) {
-    exception_handler();
-  }
+  CHECK(cursor);
+  return cursor->getArrowRecordBatch();
 }
 }  // namespace EmbeddedDatabase
