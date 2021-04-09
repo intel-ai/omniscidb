@@ -151,46 +151,49 @@ class DBEngineImpl : public DBEngine {
 
     prog_config_opts.system_parameters.omnisci_server_port = -1;
     prog_config_opts.system_parameters.calcite_keepalive = true;
-
     try {
-      db_handler_ =
-          mapd::make_shared<DBHandler>(prog_config_opts.db_leaves,
-                                       prog_config_opts.string_leaves,
-                                       prog_config_opts.base_path,
-                                       prog_config_opts.allow_multifrag,
-                                       prog_config_opts.jit_debug,
-                                       prog_config_opts.intel_jit_profile,
-                                       prog_config_opts.read_only,
-                                       prog_config_opts.allow_loop_joins,
-                                       prog_config_opts.enable_rendering,
-                                       prog_config_opts.renderer_use_vulkan_driver,
-                                       prog_config_opts.enable_auto_clear_render_mem,
-                                       prog_config_opts.render_oom_retry_threshold,
-                                       prog_config_opts.render_mem_bytes,
-                                       prog_config_opts.max_concurrent_render_sessions,
-                                       prog_config_opts.reserved_gpu_mem,
-                                       prog_config_opts.render_compositor_use_last_gpu,
-                                       prog_config_opts.num_reader_threads,
-                                       prog_config_opts.authMetadata,
-                                       prog_config_opts.system_parameters,
-                                       prog_config_opts.enable_legacy_syntax,
-                                       prog_config_opts.idle_session_duration,
-                                       prog_config_opts.max_session_duration,
-                                       prog_config_opts.enable_runtime_udf,
-                                       prog_config_opts.udf_file_name,
-                                       prog_config_opts.udf_compiler_path,
-                                       prog_config_opts.udf_compiler_options,
+      try {
+        db_handler_ =
+            mapd::make_shared<DBHandler>(prog_config_opts.db_leaves,
+                                         prog_config_opts.string_leaves,
+                                         prog_config_opts.base_path,
+                                         prog_config_opts.allow_multifrag,
+                                         prog_config_opts.jit_debug,
+                                         prog_config_opts.intel_jit_profile,
+                                         prog_config_opts.read_only,
+                                         prog_config_opts.allow_loop_joins,
+                                         prog_config_opts.enable_rendering,
+                                         prog_config_opts.renderer_use_vulkan_driver,
+                                         prog_config_opts.enable_auto_clear_render_mem,
+                                         prog_config_opts.render_oom_retry_threshold,
+                                         prog_config_opts.render_mem_bytes,
+                                         prog_config_opts.max_concurrent_render_sessions,
+                                         prog_config_opts.reserved_gpu_mem,
+                                         prog_config_opts.render_compositor_use_last_gpu,
+                                         prog_config_opts.num_reader_threads,
+                                         prog_config_opts.authMetadata,
+                                         prog_config_opts.system_parameters,
+                                         prog_config_opts.enable_legacy_syntax,
+                                         prog_config_opts.idle_session_duration,
+                                         prog_config_opts.max_session_duration,
+                                         prog_config_opts.enable_runtime_udf,
+                                         prog_config_opts.udf_file_name,
+                                         prog_config_opts.udf_compiler_path,
+                                         prog_config_opts.udf_compiler_options,
 #ifdef ENABLE_GEOS
-                                       prog_config_opts.libgeos_so_filename,
+                                         prog_config_opts.libgeos_so_filename,
 #endif
-                                       prog_config_opts.disk_cache_config,
-                                       is_new_db);
-    } catch (const std::exception& e) {
-      LOG(FATAL) << "Failed to initialize database handler: " << e.what();
-      throw;
+                                         prog_config_opts.disk_cache_config,
+                                         is_new_db);
+      } catch (const std::exception& e) {
+        LOG(FATAL) << "Failed to initialize database handler: " << e.what();
+        throw;
+      }
+      db_handler_->connect(
+          session_id_, OMNISCI_ROOT_USER, OMNISCI_ROOT_PASSWD_DEFAULT, OMNISCI_DEFAULT_DB);
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
     }
-    db_handler_->connect(
-        session_id_, OMNISCI_ROOT_USER, OMNISCI_ROOT_PASSWD_DEFAULT, OMNISCI_DEFAULT_DB);
     base_path_ = base_path;
     initialized = true;
     return true;
@@ -201,22 +204,26 @@ class DBEngineImpl : public DBEngine {
                                               const bool column_format,
                                               const int32_t first_n,
                                               const int32_t at_most_n) {
-    ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
-                                                       ExecutorDeviceType::CPU,
-                                                       QueryMemoryDescriptor(),
-                                                       nullptr,
-                                                       nullptr,
-                                                       0,
-                                                       0),
-                           {}};
-    db_handler_->sql_execute(
-        result, session_id, query_str, column_format, first_n, at_most_n);
-    auto& targets = result.getTargetsMeta();
-    std::vector<std::string> col_names;
-    for (const auto target : targets) {
-      col_names.push_back(target.get_resname());
+    try {
+      ExecutionResult result{std::make_shared<ResultSet>(std::vector<TargetInfo>{},
+                                                         ExecutorDeviceType::CPU,
+                                                         QueryMemoryDescriptor(),
+                                                         nullptr,
+                                                         nullptr,
+                                                         0,
+                                                         0),
+                             {}};
+      db_handler_->sql_execute(
+          result, session_id, query_str, column_format, first_n, at_most_n);
+      auto& targets = result.getTargetsMeta();
+      std::vector<std::string> col_names;
+      for (const auto target : targets) {
+        col_names.push_back(target.get_resname());
+      }
+      return std::make_shared<CursorImpl>(result.getRows(), col_names);
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
     }
-    return std::make_shared<CursorImpl>(result.getRows(), col_names);
   }
 
   void executeDDL(const std::string& query) {
@@ -250,6 +257,9 @@ class DBEngineImpl : public DBEngine {
       catalog->createTable(td, cols, dictionaries, false);
       Catalog_Namespace::SysCatalog::instance().createDBObject(
           session.get_currentUser(), td.tableName, TableDBObjectType, *catalog);
+    } catch (const apache::thrift::TException& ex) {
+      releaseArrowTable(name);
+      throw std::runtime_error(ex.what());
     } catch (...) {
       releaseArrowTable(name);
       throw;
@@ -267,9 +277,9 @@ class DBEngineImpl : public DBEngine {
 
   std::vector<std::string> getTables() {
     std::vector<std::string> table_names;
-    auto catalog = db_handler_->get_session_copy(session_id_).get_catalog_ptr();
-    if (catalog) {
-      const auto tables = catalog->getAllTableMetadata();
+    try {
+      auto& catalog = db_handler_->get_session_copy(session_id_).getCatalog();
+      const auto tables = catalog.getAllTableMetadata();
       for (const auto td : tables) {
         if (td->shard >= 0) {
           // skip shards, they're not standalone tables
@@ -277,21 +287,21 @@ class DBEngineImpl : public DBEngine {
         }
         table_names.push_back(td->tableName);
       }
-    } else {
-      throw std::runtime_error("System catalog uninitialized");
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
     }
     return table_names;
   }
 
   std::vector<ColumnDetails> getTableDetails(const std::string& table_name) {
     std::vector<ColumnDetails> result;
-    auto catalog = db_handler_->get_session_copy(session_id_).get_catalog_ptr();
-    if (catalog) {
-      auto metadata = catalog->getMetadataForTable(table_name, false);
+    try {
+      auto& catalog = db_handler_->get_session_copy(session_id_).getCatalog();
+      auto metadata = catalog.getMetadataForTable(table_name, false);
       if (metadata) {
         const auto col_descriptors =
-            catalog->getAllColumnMetadataForTable(metadata->tableId, false, true, false);
-        const auto deleted_cd = catalog->getDeletedColumn(metadata);
+            catalog.getAllColumnMetadataForTable(metadata->tableId, false, true, false);
+        const auto deleted_cd = catalog.getDeletedColumn(metadata);
         for (const auto cd : col_descriptors) {
           if (cd == deleted_cd) {
             continue;
@@ -316,7 +326,7 @@ class DBEngineImpl : public DBEngine {
             // have to get the actual size of the encoding from the dictionary
             // definition
             const int dict_id = ct.get_comp_param();
-            auto dd = catalog->getMetadataForDict(dict_id, false);
+            auto dd = catalog.getMetadataForDict(dict_id, false);
             if (dd) {
               col_details.comp_param = dd->dictNBits;
             } else {
@@ -331,20 +341,30 @@ class DBEngineImpl : public DBEngine {
           result.push_back(col_details);
         }
       }
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
     }
     return result;
   }
 
   bool setDatabase(std::string& db_name) {
-    auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
-    auto& user = db_handler_->get_session_copy(session_id_).get_currentUser();
-    sys_cat.switchDatabase(db_name, user.userName);
+    try {
+      auto& sys_cat = Catalog_Namespace::SysCatalog::instance();
+      auto& user = db_handler_->get_session_copy(session_id_).get_currentUser();
+      sys_cat.switchDatabase(db_name, user.userName);
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
+    }
     return true;
   }
 
   bool login(std::string& db_name, std::string& user_name, const std::string& password) {
-    db_handler_->disconnect(session_id_);
-    db_handler_->connect(session_id_, user_name, password, db_name);
+    try {
+      db_handler_->disconnect(session_id_);
+      db_handler_->connect(session_id_, user_name, password, db_name);
+    } catch (const apache::thrift::TException& ex) {
+      throw std::runtime_error(ex.what());
+    }
     return true;
   }
 
@@ -454,12 +474,8 @@ std::mutex engine_create_mutex;
 std::shared_ptr<DBEngine> DBEngine::create(const std::string& cmd_line) {
   const std::lock_guard<std::mutex> lock(engine_create_mutex);
   auto engine = std::make_shared<DBEngineImpl>();
-  try {
-    if (!engine->init(cmd_line)) {
-      throw std::runtime_error("DBE initialization failed");
-    }
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
+  if (!engine->init(cmd_line)) {
+    throw std::runtime_error("DBE initialization failed");
   }
   return engine;
 }
@@ -478,78 +494,46 @@ inline const DBEngineImpl* getImpl(const DBEngine* ptr) {
 
 void DBEngine::executeDDL(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    engine->executeDDL(query);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  engine->executeDDL(query);
 }
 
 std::shared_ptr<Cursor> DBEngine::executeDML(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->executeDML(query);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->executeDML(query);
 }
 
 std::shared_ptr<Cursor> DBEngine::executeRA(const std::string& query) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->executeRA(query);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->executeRA(query);
 }
 
 void DBEngine::importArrowTable(const std::string& name,
                                 std::shared_ptr<arrow::Table>& table,
                                 uint64_t fragment_size) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    engine->importArrowTable(name, table, fragment_size);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  engine->importArrowTable(name, table, fragment_size);
 }
 
 std::vector<std::string> DBEngine::getTables() {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->getTables();
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->getTables();
 }
 
 std::vector<ColumnDetails> DBEngine::getTableDetails(const std::string& table_name) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->getTableDetails(table_name);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->getTableDetails(table_name);
 }
 
 bool DBEngine::setDatabase(std::string& db_name) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->setDatabase(db_name);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->setDatabase(db_name);
 }
 
 bool DBEngine::login(std::string& db_name,
                      std::string& user_name,
                      const std::string& password) {
   DBEngineImpl* engine = getImpl(this);
-  try {
-    return engine->login(db_name, user_name, password);
-  } catch (const apache::thrift::TException& ex) {
-    throw std::runtime_error(ex.what());
-  }
+  return engine->login(db_name, user_name, password);
 }
 
 /** Cursor downcasting methods */
