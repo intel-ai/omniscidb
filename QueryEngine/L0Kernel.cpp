@@ -28,7 +28,7 @@ L0BinResult spv_to_bin(const std::string& spv,
 
   auto module = device->create_module((uint8_t*)spv.data(), spv.size());
   std::cerr << "Module created" << std::endl;
-  auto kernel = module->create_kernel("wrapper_scalar_expr");
+  auto kernel = module->create_kernel("wrapper_scalar_expr", 1, 1, 1);
 
   L0_SAFE_CALL(zeModuleGetNativeBinary(module->handle(), &binSize, nullptr));
 

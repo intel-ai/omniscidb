@@ -45,6 +45,7 @@ class L0Driver {
 
 class L0Module;
 class L0Kernel;
+class L0CommandList;
 
 class L0Device {
  private:
@@ -58,7 +59,7 @@ class L0Device {
 
   ze_device_handle_t device() const;
   ze_command_queue_handle_t command_queue() const;
-  ze_command_list_handle_t create_command_list() const;
+  std::unique_ptr<L0CommandList> create_command_list() const;
   ze_context_handle_t ctx() const;
 
   std::shared_ptr<L0Module> create_module(uint8_t* code, size_t len) const;
@@ -74,16 +75,51 @@ class L0Module {
   explicit L0Module(ze_module_handle_t handle);
   ze_module_handle_t handle() const;
 
-  std::shared_ptr<L0Kernel> create_kernel(char* name) const;
+  template <typename... Args>
+  std::shared_ptr<L0Kernel> create_kernel(char* name, Args&&... args) const {
+    ze_kernel_desc_t desc{
+        .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
+        .pNext = nullptr,
+        .flags = 0,
+        .pKernelName = name,
+    };
+    ze_kernel_handle_t handle;
+    L0_SAFE_CALL(zeKernelCreate(this->handle_, &desc, &handle));
+    return std::make_shared<L0Kernel>(handle, std::forward<Args>(args)...);
+  }
+
   ~L0Module();
 };
+
+template <int Index>
+void set_kernel_args(ze_kernel_handle_t kernel) {}
+
+template <int Index, typename Head>
+void set_kernel_args(ze_kernel_handle_t kernel, Head&& head) {
+  L0_SAFE_CALL(zeKernelSetArgumentValue(
+      kernel, Index, sizeof(std::remove_reference_t<Head>), head));
+}
+
+template <int Index, typename Head, typename... Tail>
+void set_kernel_args(ze_kernel_handle_t kernel, Head&& head, Tail&&... tail) {
+  set_kernel_args<Index>(kernel, head);
+  set_kernel_args<Index + 1>(kernel, std::forward<Tail>(tail)...);
+}
 
 class L0Kernel {
  private:
   ze_kernel_handle_t handle_;
+  ze_group_count_t group_size_;
 
  public:
-  explicit L0Kernel(ze_kernel_handle_t handle);
+  template <typename... Args>
+  L0Kernel(ze_kernel_handle_t handle, uint32_t x, uint32_t y, uint32_t z, Args&&... args)
+      : handle_(handle), group_size_({x, y, z}) {
+    set_kernel_args<0>(handle, std::forward<Args>(args)...);
+    zeKernelSetGroupSize(handle_, x, y, z);
+  }
+
+  ze_group_count_t& group_size();
   ze_kernel_handle_t handle() const;
   ~L0Kernel();
 };
@@ -97,17 +133,22 @@ class L0Manager {
   const std::vector<std::shared_ptr<L0Driver>>& drivers() const;
 };
 
-void copy_host_to_device(void* device_ptr,
-                         const void* host_ptr,
-                         const size_t num_bytes,
-                         ze_command_list_handle_t command_list);
+class L0CommandList {
+ private:
+  ze_command_list_handle_t handle_;
 
-void copy_device_to_host(void* host_ptr,
-                         const void* device_ptr,
-                         const size_t num_bytes,
-                         ze_command_list_handle_t command_list);
+ public:
+  L0CommandList(ze_command_list_handle_t handle);
 
-void* allocate_device_mem(const size_t num_bytes,
-                            L0Device &device);
+  void copy(void* dst, const void* src, const size_t num_bytes);
+
+  void launch(L0Kernel& kernel);
+
+  void submit(ze_command_queue_handle_t queue);
+
+  ~L0CommandList();
+};
+
+void* allocate_device_mem(const size_t num_bytes, L0Device& device);
 
 }  // namespace l0

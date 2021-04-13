@@ -79,22 +79,27 @@ std::vector<std::shared_ptr<L0Driver>> get_drivers() {
   return result;
 }
 
-void copy_host_to_device(void* device_ptr,
-                         const void* host_ptr,
-                         const size_t num_bytes,
-                         ze_command_list_handle_t command_list) {
-  L0_SAFE_CALL(zeCommandListAppendMemoryCopy(
-      command_list, device_ptr, host_ptr, num_bytes, nullptr, 0, nullptr));
-  L0_SAFE_CALL(zeCommandListAppendBarrier(command_list, nullptr, 0, nullptr));
+L0CommandList::L0CommandList(ze_command_list_handle_t handle) : handle_(handle) {}
+
+void L0CommandList::submit(ze_command_queue_handle_t queue) {
+  L0_SAFE_CALL(zeCommandListClose(handle_));
+  L0_SAFE_CALL(zeCommandQueueExecuteCommandLists(queue, 1, &handle_, nullptr));
 }
 
-void copy_device_to_host(void* host_ptr,
-                         const void* device_ptr,
-                         const size_t num_bytes,
-                         const ze_command_list_handle_t command_list) {
-  L0_SAFE_CALL(zeCommandListAppendMemoryCopy(
-      command_list, host_ptr, device_ptr, num_bytes, nullptr, 0, nullptr));
-  L0_SAFE_CALL(zeCommandListAppendBarrier(command_list, nullptr, 0, nullptr));
+void L0CommandList::launch(L0Kernel& kernel) {
+  L0_SAFE_CALL(zeCommandListAppendLaunchKernel(
+      handle_, kernel.handle(), &kernel.group_size(), nullptr, 0, nullptr));
+
+  L0_SAFE_CALL(zeCommandListAppendBarrier(handle_, nullptr, 0, nullptr));
+}
+L0CommandList::~L0CommandList() {
+  // TODO: maybe return to pool
+}
+
+void L0CommandList::copy(void* dst, const void* src, const size_t num_bytes) {
+  L0_SAFE_CALL(
+      zeCommandListAppendMemoryCopy(handle_, dst, src, num_bytes, nullptr, 0, nullptr));
+  L0_SAFE_CALL(zeCommandListAppendBarrier(handle_, nullptr, 0, nullptr));
 }
 
 void* allocate_device_mem(const size_t num_bytes, L0Device& device) {
@@ -140,7 +145,7 @@ ze_command_queue_handle_t L0Device::command_queue() const {
   return command_queue_;
 }
 
-ze_command_list_handle_t L0Device::create_command_list() const {
+std::unique_ptr<L0CommandList> L0Device::create_command_list() const {
   ze_command_list_desc_t desc = {
       ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC,
       nullptr,
@@ -149,7 +154,7 @@ ze_command_list_handle_t L0Device::create_command_list() const {
   };
   ze_command_list_handle_t res;
   zeCommandListCreate(ctx(), device_, &desc, &res);
-  return res;
+  return std::make_unique<L0CommandList>(res);
 }
 
 std::shared_ptr<L0Module> L0Device::create_module(uint8_t* code, size_t len) const {
@@ -179,18 +184,6 @@ ze_module_handle_t L0Module::handle() const {
   return handle_;
 }
 
-std::shared_ptr<L0Kernel> L0Module::create_kernel(char* name) const {
-  ze_kernel_desc_t desc{
-      .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
-      .pNext = nullptr,
-      .flags = 0,
-      .pKernelName = name,
-  };
-  ze_kernel_handle_t handle;
-  L0_SAFE_CALL(zeKernelCreate(this->handle_, &desc, &handle));
-  return std::make_shared<L0Kernel>(handle);
-}
-
 L0Module::~L0Module() {
   auto status = zeModuleDestroy(handle_);
   if (status) {
@@ -198,7 +191,9 @@ L0Module::~L0Module() {
   }
 }
 
-L0Kernel::L0Kernel(ze_kernel_handle_t handle) : handle_(handle) {}
+ze_group_count_t& L0Kernel::group_size() {
+  return group_size_;
+}
 
 ze_kernel_handle_t L0Kernel::handle() const {
   return handle_;

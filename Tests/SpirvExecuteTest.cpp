@@ -278,7 +278,6 @@ TEST_F(SPIRVExecuteTest, TranslateSimpleWithL0Manager) {
   auto spv = generateSimpleSPIRV();
 
   auto module = device->create_module((uint8_t*)spv.data(), spv.length());
-  auto kernel = module->create_kernel("plus1");
 
   auto command_queue = device->command_queue();
   auto command_list = device->create_command_list();
@@ -303,25 +302,17 @@ TEST_F(SPIRVExecuteTest, TranslateSimpleWithL0Manager) {
   void* a_void = a.data;
   void* b_void = b.data;
 
-  l0::copy_host_to_device(dA, a_void, copy_size, command_list);
-  l0::copy_host_to_device(dB, b_void, copy_size, command_list);
+  command_list->copy(dA, a_void, copy_size);
+  command_list->copy(dB, b_void, copy_size);
 
-  int sz = 32;
-  L0_SAFE_CALL(zeKernelSetArgumentValue(kernel->handle(), 0, sizeof(void*), &dA));
-  L0_SAFE_CALL(zeKernelSetArgumentValue(kernel->handle(), 1, sizeof(void*), &dB));
-  L0_SAFE_CALL(zeKernelSetGroupSize(kernel->handle(), 1, 1, 1));
-  ze_group_count_t dispatchTraits = {1, 1, 1};
+  auto kernel = module->create_kernel("plus1", 1, 1, 1, &dA, &dB);
 
-  L0_SAFE_CALL(zeCommandListAppendLaunchKernel(
-      command_list, kernel->handle(), &dispatchTraits, nullptr, 0, nullptr));
+  command_list->copy(b_void, dB, copy_size);
 
-  L0_SAFE_CALL(zeCommandListAppendBarrier(command_list, nullptr, 0, nullptr));
+  command_list->launch(*kernel);
 
-  l0::copy_device_to_host(b_void, dB, copy_size, command_list);
+  command_list->submit(command_queue);
 
-  L0_SAFE_CALL(zeCommandListClose(command_list));
-  L0_SAFE_CALL(
-      zeCommandQueueExecuteCommandLists(command_queue, 1, &command_list, nullptr));
   L0_SAFE_CALL(
       zeCommandQueueSynchronize(command_queue, std::numeric_limits<uint32_t>::max()));
 
