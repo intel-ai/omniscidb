@@ -102,6 +102,8 @@ if [ "$ID" == "ubuntu" ] ; then
       jq \
       python-dev \
       python-yaml \
+      python-numpy \
+      cython \
       libxerces-c-dev \
       swig
 

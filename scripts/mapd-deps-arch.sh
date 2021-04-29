@@ -36,6 +36,7 @@ yay -S \
     maven \
     ninja \
     python-numpy \
+    cython \
     snappy \
     thrift \
     vulkan-headers \

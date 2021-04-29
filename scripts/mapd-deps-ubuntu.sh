@@ -95,6 +95,8 @@ DEBIAN_FRONTEND=noninteractive sudo apt install -y \
     jq \
     python-dev \
     python-yaml \
+    python-numpy \
+    cython \
     swig \
     pkg-config \
     libxerces-c-dev \

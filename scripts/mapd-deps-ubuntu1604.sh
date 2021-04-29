@@ -61,6 +61,8 @@ sudo apt install -y \
     jq \
     python-dev \
     python-yaml \
+    python-numpy \
+    cython \
     pkg-config \
     swig
 

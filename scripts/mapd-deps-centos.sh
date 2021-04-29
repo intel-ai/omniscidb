@@ -58,6 +58,8 @@ sudo yum install -y \
     wget \
     curl \
     python3 \
+    python-numpy \
+    cython \
     openldap-devel
 sudo yum install -y \
     jq \

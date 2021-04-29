@@ -101,6 +101,7 @@ function install_arrow() {
     -DARROW_FILESYSTEM=ON \
     -DARROW_S3=ON \
     -DARROW_CUDA=ON \
+    -DARROW_PYTHON=ON \
     -DTHRIFT_HOME=${THRIFT_HOME:-$PREFIX} \
     ${ARROW_TSAN} \
     ..

@@ -28,6 +28,9 @@ brew install double-conversion
 brew install llvm
 brew install libuv
 brew install libiodbc
+brew install python
+brew install numpy
+brew install cython
 
 function build_pin_dep {
   brew unpin $1 || true
