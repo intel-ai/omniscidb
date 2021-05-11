@@ -3,6 +3,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 set(datamgr_source_files
     AbstractBuffer.cpp
     Allocators/CudaAllocator.cpp
+    Allocators/L0Allocator.cpp
     Allocators/ThrustAllocator.cpp
     Chunk/Chunk.cpp
     DataMgr.cpp
@@ -27,6 +28,8 @@ set(datamgr_source_files
     ForeignStorage/CsvFileBufferParser.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBufferMgr.cpp
     BufferMgr/GpuCudaBufferMgr/GpuCudaBuffer.cpp
+    BufferMgr/GpuL0BufferMgr/GpuL0BufferMgr.cpp
+    BufferMgr/GpuL0BufferMgr/GpuL0Buffer.cpp
     BufferMgr/CpuBufferMgr/CpuBufferMgr.cpp
     BufferMgr/CpuBufferMgr/CpuBuffer.cpp
     BufferMgr/BufferMgr.cpp
