@@ -100,7 +100,7 @@ function install_arrow() {
     -DARROW_PARQUET=ON \
     -DARROW_FILESYSTEM=ON \
     -DARROW_S3=ON \
-    -DARROW_CUDA=ON \
+    -DARROW_CUDA=OFF \
     -DTHRIFT_HOME=${THRIFT_HOME:-$PREFIX} \
     ${ARROW_TSAN} \
     ..
