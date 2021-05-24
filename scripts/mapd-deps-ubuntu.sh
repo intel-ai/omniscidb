@@ -131,6 +131,7 @@ VERS=0.13.0
 wget --continue http://apache.claz.org/thrift/$VERS/thrift-$VERS.tar.gz
 tar xvf thrift-$VERS.tar.gz
 pushd thrift-$VERS
+cp lib/netcore/Thrift/thrift.snk lib/netstd/Thrift/thrift.snk
 CFLAGS="-fPIC" CXXFLAGS="-fPIC" JAVA_PREFIX=$PREFIX/lib ./configure \
     --with-lua=no \
     --with-python=no \
