@@ -28,6 +28,7 @@
 // TODO(adb): fixup
 #ifdef _MSC_VER
 #include <fcntl.h>
+#include <io.h>
 #else
 #include <sys/fcntl.h>
 #endif
@@ -1342,8 +1343,13 @@ size_t StringDictionary::addStorageCapacity(
     memset(CANARY_BUFFER, 0xff, canary_buff_size_to_add);
   }
 
+#ifdef _MSC_VER
+  CHECK_NE(_lseek(fd, 0, SEEK_END), -1);
+  const auto write_return = _write(fd, CANARY_BUFFER, canary_buff_size_to_add);
+#else
   CHECK_NE(lseek(fd, 0, SEEK_END), -1);
   const auto write_return = write(fd, CANARY_BUFFER, canary_buff_size_to_add);
+#endif
   CHECK(write_return > 0 &&
         (static_cast<size_t>(write_return) == canary_buff_size_to_add));
   return canary_buff_size_to_add;

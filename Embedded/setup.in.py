@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import pyarrow as pa
 
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # conda-forge packages omniscidbe and pyomniscidbe are built
 # separately. OMNISCI_ROOT_PATH is defined by the omniscidbe activate
@@ -21,6 +21,16 @@ extra_library_dirs = []
 if 'OMNISCI_ROOT_PATH' in os.environ:
     extra_library_dirs.append(os.path.join(os.environ['OMNISCI_ROOT_PATH'], 'lib'))
 
+extra_include_dir = ""
+if sys.platform=='win32':
+    rt_lib_dirs = []
+    ex_cmpl_args = ["/std:c++17", "-DRAPIDJSON_HAS_STDSTRING"]
+    if 'CONDA_PREFIX' in os.environ:
+      extra_include_dir = os.environ['CONDA_PREFIX'] + '/Library/include'
+else:
+    rt_lib_dirs = pa.get_library_dirs() + ["$ORIGIN/../../"] + extra_library_dirs
+    ex_cmpl_args = ["-std=c++17", "-DRAPIDJSON_HAS_STDSTRING"]
+
 dbe = Extension(
     "omniscidbe",
     ["@CMAKE_CURRENT_SOURCE_DIR@/Python/dbe.pyx"],
@@ -29,15 +39,16 @@ dbe = Extension(
         np.get_include(),
         pa.get_include(),
         root,
+        extra_include_dir,
         "@CMAKE_SOURCE_DIR@",
         "@CMAKE_CURRENT_SOURCE_DIR@",
         "@CMAKE_SOURCE_DIR@/ThirdParty/rapidjson",
         "@CMAKE_SOURCE_DIR@/Distributed/os",
     ],
     library_dirs=pa.get_library_dirs() + ["@CMAKE_CURRENT_BINARY_DIR@", "."] + extra_library_dirs,
-    runtime_library_dirs=pa.get_library_dirs() + ["$ORIGIN/../../"] + extra_library_dirs,
+    runtime_library_dirs=rt_lib_dirs,
     libraries=pa.get_libraries() + ["DBEngine", "boost_system"],
-    extra_compile_args=["-std=c++17", "-DRAPIDJSON_HAS_STDSTRING"],
+    extra_compile_args=ex_cmpl_args,
 )
 # Try uncommenting the following line on Linux
 # if you get weird linker errors or runtime crashes

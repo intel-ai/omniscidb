@@ -21,7 +21,7 @@
 
 namespace EmbeddedDatabase {
 
-class Cursor {
+class RUNTIME_EXPORT Cursor {
  public:
   virtual ~Cursor() {}
   size_t getColCount();
@@ -36,7 +36,7 @@ class Cursor {
   Cursor& operator=(const Cursor&) = delete;
 };
 
-class DBEngine {
+class RUNTIME_EXPORT DBEngine {
  public:
   virtual ~DBEngine() {}
   void executeDDL(const std::string& query);

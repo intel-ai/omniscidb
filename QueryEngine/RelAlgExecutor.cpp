@@ -3272,6 +3272,9 @@ struct ErrorInfo {
   const char* description{nullptr};
 };
 ErrorInfo getErrorDescription(const int32_t error_code) {
+  // FIXME: Temp code. This needs to be refactored for Windows
+  return ErrorInfo();
+#if 0
   switch (error_code) {
     case Executor::ERR_DIV_BY_ZERO:
       return {.code = "ERR_DIV_BY_ZERO", .description = "Division by zero"};
@@ -3319,6 +3322,7 @@ ErrorInfo getErrorDescription(const int32_t error_code) {
     default:
       return {.code = nullptr, .description = nullptr};
   }
+#endif
 }
 
 }  // namespace

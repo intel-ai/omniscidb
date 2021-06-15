@@ -139,7 +139,12 @@ class ProcBuddyinfoParser {
     }
 
     const long page_size =
+#ifdef __linux__
         sysconf(_SC_PAGE_SIZE);  // in case x86-64 is configured to use 2MB pages
+#else
+//TODO: Fix for Windows
+        0;
+#endif
     size_t scaled = 0;
     size_t total = 0;
     for (size_t order = 0; order < orders_.size(); ++order) {

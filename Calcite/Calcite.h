@@ -26,6 +26,10 @@
 #include "Shared/mapd_shared_ptr.h"
 #include "gen-cpp/extension_functions_types.h"
 
+#ifdef _MSC_VER
+#include "Shared/cleanup_global_namespace.h"
+#endif
+
 #include <thrift/transport/TTransport.h>
 
 #include <mutex>

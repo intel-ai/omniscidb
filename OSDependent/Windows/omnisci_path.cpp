@@ -19,6 +19,7 @@
 #include <boost/filesystem/path.hpp>
 
 #include "Logger/Logger.h"
+#include <iostream>
 
 #include <windows.h>  // Must be last
 
@@ -31,7 +32,11 @@ std::string get_root_abs_path() {
   CHECK_LT(static_cast<size_t>(path_len), sizeof(abs_exe_path));
   boost::filesystem::path abs_exe_dir(std::string(abs_exe_path, path_len));
   abs_exe_dir.remove_filename();
-  const auto mapd_root = abs_exe_dir.parent_path();
+#ifdef CONDA_BUILD
+  const auto mapd_root = abs_exe_dir;
+#else
+  const auto mapd_root = abs_exe_dir;//.parent_path();
+#endif
 
   return mapd_root.string();
 }

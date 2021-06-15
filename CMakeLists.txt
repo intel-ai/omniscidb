@@ -6,19 +6,24 @@ set(CMAKE_ENABLE_EXPORTS True)
 set(ENABLE_CONDA OFF)
 if(DEFINED ENV{CONDA_PREFIX})
   set(ENABLE_CONDA ON)
+  add_definitions("-DCONDA_BUILD")
   # various fixes and workarounds
   add_definitions("-Dsecure_getenv=getenv")
   # fixes `undefined reference to `boost::system::detail::system_category_instance'`:
   add_definitions("-DBOOST_ERROR_CODE_HEADER_ONLY")
-  # Adding formating macros
-  add_definitions("-D__STDC_FORMAT_MACROS=1")
+  add_definitions("-DBOOST_ALL_DYN_LINK")
+  if(NOT MSVC)
+    message("NOT MVC MODE START")
+    # Adding formating macros
+    add_definitions("-D__STDC_FORMAT_MACROS=1")
+    # Adding sysroot include dir resolves `cassert file not found` error:
+    include_directories(SYSTEM "$ENV{CONDA_BUILD_SYSROOT}/usr/include")
+  endif()
   # fixes always_inline attribute errors
-  add_compile_options("-fno-semantic-interposition")
+  #add_compile_options("-fno-semantic-interposition")
   # Adding `--sysroot=...` resolves `no member named 'signbit' in the global namespace` error:
   set(CMAKE_SYSROOT "$ENV{CONDA_BUILD_SYSROOT}")
   link_directories("$ENV{CONDA_PREFIX}/lib")  # resolves link issue for zlib 
-  # Adding sysroot include dir resolves `cassert file not found` error:
-  include_directories(SYSTEM "$ENV{CONDA_BUILD_SYSROOT}/usr/include")
 endif(DEFINED ENV{CONDA_PREFIX})
 
 # force `Release` build type if left unspecified
@@ -220,6 +225,10 @@ if (ENABLE_GEOS)
   endif()
 endif()
 
+# SQLite - put it here for WIndows build to prevent include sqlite from conda
+include_directories(ThirdParty/sqlite3)
+add_subdirectory(ThirdParty/sqlite3)
+
 # fixme: hack works for Homebrew, might not work for Conda
 if(ENABLE_CONDA)
   set(OPENSSL_ROOT_DIR "$ENV{CONDA_PREFIX}")
@@ -411,7 +420,7 @@ find_library(CLANG_LIB clang-cpp)
 find_library(LLVM_LIB LLVM)
 # Deps builds use separate libs for each clang component, while some distros now bundle into a single lib
 if (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin" OR NOT LLVM_LIB)
-  set(LLVM_COMPONENTS support mcjit core irreader option linker)
+  set(LLVM_COMPONENTS support mcjit core irreader option linker ipo)
 
   if(ENABLE_INTEL_JIT_LISTENER)
     list(APPEND LLVM_COMPONENTS inteljitevents)
@@ -529,15 +538,16 @@ add_definitions(-DRAPIDJSON_HAS_STDSTRING)
 # Linenoise
 add_subdirectory(ThirdParty/linenoise)
 
-# SQLite
-include_directories(ThirdParty/sqlite3)
-add_subdirectory(ThirdParty/sqlite3)
-
 # raft/canonical
 option(ENABLE_CANONICAL_RAFT "Enable Canonical Raft" OFF)
 if(ENABLE_CANONICAL_RAFT)
   add_subdirectory(ThirdParty/raft/canonical)
 endif()
+
+if (ENABLE_CONDA)
+  include_directories($ENV{CONDA_PREFIX}/include)
+endif()
+
 
 # rdkafka
 find_package(RdKafka REQUIRED)

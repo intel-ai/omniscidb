@@ -1510,8 +1510,14 @@ llvm::Value* GroupByAndAggregate::codegenAggColumnPtr(
       CHECK(out_row_idx);
       uint32_t col_off = query_mem_desc.getColOffInBytes(agg_out_off);
       // multiplying by chosen_bytes, i.e., << log2(chosen_bytes)
+#ifdef _MSC_VER
+      unsigned long index;
+      auto res = int(_BitScanForward64(&index, (unsigned long)chosen_bytes) ? index + 1 : 0);
+      auto out_per_col_byte_idx = LL_BUILDER.CreateShl(out_row_idx, res - 1);
+#else
       auto out_per_col_byte_idx =
           LL_BUILDER.CreateShl(out_row_idx, __builtin_ffs(chosen_bytes) - 1);
+#endif
       auto byte_offset = LL_BUILDER.CreateAdd(out_per_col_byte_idx,
                                               LL_INT(static_cast<int64_t>(col_off)));
       byte_offset->setName("out_byte_off_target_" + std::to_string(target_idx));

@@ -182,8 +182,10 @@ find_program(llvm_clangpp_cmd NAME clang++ HINTS ${LLVM_TOOLS_BINARY_DIR})
 list(APPEND ADDITIONAL_MAKE_CLEAN_FILES ${CMAKE_CURRENT_BINARY_DIR}/gen-cpp/)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
-
-if(ENABLE_JIT_DEBUG AND NOT ENABLE_CUDA)
+#FIXME: Seems llvm 11 which is used on Windows currently needs to be used with O0
+# since O3 does not pay much attention to noinline attributes and ruines routines in 
+# RuntimeFunctions.bc
+if(MSVC OR (ENABLE_JIT_DEBUG AND NOT ENABLE_CUDA))
   set(RT_OPT_FLAGS -O0 -g)
 else()
   set(RT_OPT_FLAGS -O3)

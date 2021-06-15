@@ -20,6 +20,10 @@
 
 #include <iostream>
 
+#ifdef _WIN32
+#include <io.h>
+#endif
+
 #include "CommandLineOptions.h"
 #include "LeafHostInfo.h"
 #include "MapDRelease.h"
@@ -820,6 +824,21 @@ void CommandLineOptions::validate() {
       throw std::runtime_error(err);
     }
 #endif
+#ifdef _WIN32
+    SetFilePointer((HANDLE)pid_fd, 0, 0, FILE_BEGIN); 
+    if (SetEndOfFile((HANDLE)pid_fd) == 0) {
+      _close(pid_fd);
+      auto err = std::string("Failed to truncate PID file ") +
+                 lock_file.string().c_str() + ". " + strerror(errno) + ".";
+      throw std::runtime_error(err);
+    }
+    if (_write(pid_fd, pid.c_str(), pid.length()) == -1) {
+      _close(pid_fd);
+      auto err = std::string("Failed to write PID file ") + lock_file.string().c_str() +
+                 ". " + strerror(errno) + ".";
+      throw std::runtime_error(err);
+    }
+#else
     if (ftruncate(pid_fd, 0) == -1) {
       ::close(pid_fd);
       auto err = std::string("Failed to truncate PID file ") +
@@ -832,6 +851,7 @@ void CommandLineOptions::validate() {
                  ". " + strerror(errno) + ".";
       throw std::runtime_error(err);
     }
+#endif
   }
   boost::algorithm::trim_if(db_query_file, boost::is_any_of("\"'"));
   if (db_query_file.length() > 0 && !boost::filesystem::exists(db_query_file)) {

@@ -113,6 +113,8 @@ extern "C" void agg_count_distinct_bitmap(int64_t* agg,
                                           const int64_t val,
                                           const int64_t min_val);
 
+extern "C" uint64_t agg_count(uint64_t* agg, const int64_t); 
+
 #define EMPTY_KEY_64 std::numeric_limits<int64_t>::max()
 #define EMPTY_KEY_32 std::numeric_limits<int32_t>::max()
 #define EMPTY_KEY_16 std::numeric_limits<int16_t>::max()
